@@ -83,6 +83,11 @@ else
   command -v sway >/dev/null 2>&1 \
     || fail "sway is not installed (use --session to test against the running compositor)"
   echo "[smoke] starting headless wlroots compositor (sway, headless backend, pixman renderer)"
+  # CI runners have no Xwayland binary and a headless compositor needs none;
+  # leaving Xwayland on made sway abort before creating its socket (CI run
+  # 35461889214). Disabled in scripts/headless-sway.conf (`xwayland disable`) —
+  # the config is the documented lever, not WLR_XWAYLAND, which points at a
+  # binary path rather than an on/off switch.
   WLR_BACKENDS=headless \
   WLR_RENDERER=pixman \
   WLR_LIBINPUT_NO_DEVICES=1 \

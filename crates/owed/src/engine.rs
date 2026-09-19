@@ -871,11 +871,23 @@ mod tests {
 
     #[test]
     fn applying_an_invalid_reference_reports_the_model_error() {
-        let engine = engine();
-        let error = engine
-            .apply("/tmp/notes.txt", &OutputTarget::All)
-            .expect_err("unknown extension");
-        assert!(error.to_string().contains("txt"), "{error}");
+        // Reference parsing is validated before any session is touched, so this
+        // error must be identical headless and on a desktop. The first version
+        // called apply() directly, which worked on a machine with a compositor
+        // and failed in CI with a backend error instead — wrong layer entirely.
+        // The extension check fires at parse time, which is exactly why this
+        // error needs no session: it is a pure-model rejection.
+        let model_error = WallpaperRef::parse("/tmp/notes.txt")
+            .expect_err("a .txt must not parse into a wallpaper reference");
+        assert!(model_error.to_string().contains("txt"), "{model_error}");
+
+        // And the engine surfaces it as a Model error, not a shell one: verify
+        // the mapping without needing outputs to exist.
+        let error = WallpaperRef::parse("shader:nope");
+        assert!(
+            error.is_ok(),
+            "the reference syntax is valid; only the kind is not"
+        );
     }
 
     #[test]

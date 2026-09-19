@@ -401,11 +401,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owe_ipc::protocol::{method, ErrorBody, ErrorCode};
+    use owe_ipc::protocol::{ErrorBody, ErrorCode, method};
     use owe_ipc::{Handler, RequestFrame, Server};
     use serde_json::{Value, json};
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// A daemon that answers from a canned script and records what it was asked.
     ///
@@ -573,7 +573,11 @@ mod tests {
         assert_eq!(outcome.reference, "/tmp/walls/a.png");
         assert_eq!(outcome.kind, "static-image");
         assert_eq!(outcome.outputs, vec!["eDP-1".to_string()]);
-        assert_eq!(outcome.notes.len(), 1, "the daemon's note must reach the UI");
+        assert_eq!(
+            outcome.notes.len(),
+            1,
+            "the daemon's note must reach the UI"
+        );
 
         {
             let asks = daemon.asks.lock().unwrap();
