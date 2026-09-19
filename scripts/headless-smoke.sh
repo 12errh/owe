@@ -135,6 +135,10 @@ else
   done
   [ -n "$wayland_socket" ] || fail "compositor never created any wayland-* socket"
   echo "[smoke] compositor up: $wayland_socket"
+  # Session mode exports this above; headless mode must too, or every client
+  # after this point (wayland-info, owed) has no display to connect to. Found in
+  # CI run 8: the compositor was up at wayland-1 and the probe still failed.
+  export WAYLAND_DISPLAY="$wayland_socket"
 fi
 
 # --- protocol probe ----------------------------------------------------------
