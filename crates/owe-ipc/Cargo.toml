@@ -1,0 +1,25 @@
+[package]
+name = "owe-ipc"
+description = "OWE IPC protocol v1: JSON-lines framing, version negotiation, server and client. No async runtime (ADR-004)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

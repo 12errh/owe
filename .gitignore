@@ -1,0 +1,29 @@
+# OWE build artifacts
+/target/
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# Node / Tauri frontend
+app/node_modules/
+app/dist/
+*.local
+
+# Reference repos (ADR-013): studied locally, never compiled, never committed.
+reference/
+
+# Coverage artifacts (cargo-llvm-cov locally, and the CI coverage job)
+/lcov.info
+*.profraw
+*.profdata
+
+# Thumbnails / tmp
+*.tmp
+__pycache__/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Freebuff agent state (per-checkout, not project content)
+.freebuff/

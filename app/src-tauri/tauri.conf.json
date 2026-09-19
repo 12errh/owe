@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OWE",
+  "version": "0.1.0",
+  "identifier": "dev.owe.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "OWE",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 720,
+        "minHeight": 480,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "category": "Utility",
+    "shortDescription": "Low-resource live wallpaper engine for Wayland",
+    "longDescription": "OWE renders static, animated, and video wallpapers on Wayland layer-shell surfaces with a resource governor, and integrates natively with Hyprland and Caelestia Shell. The window is a disposable control panel for the owed daemon.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ]
+  }
+}

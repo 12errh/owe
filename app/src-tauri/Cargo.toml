@@ -1,0 +1,37 @@
+[package]
+name = "owe-app"
+description = "OWE desktop app — Tauri v2 GUI client for the owed daemon."
+version = "0.1.0"
+# Desktop-only by design (Hyprland + Caelestia are the launch targets), so this
+# crate is a plain binary: no `staticlib`/`cdylib` mobile entry point.
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/12errh/owe"
+publish = false
+
+# Deliberately NOT a member of the root workspace (see the root Cargo.toml
+# comment): it would drag webkit/GTK into every daemon lint/test run.
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The GUI talks to the daemon through the IPC protocol only (ARCHITECTURE §2
+# dependency direction) — never through daemon internals.
+owe-ipc = { path = "../../crates/owe-ipc" }
+tauri = { version = "2", features = [] }
+tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-process = "2"
+tauri-plugin-store = "2"
+serde = { version = "1", features = ["derive"] }
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

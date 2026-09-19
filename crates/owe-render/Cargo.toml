@@ -1,0 +1,27 @@
+[package]
+name = "owe-render"
+description = "OWE rendering: wgpu device management and headless golden-image tooling."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+image = { version = "0.25.9", default-features = false, features = ["png"] }
+pollster = "1.0.1"
+thiserror = { workspace = true }
+wgpu = "26.0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# NOTE: `unsafe_code` stays at the workspace default (warn). This crate is where
+# reviewed unsafe will appear for dma-buf importing from P4; every use needs a
+# SAFETY comment and review (STRATEGY §3).
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"

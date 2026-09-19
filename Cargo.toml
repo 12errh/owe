@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/owe-core",
+  "crates/owe-ipc",
+  "crates/owe-render",
+  "crates/owed",
+  "crates/owectl",
+]
+# The Tauri app is deliberately NOT a workspace member: it pulls the whole
+# webkit/GTK stack, which would slow down rustfmt/clippy/nextest for the daemon
+# crates and force every CI job to install GTK. It depends on `owe-ipc` by path
+# (ARCHITECTURE §2) and is built, linted, and tested by its own CI job.
+exclude = ["app/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/12errh/owe"
+authors = ["OWE contributors"]
+
+[workspace.dependencies]
+owe-core = { path = "crates/owe-core", version = "0.1.0" }
+owe-ipc = { path = "crates/owe-ipc", version = "0.1.0" }
+owe-render = { path = "crates/owe-render", version = "0.1.0" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# NOTE: `panic = "abort"` is deliberately NOT set. The P2 output-worker supervisor
+# needs `catch_unwind` (NFR-REL-1: one output crashing must not kill the others),
+# which requires unwinding.

@@ -1,0 +1,16 @@
+# pnpm settings for the OWE app.
+#
+# This file is the only place pnpm reads install-script policy from: the `pnpm`
+# field in package.json has been ignored since pnpm 10, and pnpm 11 uses the
+# `allowBuilds` map below (it writes the key itself with a placeholder when it
+# refuses a script, which is how this file came to exist).
+#
+# `allowBuilds` is an allow-list — every dependency install script is denied
+# unless it is named here and set to `true`. esbuild needs its native-binary
+# link step. Nothing else is approved on purpose: fewer arbitrary scripts running
+# at install time means a smaller supply-chain surface (STRATEGY §3). If a future
+# dependency appears in `ERR_PNPM_IGNORED_BUILDS`, that is a decision to make
+# deliberately, not a warning to silence.
+
+allowBuilds:
+  esbuild: true

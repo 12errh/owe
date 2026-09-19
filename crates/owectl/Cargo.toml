@@ -1,0 +1,25 @@
+[package]
+name = "owectl"
+description = "OWE control CLI: talks to the owed daemon over the IPC socket."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "owectl"
+path = "src/main.rs"
+
+[dependencies]
+owe-core = { workspace = true }
+owe-ipc = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

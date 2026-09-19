@@ -1,0 +1,40 @@
+# cargo-deny policy (STRATEGY §3: dependency & supply-chain strategy).
+# SKELETON — not yet wired into CI. It is added to the nightly job in P7 together
+# with cargo-audit, once the dependency tree has settled.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "warn"
+ignore = []
+
+[licenses]
+# GPL-3.0-or-later is our license (ADR-001); everything below is compatible.
+allow = [
+  "GPL-3.0-or-later",
+  "GPL-3.0-only",
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "0BSD",
+  "MPL-2.0",
+  "LGPL-3.0-only",
+  "LGPL-2.1-only",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

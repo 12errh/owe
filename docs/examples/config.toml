@@ -1,0 +1,97 @@
+# OWE example configuration.
+#
+# Location: $XDG_CONFIG_HOME/owe/config.toml  (~/.config/owe/config.toml)
+# Schema: see docs/BACKEND-DESIGN.md §4. Unknown keys are hard errors — this is
+# deliberate, so a typo cannot silently do nothing.
+#
+# This file is loaded by a test (crates/owe-core/src/config.rs), so it can never
+# drift out of validity.
+
+schema = 1
+
+[shell]
+# "auto" resolves using detect_order below.
+backend = "auto"
+detect_order = ["caelestia", "hyprland", "generic-layer-shell"]
+
+[shell.hyprland]
+# What to do when a hyprpaper process is detected: "warn" | "stop" | "ignore".
+# OWE never kills another tool's process unless you ask it to.
+hyprpaper = "warn"
+# Subscribe to the Hyprland event socket (feeds the resource governor).
+event_socket = true
+
+[shell.caelestia]
+# "shell-routed" lets Caelestia set the wallpaper (its theming pipeline runs);
+# "daemon-drawn" keeps rendering in owed even when Caelestia is running.
+mode = "shell-routed"
+# Leave this at the shell's own variable unless you keep wallpapers elsewhere.
+wallpapers_dir = "$CAELESTIA_WALLPAPERS_DIR"
+theme_hook = true
+
+[render]
+allow_transitions = ["none", "fade", "wipe", "slide", "grow", "wave", "outer"]
+
+[render.default_transition]
+name = "fade"
+duration_ms = 300
+fps = 60
+
+[render.buffering]
+# Hard cap on frames in flight per output (keep this small: memory is the budget).
+max_in_flight = 3
+shm_fallback = true
+
+[media]
+# "auto" prefers GStreamer and falls back to FFmpeg.
+backend = "auto"
+# true = refuse to play video when hardware decode is unavailable.
+hw_decode_required = false
+
+[media.cache]
+# Per-wallpaper cap for cached animated frames.
+animated_frame_cap_mb = 96
+compression = "zstd"
+
+[library]
+paths = ["~/Pictures/Wallpapers"]
+thumbnail_size = 512
+# 0 = rescan only on IPC/FS events, never on a timer.
+rescan_interval_secs = 0
+
+[governor]
+eco_mode = false
+# Policy when an output's display is off: "pause" | "dim" | "ignore" | { fps = N }.
+dpms_off = "pause"
+
+[governor.fullscreen]
+# Default: pause the focused output while a fullscreen window is up.
+focused = "pause"
+others = "ignore"
+
+[governor.battery]
+on_battery = "ignore"
+# below_pct = 25
+# fps_on_battery = 30
+
+[governor.idle]
+after_secs = 0
+action = "none"
+
+[governor.cpu_busy]
+pct = 0
+for_secs = 0
+action = "none"
+
+# Per-output sections. The key can be an output name ("DP-1"), a description
+# fragment, or "any" for the fallback. Precedence: name > description > any.
+[outputs."any"]
+wallpaper = "/usr/share/backgrounds/owe-example.png"
+
+# [outputs."DP-1"]
+# wallpaper = "~/Pictures/Wallpapers/tokyo.png"
+# fps_cap = 30
+# [outputs."DP-1".transition]
+# name = "slide"
+# duration_ms = 450
+# fps = 60
