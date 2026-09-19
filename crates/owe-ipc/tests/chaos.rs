@@ -182,6 +182,10 @@ fn clients_are_served_independently() {
     let mut first = server.client();
     let mut second = server.client();
 
+    // The real assertion: two clients interleave requests on one socket and both
+    // are served correctly. (This failed intermittently in CI run 9 in a weaker
+    // form that asserted an instantaneous connection count, which races with
+    // connection teardown.)
     first.hello("first", "0.1.0").expect("first hello");
     second.hello("second", "0.1.0").expect("second hello");
     first
@@ -190,7 +194,27 @@ fn clients_are_served_independently() {
     second
         .call(method::DAEMON_KILL, json!({}))
         .expect("kill via second");
-    assert_eq!(server.server.active_connections(), 2);
+
+    // A connection thread lives until its *client* disconnects (the 30s read
+    // timeout is the backstop, not the mechanism), so draining requires the
+    // clients to let go first. Only then must the count reach zero — polled with
+    // a deadline, never sampled at one arbitrary instant, because teardown is
+    // asynchronous by design.
+    drop(first);
+    drop(second);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let active = server.server.active_connections();
+        if active == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "connections never drained: {active} still active"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(server.server.active_connections(), 0);
 }
 
 #[test]
