@@ -58,7 +58,11 @@ fail() {
   # being a mystery wrapped in a missing file (three CI runs needed for this).
   if [ -n "${compositor_pid:-}" ] && kill -0 "$compositor_pid" 2>/dev/null; then
     echo "--- compositor process $compositor_pid is alive but produced no socket ---"
-    ps -p "$compositor_pid" -o pid,cmd 2>/dev/null || true
+    ps -p "$compositor_pid" -o pid,stat,wchan:30,etime,cmd 2>/dev/null || true
+    # A process in Z (zombie) state means its parent (this script) never reaped
+    # it; D means uninterruptible IO. Both say "dead, not slow". S/R at 10+s
+    # with no output says hung-in-startup, and the window may just be too short
+    # on a cold runner (fontconfig cache building alone can take >10s).
   else
     echo "--- compositor process is gone ---"
   fi
@@ -108,8 +112,13 @@ else
     sway -c "$root/scripts/headless-sway.conf" >"$work/sway.log" 2>&1 &
   compositor_pid=$!
 
+  # 30s, not 10s: a cold CI runner builds fontconfig caches, links the seat
+  # manager, and warms wlroots' backends on first start — runs 4 and 5 found the
+  # compositor *alive but socket-less* at exactly 10s, which is a slow start at
+  # least as likely as a hang. If it still fails at 30s, the failure diagnostics
+  # now include the process state (zombie? uninterruptible IO?) to say which.
   wayland_socket="$XDG_RUNTIME_DIR/wayland-0"
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 300); do
     [ -S "$wayland_socket" ] && break
     sleep 0.1
   done
