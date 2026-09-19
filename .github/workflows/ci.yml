@@ -112,6 +112,13 @@ jobs:
       - name: app crate — build
         working-directory: app/src-tauri
         run: cargo build
+      # The GUI's daemon-facing path is tested against a stub daemon hosted in
+      # process (its own `tests` module), so this needs no compositor and no
+      # running daemon. It is what stops "the GUI compiles" from counting as
+      # "the GUI works" (P1 gate: GUI apply).
+      - name: app crate — tests (stub-daemon IPC contract)
+        working-directory: app/src-tauri
+        run: cargo test
 
   headless-wayland:
     name: headless Wayland smoke

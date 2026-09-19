@@ -51,6 +51,32 @@ cargo run -p owed -- --check-config --config ./docs/examples/config.toml
 ./target/debug/owectl kill
 ```
 
+### Use it
+
+The daemon renders on a background layer surface; the CLI talks to it over the session socket.
+
+```bash
+owed &
+
+owectl hello                                  # version, capabilities, what this build cannot do yet
+owectl monitors                               # every output: size, state, current wallpaper
+owectl set ~/Pictures/wallpapers/one.png      # every output
+owectl set ~/Pictures/wallpapers/two.png -m eDP-1
+owectl get --monitor eDP-1                    # prints the path, or nothing if OWE applied none
+owectl list ~/Pictures/wallpapers             # what the daemon can see in that folder
+owectl pause  # / resume: governor override
+owectl clear -m eDP-1
+owectl kill
+```
+
+`--json` prints the raw reply for scripting. Exit codes: `0` success, `1` the daemon refused
+(with a protocol code such as `CONFIG_INVALID` or `NOT_FOUND`), `2` the daemon could not be
+reached. The GUI (`cd app && pnpm tauri dev`) does the same four things: status, outputs,
+choose a folder, apply — and says when the daemon is not running instead of failing silently.
+
+After `owectl clear` the output has no OWE wallpaper, so a previous wallpaper tool
+(`swaybg`, `swww`, Caelestia) needs to be re-run if you were using one.
+
 ### GUI
 
 Needs **Node ≥ 22** (pnpm 11 refuses to run on older Node), pnpm, and `webkit2gtk-4.1`:
@@ -69,6 +95,17 @@ cd app && pnpm install && pnpm tauri dev
 
 # Regenerate the placeholder app icons (deterministic, no image editor involved)
 cargo run -p owe-render --example gen-app-icons
+
+# End to end on the session you are logged into: apply a four-colour test image,
+# prove it reached the screen by sampling a screenshot, assert the layer surface,
+# check session state, clear, and shut down. Needs grim + python3+PIL.
+./scripts/e2e-hyprland.sh
+
+# NFR-PERF-1: 60 s of idle with a wallpaper on screen must stay under 1% of a core.
+./scripts/idle-cpu.sh 60
+
+# The GUI's daemon-facing layer, tested against a stub daemon (no compositor needed)
+cd app/src-tauri && cargo test
 ```
 
 ## License

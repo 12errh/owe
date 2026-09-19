@@ -1,6 +1,6 @@
 [package]
-name = "owe-core"
-description = "OWE core: configuration model + validation and the content model. Pure logic, no Wayland/GPU/sockets."
+name = "owe-shell-hyprland"
+description = "OWE shell backend for Hyprland: output enumeration and detection via hyprctl."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+owe-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints.rust]
 missing_docs = "warn"

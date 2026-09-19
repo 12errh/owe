@@ -3,7 +3,10 @@ resolver = "3"
 members = [
   "crates/owe-core",
   "crates/owe-ipc",
+  "crates/owe-media",
   "crates/owe-render",
+  "crates/owe-shell-hyprland",
+  "crates/owe-shell-generic",
   "crates/owed",
   "crates/owectl",
 ]
@@ -24,7 +27,9 @@ authors = ["OWE contributors"]
 [workspace.dependencies]
 owe-core = { path = "crates/owe-core", version = "0.1.0" }
 owe-ipc = { path = "crates/owe-ipc", version = "0.1.0" }
+owe-media = { path = "crates/owe-media", version = "0.1.0" }
 owe-render = { path = "crates/owe-render", version = "0.1.0" }
+owe-shell-hyprland = { path = "crates/owe-shell-hyprland", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

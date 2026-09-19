@@ -81,6 +81,21 @@ enum Command {
         monitor: Option<String>,
     },
 
+    /// Remove the wallpaper from one output (or all of them).
+    Clear {
+        /// Output name; omit for all outputs.
+        monitor: Option<String>,
+    },
+
+    /// List image files in a directory.
+    ///
+    /// P1 scans one level; the indexed library with thumbnails is P2.
+    List {
+        /// Directory to scan.
+        #[arg(default_value = "~/Pictures")]
+        dir: String,
+    },
+
     /// Ask the daemon to shut down.
     Kill,
 }
@@ -183,17 +198,191 @@ fn run(cli: &Cli) -> Result<(), Failure> {
                 "media backends: {}",
                 hello.capabilities.media_backends.join(", ")
             );
+            // Planned-but-missing features are shown, not hidden: a user
+            // comparing the roadmap to the build should not have to infer them.
+            if !hello.capabilities.unavailable.is_empty() {
+                println!("not in this build:");
+                for entry in &hello.capabilities.unavailable {
+                    println!("  {entry}");
+                }
+            }
             Ok(())
         }
         other => {
             let value = dispatch(&mut client, other)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).unwrap_or_default()
-            );
+            println!("{}", render(other, &value));
             Ok(())
         }
     }
+}
+
+/// Human-readable rendering of a reply.
+///
+/// The CLI is the surface most users touch first, so a raw JSON dump is a bug,
+/// not a default: `owectl monitors` exists to answer "what is on my screens?".
+fn render(command: &Command, value: &Value) -> String {
+    match command {
+        Command::Hello => unreachable!("hello is rendered before dispatch"),
+        Command::Monitors | Command::Get { .. } => render_outputs(command, value),
+        Command::Set { .. } => {
+            let outputs = value["outputs"].as_array().cloned().unwrap_or_default();
+            let mut lines = vec![format!(
+                "applied {} ({}) to {}",
+                value["reference"].as_str().unwrap_or("?"),
+                value["kind"].as_str().unwrap_or("?"),
+                join_strings(&outputs)
+            )];
+            if let Some(sizes) = value["sizes"].as_array() {
+                for size in sizes {
+                    lines.push(format!(
+                        "  {} presented at {}x{}",
+                        size[0].as_str().unwrap_or("?"),
+                        size[1].as_u64().unwrap_or(0),
+                        size[2].as_u64().unwrap_or(0)
+                    ));
+                }
+            }
+            append_notes(&mut lines, value);
+            lines.join("\n")
+        }
+        Command::Pause { .. } | Command::Resume { .. } => {
+            let mut lines = vec![if value["paused"] == json!(true) {
+                "paused".to_string()
+            } else {
+                "resumed".to_string()
+            }];
+            if let Some(affects) = value["affects"].as_str() {
+                lines.push(format!("  affects: {affects}"));
+            }
+            lines.join("\n")
+        }
+        Command::Clear { .. } => {
+            let cleared = value["cleared"].as_array().cloned().unwrap_or_default();
+            if cleared.is_empty() {
+                "nothing was set on the matching output(s)".to_string()
+            } else {
+                format!("cleared {}", join_strings(&cleared))
+            }
+        }
+        Command::Kill => "daemon is shutting down".to_string(),
+        Command::List { .. } => {
+            let entries = value["entries"].as_array().cloned().unwrap_or_default();
+            let mut lines = vec![format!(
+                "{} ({} entries)",
+                value["dir"].as_str().unwrap_or("?"),
+                entries.len()
+            )];
+            for entry in entries {
+                lines.push(format!(
+                    "  {}  {}x{}  {}",
+                    entry["name"].as_str().unwrap_or("?"),
+                    entry["width"].as_u64().unwrap_or(0),
+                    entry["height"].as_u64().unwrap_or(0),
+                    entry["path"].as_str().unwrap_or("")
+                ));
+            }
+            if let Some(scope) = value["scope"].as_str() {
+                lines.push(format!("  scope: {scope}"));
+            }
+            lines.join("\n")
+        }
+    }
+}
+
+/// Render `outputs.list` for `monitors` (a table) or `get` (the wallpaper).
+fn render_outputs(command: &Command, value: &Value) -> String {
+    let wanted = match command {
+        Command::Get { monitor } => monitor.as_deref(),
+        _ => None,
+    };
+    let empty = Vec::new();
+    let outputs = value["outputs"].as_array().unwrap_or(&empty);
+    let matching: Vec<&Value> = outputs
+        .iter()
+        .filter(|output| match wanted {
+            None => true,
+            Some(name) => output["name"].as_str() == Some(name),
+        })
+        .collect();
+
+    if matching.is_empty() {
+        return match wanted {
+            Some(name) => format!("no output named {name}"),
+            None => "no outputs".to_string(),
+        };
+    }
+
+    if wanted.is_some() {
+        return matching
+            .iter()
+            .map(|output| output["wallpaper"].as_str().unwrap_or("none").to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    let mut lines = Vec::new();
+    for output in &matching {
+        lines.push(format!(
+            "{}  {}x{}  {}{}",
+            output["name"].as_str().unwrap_or("?"),
+            output["width"].as_u64().unwrap_or(0),
+            output["height"].as_u64().unwrap_or(0),
+            if output["focused"] == json!(true) {
+                "focused  "
+            } else {
+                ""
+            },
+            output["state"].as_str().unwrap_or("?")
+        ));
+        lines.push(format!(
+            "    {}",
+            output["description"].as_str().unwrap_or("")
+        ));
+        lines.push(format!(
+            "    wallpaper: {}",
+            output["wallpaper"].as_str().unwrap_or("none")
+        ));
+        // A reference the session file remembers but this run has not applied is
+        // shown as what it is. Printing it as the wallpaper would claim something
+        // is on screen when it is not (restore lands in P2).
+        if let Some(recorded) = output["recorded"].as_str() {
+            lines.push(format!(
+                "    recorded: {recorded} (not applied this run; restore lands in P2)"
+            ));
+        }
+        if let Some(error) = output["error"].as_str() {
+            lines.push(format!("    error: {error}"));
+        }
+    }
+    if value["paused"] == json!(true) {
+        lines.push(String::from("governor: paused"));
+    }
+    append_notes(&mut lines, value);
+    lines.join("\n")
+}
+
+/// Append any `notes` array — the daemon's way of saying "this worked, but not
+/// the way you may think".
+fn append_notes(lines: &mut Vec<String>, value: &Value) {
+    if let Some(notes) = value["notes"].as_array() {
+        for note in notes {
+            if let Some(text) = note.as_str() {
+                lines.push(format!("note: {text}"));
+            }
+        }
+    }
+}
+
+/// Join a JSON string array for display.
+fn join_strings(values: &[Value]) -> String {
+    if values.is_empty() {
+        return "no outputs".to_string();
+    }
+    values
+        .iter()
+        .map(|value| value.as_str().unwrap_or("?"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn dispatch(client: &mut Client, command: &Command) -> Result<Value, Failure> {
@@ -226,6 +415,15 @@ fn dispatch(client: &mut Client, command: &Command) -> Result<Value, Failure> {
                 method::GOVERNOR_OVERRIDE,
                 json!({ "output": monitor.clone().unwrap_or_else(|| "all".into()), "policy": "auto" }),
             )
+            .map_err(map_client_error),
+        Command::Clear { monitor } => client
+            .call(
+                method::WALLPAPER_CLEAR,
+                json!({ "output": monitor.clone().unwrap_or_else(|| "all".into()) }),
+            )
+            .map_err(map_client_error),
+        Command::List { dir } => client
+            .call(method::LIBRARY_LIST, json!({ "dir": dir }))
             .map_err(map_client_error),
         Command::Kill => client
             .call(method::DAEMON_KILL, json!({}))

@@ -166,3 +166,142 @@ body {
   margin: 0 0 8px;
   color: var(--text-dim);
 }
+
+/* --- P1 views: outputs, library, feedback ---------------------------------
+   Same simple-UI contract (UI-DESIGN §3): flat blocks, one accent colour, no
+   framework. Sized for the window's minimum width so nothing clips. */
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 12px 0;
+}
+
+.panel--quiet {
+  opacity: 0.8;
+}
+
+.panel__title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.panel__empty,
+.panel__note {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.panel__path {
+  margin: 0 0 8px;
+  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.list--plain {
+  gap: 2px;
+}
+
+.list__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.list__main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.list__name {
+  font-weight: 600;
+}
+
+.list__sub {
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.list__sub--mono {
+  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+}
+
+.list__sub--error {
+  color: var(--danger, #f38ba8);
+}
+
+.button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--accent, #89b4fa);
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.button--primary {
+  border-color: var(--accent, #89b4fa);
+  color: var(--accent, #89b4fa);
+}
+
+.alert {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.alert--error {
+  border: 1px solid var(--danger, #f38ba8);
+  color: var(--danger, #f38ba8);
+}
+
+.alert--ok {
+  border: 1px solid var(--accent, #89b4fa);
+  color: var(--accent, #89b4fa);
+}
+
+.alert code {
+  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+}

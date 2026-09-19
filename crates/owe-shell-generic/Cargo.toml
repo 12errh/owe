@@ -1,0 +1,18 @@
+[package]
+name = "owe-shell-generic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generic Wayland shell backend: output enumeration with no compositor-specific code"
+
+[dependencies]
+owe-core = { path = "../owe-core" }
+smithay-client-toolkit = { version = "0.19", default-features = false }
+thiserror = "2"
+tracing = "0.1"
+wayland-client = "0.31"
+
+[lints]
+workspace = true

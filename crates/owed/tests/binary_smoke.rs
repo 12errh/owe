@@ -176,14 +176,34 @@ fn daemon_answers_hello_then_kills_cleanly() {
     assert_eq!(hello.server_version, env!("CARGO_PKG_VERSION"));
     assert!(!hello.capabilities.methods.is_empty());
 
-    // Unimplemented methods are honest about it.
+    // Still-unimplemented methods stay honest about it.
     let error = client
-        .call(method::WALLPAPER_SET, serde_json::json!({}))
+        .call(method::STATS_GET, serde_json::json!({}))
         .expect_err("stub method");
     match error {
         owe_ipc::ClientError::Server(body) => assert_eq!(body.code, ErrorCode::Unsupported),
         other => panic!("unexpected: {other:?}"),
     }
+
+    // Implemented methods validate their parameters instead of pretending to
+    // work: `wallpaper.set` without a spec is a bad request, not a silent success.
+    let error = client
+        .call(method::WALLPAPER_SET, serde_json::json!({}))
+        .expect_err("wallpaper.set needs a spec");
+    match error {
+        owe_ipc::ClientError::Server(body) => assert_eq!(body.code, ErrorCode::BadRequest),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // ...and the new P1 read paths answer, even with no session to render into.
+    let outputs = client
+        .call(method::OUTPUTS_LIST, serde_json::json!({}))
+        .expect("outputs.list must answer even headless");
+    assert!(
+        outputs.get("outputs").is_some(),
+        "outputs.list must return an outputs array: {outputs}"
+    );
+    assert_eq!(outputs["paused"], serde_json::json!(false));
 
     client
         .call(method::DAEMON_KILL, serde_json::json!({}))
@@ -193,6 +213,15 @@ fn daemon_answers_hello_then_kills_cleanly() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stderr.contains("listening"), "stderr: {stderr}");
     assert!(stderr.contains("stopped"), "stderr: {stderr}");
+    // The startup report must state plainly whether rendering is possible; a
+    // silent daemon is how users end up staring at a blank screen with no idea
+    // why.
+    assert!(
+        stderr.contains("shell backend ready")
+            || stderr.contains("no shell backend available")
+            || stderr.contains("using built-in defaults"),
+        "startup must report backend state: {stderr}"
+    );
 }
 
 #[test]

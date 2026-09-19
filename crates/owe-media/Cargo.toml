@@ -1,0 +1,37 @@
+[package]
+name = "owe-media"
+description = "OWE media decoding: images now, animated images and video behind the same trait in later phases."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# AVIF decoding pulls in a large C dependency chain, so it is opt-in (the P1 plan
+# calls for exactly this: "decode via the image crate (+avif feature flag)").
+avif = ["image/avif"]
+
+[dependencies]
+owe-core = { workspace = true }
+thiserror = { workspace = true }
+image = { version = "0.25.9", default-features = false, features = [
+  "png",
+  "jpeg",
+  "webp",
+  "bmp",
+  "gif",
+  "tiff",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

@@ -2336,6 +2336,7 @@ version = "0.1.0"
 dependencies = [
  "owe-ipc",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2344,6 +2345,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-process",
  "tauri-plugin-store",
+ "tempfile",
 ]
 
 [[package]]

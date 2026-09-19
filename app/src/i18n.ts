@@ -23,9 +23,32 @@ export const strings = {
   mediaBackendsLabel: "Decode backends",
   none: "none advertised",
 
-  placeholderTitle: "Library and Outputs views arrive in Phase 1",
-  placeholderBody:
-    "Phase 0 ships the wiring only: this window proves the GUI can reach the daemon. Browsing, assigning, and per-output controls are built in Phase 1 against the same IPC.",
+  outputsTitle: "Outputs",
+  outputsNone: "The daemon reports no outputs.",
+  outputsUnavailable: "Could not read the outputs from the daemon.",
+  focusedBadge: "focused",
+  wallpaperLabel: "Wallpaper",
+  wallpaperNone: "no wallpaper applied by OWE",
+  recordedLabel: "Recorded",
+  recordedHint: "not applied this run; restore lands in P2",
+  stateLabel: "State",
+  clear: "Clear",
+  clearedLabel: "Cleared",
+  clearNothing: "Nothing was set on that output.",
+  governorPaused: "The governor is paused: nothing new will be drawn until it resumes.",
+
+  libraryTitle: "Library",
+  chooseFolder: "Choose folder…",
+  libraryEmpty: "Pick a folder to see the wallpapers in it.",
+  libraryNoneInFolder: "No images found in that folder.",
+  scopeLabel: "Scanned",
+  apply: "Apply",
+  appliedLabel: "Applied",
+  noOutputsMatched: "no outputs matched",
+
+  unavailableTitle: "Not in this build",
+  failureLabel: "The daemon refused",
+
   disposableNote:
     "This window is disposable — closing it leaves no background work and frees its memory. The daemon keeps rendering.",
 

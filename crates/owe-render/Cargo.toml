@@ -13,6 +13,12 @@ pollster = "1.0.1"
 thiserror = { workspace = true }
 wgpu = "26.0.1"
 
+# Wayland client stack for the layer-shell presenter (P1). These versions are the
+# combination the studied reference engines (wallr, phonto) build against, so the
+# API surface is known-good rather than guessed.
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
+
 [dev-dependencies]
 tempfile = "3"
 

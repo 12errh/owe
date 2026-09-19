@@ -35,6 +35,7 @@ impl Handler for TestHandler {
                         shell_backends: vec!["hyprland".to_string()],
                         content_kinds: vec!["static-image".to_string()],
                         media_backends: vec!["auto".to_string()],
+                        unavailable: Vec::new(),
                     },
                 };
                 serde_json::to_value(reply).map_err(|error| ErrorBody::internal(error.to_string()))

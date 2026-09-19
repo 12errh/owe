@@ -1,8 +1,8 @@
 //! `owed` — the OWE daemon.
 //!
-//! P0 scope: configuration handling (`--check-config`, `--dump-config`), IPC
-//! hosting with an honest capability set, and clean exit codes. Rendering lands
-//! in P1.
+//! P1 scope: configuration handling (`--check-config`, `--dump-config`), IPC
+//! hosting with an honest capability set, the render engine (static images on
+//! layer-shell background surfaces), session state, and clean exit codes.
 //!
 //! Exit codes (docs/BACKEND-DESIGN.md §8):
 //!
@@ -14,6 +14,7 @@
 //! | 3 | startup blocked (e.g. another instance owns the socket) |
 
 mod cli;
+mod engine;
 mod handler;
 
 use std::process::ExitCode;
@@ -25,6 +26,7 @@ use owe_ipc::{Server, ServerError, Shutdown};
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::Cli;
+use crate::engine::Engine;
 use crate::handler::{DaemonState, IpcHandler};
 
 /// Process exit codes (see the table in the module docs).
@@ -153,13 +155,6 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
     // Daemon run.
     let config = load_config(cli, &config_path)?;
 
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        tracing::warn!(
-            "WAYLAND_DISPLAY is not set: this daemon cannot render wallpapers here \
-             (P0 serves IPC only; P1 will fail fast on a missing session)"
-        );
-    }
-
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config = %config_path.display(),
@@ -167,12 +162,53 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
         "owed starting"
     );
 
+    // Start the engine before serving: its report is the honest summary of what
+    // this session can actually do, and it never fails (see Engine::start).
+    let engine = Engine::new(config.clone(), paths.clone());
+    let report = engine.start();
+
+    match (&report.backend, &report.backend_error) {
+        (Some(id), _) => {
+            let names: Vec<&str> = report
+                .outputs
+                .iter()
+                .map(|output| output.name.as_str())
+                .collect();
+            tracing::info!(
+                backend = %id,
+                outputs = %if names.is_empty() { "none".to_string() } else { names.join(", ") },
+                "shell backend ready"
+            );
+        }
+        (None, Some(error)) => {
+            tracing::warn!(%error, "no shell backend available; serving ipc only");
+        }
+        (None, None) => {}
+    }
+
+    if report.presenter {
+        tracing::info!(
+            outputs = %report.presentable.join(", "),
+            "wallpaper rendering available"
+        );
+    } else {
+        tracing::warn!(
+            "wallpaper rendering is unavailable in this session (no Wayland session): \
+             `wallpaper.set` will fail with a precise reason"
+        );
+    }
+
+    for warning in &report.warnings {
+        tracing::warn!("{warning}");
+    }
+
     // One shutdown signal shared by the IPC handler and the accept loop.
     let shutdown = Shutdown::new();
     let state = Arc::new(DaemonState::new(
         config,
         socket_path.clone(),
         shutdown.clone(),
+        engine,
     ));
     let server = Server::bind_with_shutdown(
         &socket_path,

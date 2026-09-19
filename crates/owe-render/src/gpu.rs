@@ -49,6 +49,15 @@ pub enum RenderError {
     #[error("image error: {0}")]
     Image(String),
 
+    /// A zero-sized render target was requested.
+    #[error("render target is empty ({width}x{height})")]
+    EmptyTarget {
+        /// Requested width.
+        width: u32,
+        /// Requested height.
+        height: u32,
+    },
+
     /// A strict golden comparison found no committed reference.
     #[error("golden reference missing at {0} (strict mode never records)")]
     GoldenMissing(PathBuf),
@@ -123,14 +132,96 @@ impl HeadlessGpu {
         &self.adapter_info
     }
 
+    /// The wgpu device, for renderers built on top of this one (image scaling,
+    /// the P5 shader runtime).
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The wgpu queue.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Copy a texture back to CPU memory, tightly packed, in the texture's format.
+    ///
+    /// wgpu requires 256-byte row alignment for texture→buffer copies, so the
+    /// mapped rows are de-padded here rather than at every call site.
+    pub fn read_texture(
+        &self,
+        texture: &wgpu::Texture,
+        size: (u32, u32),
+    ) -> Result<Vec<u8>, RenderError> {
+        let (width, height) = size;
+        if width == 0 || height == 0 {
+            return Err(RenderError::EmptyTarget { width, height });
+        }
+
+        let unpadded_bytes_per_row = width * 4;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(256) * 256;
+
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("owe-readback"),
+            size: u64::from(padded_bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("owe-readback-encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        if let Ok(Err(error)) = receiver.recv() {
+            return Err(RenderError::Mapping(error.to_string()));
+        }
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
+        for row in 0..height {
+            let start = (row * padded_bytes_per_row) as usize;
+            let end = start + unpadded_bytes_per_row as usize;
+            pixels.extend_from_slice(&mapped[start..end]);
+        }
+        drop(mapped);
+        buffer.unmap();
+        Ok(pixels)
+    }
+
     /// Render a solid colour into an offscreen texture and read it back.
     ///
     /// Returns tightly packed RGBA8 pixels, row-major from the top-left.
     pub fn render_clear(&self, size: (u32, u32), color: [f32; 4]) -> Vec<u8> {
         let (width, height) = size;
-        let unpadded_bytes_per_row = width * 4;
-        // wgpu requires 256-byte row alignment for texture→buffer copies.
-        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(256) * 256;
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("owe-offscreen"),
@@ -147,13 +238,6 @@ impl HeadlessGpu {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("owe-readback"),
-            size: u64::from(padded_bytes_per_row) * u64::from(height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
 
         let mut encoder = self
             .device
@@ -184,50 +268,15 @@ impl HeadlessGpu {
             });
         }
 
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = buffer.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        let _ = self.device.poll(wgpu::PollType::Wait);
-        if let Ok(Err(error)) = receiver.recv() {
-            tracing_less_note(format!("map_async failed: {error}"));
-        }
-
-        let mapped = slice.get_mapped_range();
-        let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
-        for row in 0..height {
-            let start = (row * padded_bytes_per_row) as usize;
-            let end = start + unpadded_bytes_per_row as usize;
-            pixels.extend_from_slice(&mapped[start..end]);
-        }
-        drop(mapped);
-        buffer.unmap();
-        pixels
+        // Direct readback failure here means the GPU could not map memory; the
+        // existing tests assert the pixel values, so an unwrap would hide a real
+        // bug behind a panic with no context.
+        self.read_texture(&texture, size).unwrap_or_else(|error| {
+            tracing_less_note(format!("readback failed: {error}"));
+            Vec::new()
+        })
     }
 }
 

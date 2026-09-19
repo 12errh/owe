@@ -318,12 +318,25 @@ pub struct HelloReply {
 pub struct Capabilities {
     /// Protocol methods implemented by this build (subset of [`method::ALL`]).
     pub methods: Vec<String>,
-    /// Shell backend ids known to this build.
+    /// Shell backend ids **registered and usable** in this build.
+    ///
+    /// Registered, not "known to the project": a backend that exists only in the
+    /// roadmap must not appear here, or the GUI status surface shows a healthy
+    /// integration that cannot render anything (the P0 §0.2.4 finding).
     pub shell_backends: Vec<String>,
     /// Content kinds this build can render.
     pub content_kinds: Vec<String>,
     /// Media decode backends this build can use.
     pub media_backends: Vec<String>,
+    /// Things the project supports on paper but **this build cannot do**, each as
+    /// `"<id>: <why>"`.
+    ///
+    /// The companion to `shell_backends`: dropping the unimplemented ids from
+    /// that list alone would make them invisible, and a user comparing OWE to the
+    /// feature list deserves to see "caelestia: not implemented in this build"
+    /// rather than silence. Additive field — older clients ignore it.
+    #[serde(default)]
+    pub unavailable: Vec<String>,
 }
 
 /// Decode a request frame, rejecting unsupported schema majors early.
@@ -474,8 +487,22 @@ mod tests {
                 shell_backends: vec!["hyprland".into()],
                 content_kinds: vec!["static-image".into()],
                 media_backends: vec!["auto".into()],
+                unavailable: vec!["caelestia: planned for P3".into()],
             },
         };
+        // A P0-era client that predates `unavailable` must still parse the reply:
+        // the field is additive by design. This asserts that promise.
+        let older: HelloReply = serde_json::from_value({
+            let mut value = serde_json::to_value(&reply).unwrap();
+            value["capabilities"]
+                .as_object_mut()
+                .unwrap()
+                .remove("unavailable");
+            value
+        })
+        .expect("a reply without `unavailable` must still deserialize");
+        assert!(older.capabilities.unavailable.is_empty());
+
         let value = serde_json::to_value(&reply).unwrap();
         let back: HelloReply = serde_json::from_value(value).unwrap();
         assert_eq!(back, reply);
