@@ -130,7 +130,12 @@ jobs:
       - name: install compositor + wayland tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends sway wayland-utils
+          # `xwayland` is required by sway: without the binary, sway aborts with
+          # "Cannot find Xwayland binary" before creating its socket (CI run
+          # 35461889214). Disabling Xwayland in the config instead made sway
+          # hang silently with no socket at all (runs 35462429597–35463791483),
+          # so installing the package is the evidence-backed fix.
+          sudo apt-get install -y --no-install-recommends sway wayland-utils xwayland
       - name: build
         run: cargo build --workspace
       # P0 scope: proves the harness (headless compositor comes up, protocol
