@@ -903,13 +903,17 @@ mod tests {
                 "/tmp/does-not-matter.png",
                 &OutputTarget::Named("DP-999".to_string()),
             )
-            .expect_err("unknown output");
-        // Either "no output matches" (a session with outputs) or "no outputs" (a
-        // headless box) — both are the caller's fault, clearly stated, and the
-        // missing file must not be what we complain about first.
+            .expect_err("an unknown output (or, headless, no session at all)");
+        // What is honest depends on the environment, and the test accepts each
+        // environment's honest answer: with a session, the unknown name (or an
+        // empty output list); without any session (CI), the backend error — which
+        // IS the answer to "apply to DP-999" on a box with no compositor. What no
+        // environment may do is complain about the file first.
         let text = error.to_string();
         assert!(
-            text.contains("DP-999") || text.contains("no outputs"),
+            text.contains("DP-999")
+                || text.contains("no outputs")
+                || text.contains("no shell backend"),
             "{text}"
         );
         assert!(

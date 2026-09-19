@@ -52,6 +52,20 @@ fail() {
   echo "[smoke] FAIL: $*" >&2
   [ -f "$work/sway.log" ] && { echo "--- sway.log ---"; tail -30 "$work/sway.log"; }
   [ -f "$work/owed.log" ] && { echo "--- owed.log ---"; tail -30 "$work/owed.log"; }
+  # An empty sway.log is itself a diagnostic: it means the compositor process
+  # never got far enough to log, or never started. Show whether the process is
+  # even alive and whether the binary could run at all, so CI failures stop
+  # being a mystery wrapped in a missing file (three CI runs needed for this).
+  if [ -n "${compositor_pid:-}" ] && kill -0 "$compositor_pid" 2>/dev/null; then
+    echo "--- compositor process $compositor_pid is alive but produced no socket ---"
+    ps -p "$compositor_pid" -o pid,cmd 2>/dev/null || true
+  else
+    echo "--- compositor process is gone ---"
+  fi
+  echo "--- environment ---"
+  echo "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset} XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+  command -v sway >/dev/null 2>&1 && echo "sway: $(sway --version 2>&1 | head -1)" || echo "sway: NOT FOUND"
+  [ -d /usr/lib/wlroots ] 2>/dev/null && ls /usr/lib/wlroots 2>/dev/null | head -3
   exit 1
 }
 
