@@ -270,7 +270,7 @@ A feature appearing in a release without its gate row green is a process violati
 
 | Phase | Date | Commit | Result | Notes / ADRs |
 |---|---|---|---|---|
-| P0 | 2026-09-19 | (initial commit pending maintainer) | **PASS, one item open** | All tasks + 4/5 gate items proven on real hardware (§0.1), including the 92.64 % coverage floor. Open: "CI green" — it can only be observed after the first push (ADR-016's hosting caveat). See §0.2 for the deviations and honest notes. |
+| P0 | 2026-09-19 | `8a0e360` | **PASS, one item open** | All tasks + 4/5 gate items proven on real hardware (§0.1), including the 92.64 % coverage floor. Open: "CI green" — it can only be observed after the first push (ADR-016's hosting caveat). See §0.2 for the deviations and honest notes. |
 | P1 | — | — | not started | |
 | P2 | — | — | not started | |
 | P3 | — | — | not started | |
