@@ -398,6 +398,30 @@ where
 
 /// `OWE_SOCKET` (the client-side override) must win over XDG discovery, so the GUI
 /// can be aimed at a second daemon — and so these tests can aim it at a stub.
+fn main() {
+    tauri::Builder::default()
+        // P0 plugin set (IMPLEMENTATION-PLAN Phase 0). They are registered now
+        // so the capability surface is settled before any screen depends on it.
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![
+            daemon_status,
+            list_wallpapers,
+            list_outputs,
+            apply_wallpaper,
+            clear_wallpaper
+        ])
+        .run(tauri::generate_context!())
+        .expect("failed to start the OWE window");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,7 +464,7 @@ mod tests {
                 .expect("stub lock")
                 .push((request.method.clone(), request.params.clone()));
             if let Some((code, message)) = &self.fail_with {
-                return Err(ErrorBody::new(code.clone(), message.clone()));
+                return Err(ErrorBody::new(*code, message.clone()));
             }
             match request.method.as_str() {
                 method::HELLO => {
@@ -644,28 +668,4 @@ mod tests {
             assert!(!failure.message.is_empty());
         }
     }
-}
-
-fn main() {
-    tauri::Builder::default()
-        // P0 plugin set (IMPLEMENTATION-PLAN Phase 0). They are registered now
-        // so the capability surface is settled before any screen depends on it.
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_store::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![
-            daemon_status,
-            list_wallpapers,
-            list_outputs,
-            apply_wallpaper,
-            clear_wallpaper
-        ])
-        .run(tauri::generate_context!())
-        .expect("failed to start the OWE window");
 }

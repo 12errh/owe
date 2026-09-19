@@ -432,14 +432,19 @@ impl Engine {
 
     /// Apply a wallpaper reference to the resolved outputs.
     pub fn apply(&self, spec: &str, target: &OutputTarget) -> Result<Applied, EngineError> {
-        let report = self.start();
-        report.backend_failure()?;
-
+        // Validate the *request* before demanding a session: a bad reference, an
+        // unrenderable kind, or a target that cannot match is a property of the
+        // request, not of the environment. Reporting it correctly must not depend
+        // on a compositor happening to be attached — the first CI runs failed two
+        // tests on exactly that, because they only passed on a desktop.
         let reference = WallpaperRef::parse(spec)?;
         let kind = reference.resolved_kind()?;
         // P1 renders still images. Named, explicit failure for everything else
         // rather than a confusing decode error.
         owe_media::ensure_supported(kind)?;
+
+        let report = self.start();
+        report.backend_failure()?;
 
         let path = match reference.source() {
             WallpaperSource::Path(path) => path.clone(),
