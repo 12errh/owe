@@ -117,12 +117,23 @@ else
   # compositor *alive but socket-less* at exactly 10s, which is a slow start at
   # least as likely as a hang. If it still fails at 30s, the failure diagnostics
   # now include the process state (zombie? uninterruptible IO?) to say which.
-  wayland_socket="$XDG_RUNTIME_DIR/wayland-0"
+  #
+  # Any socket name counts (wayland-0, wayland-1, …) — hardcoding one name made
+  # this loop blind to what the compositor actually did (CI runs 4–7 all waited
+  # for wayland-0 while the truth about the process was in the diagnostics).
+  wayland_socket=""
   for _ in $(seq 1 300); do
-    [ -S "$wayland_socket" ] && break
+    for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
+      # The `.lock` companion file is not the socket.
+      case "$candidate" in *.lock) continue ;; esac
+      if [ -S "$candidate" ]; then
+        wayland_socket="$candidate"
+        break 2
+      fi
+    done
     sleep 0.1
   done
-  [ -S "$wayland_socket" ] || fail "compositor never created $wayland_socket"
+  [ -n "$wayland_socket" ] || fail "compositor never created any wayland-* socket"
   echo "[smoke] compositor up: $wayland_socket"
 fi
 
