@@ -715,14 +715,18 @@ impl Engine {
         // rather than a confusing decode error.
         owe_media::ensure_supported(kind)?;
 
-        let report = self.start();
-        report.backend_failure()?;
-
-        // A transition request is validated here, before any output work: it is a
-        // property of the request, not of the environment (same rule as above).
+        // The transition *request* is validated on the same rule, and it has to
+        // happen before `start()` for that rule to hold: asking for a transition
+        // the config disallows is the client's mistake whether or not a compositor
+        // is attached, and the CLI is how a user discovers the allow-list. This
+        // sat below `start()` once and two handler tests passed on a desktop while
+        // failing in CI, where there is no session to start.
         if let Some(requested) = requested {
             self.validate_transition(requested)?;
         }
+
+        let report = self.start();
+        report.backend_failure()?;
 
         let path = match reference.source() {
             WallpaperSource::Path(path) => path.clone(),

@@ -190,7 +190,10 @@ mode="$(stat -c '%a' "$socket")"
 
 echo "[smoke] owectl hello"
 "$ctl" hello | tee "$work/hello.txt" || fail "owectl hello failed"
-grep -q 'ipc schema 1.0' "$work/hello.txt" || fail "hello did not report ipc schema 1.0"
+# Any 1.x minor is a pass: minors are additive by design (a new capability field
+# must not require a protocol bump), and pinning the exact minor here meant this
+# check failed the moment a later phase added one.
+grep -qE 'ipc schema 1\.[0-9]+' "$work/hello.txt" || fail "hello did not report an ipc schema 1.x"
 
 echo "[smoke] owectl kill"
 "$ctl" kill >/dev/null || fail "owectl kill failed"

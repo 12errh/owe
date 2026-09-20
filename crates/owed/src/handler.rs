@@ -1362,6 +1362,49 @@ mod tests {
     }
 
     #[test]
+    fn a_request_mistake_outranks_the_session_being_unavailable() {
+        // The rule this pins: whether the *request* is valid must not depend on
+        // whether a compositor happens to be attached, because "the daemon cannot
+        // start here" is not a useful answer to a misspelled transition — and the
+        // CLI is how a user discovers the allow-list in the first place.
+        //
+        // It regressed: the transition check sat *below* the session start, so a
+        // desktop got `BAD_REQUEST` naming `render.allow_transitions` while CI, with
+        // no session at all, got `CONFIG_INVALID: no shell backend` for the same
+        // request. Two tests passed on the developer's machine and failed on every
+        // CI run. A backend id that can never resolve makes the condition
+        // reproducible in both: start() is guaranteed to fail, so if the request is
+        // reported correctly *despite* that, the ordering is right.
+        let mut config = Config::default();
+        config.shell.backend = "no-such-backend".to_string();
+        config.render.allow_transitions = vec!["none".to_string(), "fade".to_string()];
+        let (handler, _tree) = handler_in_tree(config);
+
+        let disallowed = RequestFrame::new(
+            "c1",
+            method::WALLPAPER_SET,
+            json!({"source": "/tmp/x.png", "transition": "wave"}),
+        );
+        let error = handler.handle(&disallowed).unwrap_err();
+        assert_eq!(
+            error.code,
+            ErrorCode::BadRequest,
+            "a disallowed transition must be the client's fault, not the session's: {}",
+            error.msg
+        );
+        assert!(error.msg.contains("allow_transitions"), "{}", error.msg);
+
+        let unknown = RequestFrame::new(
+            "c2",
+            method::WALLPAPER_SET,
+            json!({"source": "/tmp/x.png", "transition": "explode"}),
+        );
+        let error = handler.handle(&unknown).unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest, "{}", error.msg);
+        assert!(error.msg.contains("explode"), "{}", error.msg);
+    }
+
+    #[test]
     fn transition_parameters_accept_a_name_and_a_table_and_reject_junk() {
         assert_eq!(
             parse_transition(&json!("wipe")).unwrap(),
