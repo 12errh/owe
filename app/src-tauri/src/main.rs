@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How long the status probe waits before calling the daemon unreachable.
 /// Short on purpose: a status bar must never make the window feel hung.
@@ -110,29 +110,181 @@ fn with_daemon<T>(
     request(&mut client).map_err(IpcError::from_client)
 }
 
-/// `library.list` → a listing the UI can render.
-fn list_wallpapers_from(socket: &Path, dir: &str) -> Result<LibraryListing, IpcError> {
-    let listing = with_daemon(socket, |client| {
-        client.call("library.list", serde_json::json!({ "dir": dir }))
+/// The `library.list` parameters the GUI actually sets.
+///
+/// All optional: the frontend sends only what the user changed, which leaves the
+/// daemon's own defaults (`page = 1`, `per_page = 100`, its configured roots) as
+/// the single authority instead of being duplicated here.
+#[derive(Debug, Default, Deserialize)]
+struct LibraryQuery {
+    /// Case-insensitive substring match against the name and path.
+    filter: Option<String>,
+    /// Restrict to a directory (inclusive of subdirectories).
+    dir: Option<String>,
+    /// Restrict to one content kind id.
+    kind: Option<String>,
+    /// 1-based page number.
+    page: Option<u32>,
+    /// Rows per page.
+    per_page: Option<u32>,
+    /// Ask the daemon to scan once when the index is empty, so a first launch shows
+    /// a library instead of an empty grid on a machine full of wallpapers.
+    scan_if_empty: Option<bool>,
+}
+
+impl LibraryQuery {
+    /// The `params` object for `library.list`, with unset keys omitted.
+    fn to_params(&self) -> serde_json::Value {
+        let mut params = serde_json::Map::new();
+        for (key, value) in [
+            ("filter", self.filter.as_deref()),
+            ("dir", self.dir.as_deref()),
+            ("kind", self.kind.as_deref()),
+        ] {
+            if let Some(text) = value.filter(|text| !text.is_empty()) {
+                params.insert(key.to_string(), serde_json::Value::String(text.to_string()));
+            }
+        }
+        if let Some(page) = self.page {
+            params.insert("page".to_string(), serde_json::json!(page));
+        }
+        if let Some(per_page) = self.per_page {
+            params.insert("per_page".to_string(), serde_json::json!(per_page));
+        }
+        if let Some(scan_if_empty) = self.scan_if_empty {
+            params.insert(
+                "scan_if_empty".to_string(),
+                serde_json::json!(scan_if_empty),
+            );
+        }
+        serde_json::Value::Object(params)
+    }
+}
+
+/// `library.list` → a page of the index the grid renders.
+fn library_index_from(socket: &Path, query: &LibraryQuery) -> Result<LibraryPage, IpcError> {
+    let reply = with_daemon(socket, |client| {
+        client.call(owe_ipc::protocol::method::LIBRARY_LIST, query.to_params())
     })?;
 
-    Ok(LibraryListing {
-        dir: field_str(&listing, "dir"),
-        entries: listing["entries"]
+    Ok(LibraryPage {
+        items: reply["items"]
             .as_array()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| WallpaperEntry {
-                        path: field_str(entry, "path"),
-                        name: field_str(entry, "name"),
-                        bytes: entry["bytes"].as_u64().unwrap_or(0),
-                    })
-                    .collect()
-            })
+            .map(|items| items.iter().map(library_item_from).collect())
             .unwrap_or_default(),
-        scope: field_str(&listing, "scope"),
+        total: reply["total"].as_u64().unwrap_or(0),
+        page: reply["page"].as_u64().unwrap_or(1).max(1) as u32,
+        pages: reply["pages"].as_u64().unwrap_or(0),
+        per_page: reply["per_page"].as_u64().unwrap_or(0) as u32,
+        thumbnail_size: reply["thumbnail_size"].as_u64().unwrap_or(0) as u32,
+        roots: string_list(&reply, "roots"),
     })
+}
+
+/// One row of `library.list`.
+fn library_item_from(item: &serde_json::Value) -> LibraryItem {
+    LibraryItem {
+        id: item["id"].as_i64().unwrap_or(0),
+        path: field_str(item, "path"),
+        name: field_str(item, "name"),
+        kind: field_str(item, "kind"),
+        reference: field_str(item, "reference"),
+        // `null` is meaningful here (the daemon stat-ed the cache and there is no
+        // thumbnail yet), so it must survive as `None` rather than become an empty
+        // string the webview would try to load as an image.
+        thumb: item["thumb"].as_str().map(str::to_string),
+        bytes: item["size_bytes"].as_u64().unwrap_or(0),
+    }
+}
+
+/// `library.scan` → what the scan did.
+fn library_scan_from(socket: &Path, paths: Option<Vec<String>>) -> Result<ScanSummary, IpcError> {
+    let reply = with_daemon(socket, |client| {
+        let params = match &paths {
+            // Omitted means "the configured `library.paths`", which is the daemon's
+            // rule to state, not the GUI's to guess.
+            Some(paths) if !paths.is_empty() => serde_json::json!({ "paths": paths }),
+            _ => serde_json::json!({}),
+        };
+        client.call(owe_ipc::protocol::method::LIBRARY_SCAN, params)
+    })?;
+
+    Ok(ScanSummary {
+        summary: field_str(&reply, "summary"),
+        roots: string_list(&reply, "roots"),
+        added: reply["added"].as_u64().unwrap_or(0),
+        updated: reply["updated"].as_u64().unwrap_or(0),
+        removed: reply["removed"].as_u64().unwrap_or(0),
+        unchanged: reply["unchanged"].as_u64().unwrap_or(0),
+        skipped_unsupported: reply["skipped_unsupported"].as_u64().unwrap_or(0),
+        rows_touched: reply["rows_touched"].as_u64().unwrap_or(0),
+        files_seen: reply["files_seen"].as_u64().unwrap_or(0),
+        missing_roots: string_list(&reply, "missing_roots"),
+        duration_ms: reply["duration_ms"].as_f64().unwrap_or(0.0),
+    })
+}
+
+/// `library.thumb` → the cached PNG for one item, as a data URL.
+///
+/// The bytes are read here and inlined rather than handing the webview a file
+/// path. That is a deliberate trade: it costs one file read per grid cell the user
+/// actually sees, and it buys a webview with **no filesystem access at all** — no
+/// `asset:` protocol to enable, no scope to widen, nothing to get wrong in a CSP.
+/// The daemon remains the only component that touches the cache as a path.
+fn library_thumb_from(socket: &Path, id: i64) -> Result<Thumbnail, IpcError> {
+    let reply = with_daemon(socket, |client| {
+        client.call(
+            owe_ipc::protocol::method::LIBRARY_THUMB,
+            serde_json::json!({ "id": id }),
+        )
+    })?;
+    let path = field_str(&reply, "path");
+
+    let bytes = std::fs::read(&path).map_err(|error| IpcError {
+        code: "cache".to_string(),
+        message: format!(
+            "the daemon reported a thumbnail at `{path}` but it could not be read: {error}"
+        ),
+    })?;
+
+    Ok(Thumbnail {
+        id: reply["id"].as_i64().unwrap_or(id),
+        path,
+        size: reply["size"].as_u64().unwrap_or(0) as u32,
+        cached: reply["cached"].as_bool().unwrap_or(false),
+        source: field_str(&reply, "source"),
+        data_url: format!("data:image/png;base64,{}", base64(&bytes)),
+    })
+}
+
+/// Standard-alphabet base64 with `=` padding.
+///
+/// Hand-rolled rather than a new dependency: it is twenty lines of pure function
+/// with an obvious test, and the alternative puts a crate in the GUI's tree for
+/// one encode per visible grid cell. Panics are impossible by construction (every
+/// index is masked to six bits), which is the property worth having here.
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let triple = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(char::from(ALPHABET[((triple >> 18) & 0x3f) as usize]));
+        out.push(char::from(ALPHABET[((triple >> 12) & 0x3f) as usize]));
+        out.push(if chunk.len() > 1 {
+            char::from(ALPHABET[((triple >> 6) & 0x3f) as usize])
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            char::from(ALPHABET[(triple & 0x3f) as usize])
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// `outputs.list` → the outputs view.
@@ -166,29 +318,87 @@ fn list_outputs_from(socket: &Path) -> Result<OutputsView, IpcError> {
     })
 }
 
-/// `wallpaper.set` → what was applied.
-fn apply_wallpaper_to(
-    socket: &Path,
-    path: &str,
+/// The `source` object for a reference, in the documented object form
+/// (BACKEND-DESIGN §3).
+///
+/// `library:<id>` and `shader:<name>` are prefixes on the wire only where a user
+/// types the reference; the object form names the *source* key, and the daemon
+/// rejects a request that names more than one — so the mapping has to be exact,
+/// not a best-effort guess.
+fn source_params(reference: &str) -> serde_json::Value {
+    if let Some(id) = reference.strip_prefix("library:") {
+        serde_json::json!({ "library_id": id })
+    } else if let Some(name) = reference.strip_prefix("shader:") {
+        serde_json::json!({ "name": name })
+    } else {
+        serde_json::json!({ "path": reference })
+    }
+}
+
+/// The `wallpaper.set` parameters for one target.
+fn set_params(
+    reference: &str,
     output: Option<&str>,
+    transition: Option<&TransitionRequest>,
+) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    // An omitted `output` means "all outputs" — the daemon's default. Sending a
+    // keyword by hand would restate that rule here, where it could drift.
+    if let Some(name) = output {
+        params.insert("output".to_string(), serde_json::json!(name));
+    }
+    params.insert("source".to_string(), source_params(reference));
+    if let Some(transition) = transition {
+        params.insert("transition".to_string(), serde_json::json!(transition));
+    }
+    serde_json::Value::Object(params)
+}
+
+/// `wallpaper.set` → what was applied.
+///
+/// `outputs` is the assignment the user made: empty means "every output", and one
+/// or more names means exactly those. The daemon's target is a single name or a
+/// keyword, so a multi-output assignment is one request per output over a *single*
+/// connection — which is what makes "put this on two of my three monitors"
+/// expressible at all, and keeps it one handshake instead of N.
+fn assign_wallpaper_to(
+    socket: &Path,
+    reference: &str,
+    outputs: &[String],
+    transition: Option<&TransitionRequest>,
 ) -> Result<ApplyOutcome, IpcError> {
-    let reply = with_daemon(socket, |client| {
-        let params = match output {
-            // The documented object form (BACKEND-DESIGN §3) so the GUI exercises
-            // the same shape a script would. `output` is omitted to mean "all",
-            // which is the daemon's default rather than a name it must know.
-            Some(name) => serde_json::json!({ "output": name, "source": { "path": path } }),
-            None => serde_json::json!({ "source": { "path": path } }),
-        };
-        client.call("wallpaper.set", params)
+    let replies = with_daemon(socket, |client| {
+        let mut replies = Vec::new();
+        if outputs.is_empty() {
+            replies.push(client.call(
+                owe_ipc::protocol::method::WALLPAPER_SET,
+                set_params(reference, None, transition),
+            )?);
+        } else {
+            for output in outputs {
+                replies.push(client.call(
+                    owe_ipc::protocol::method::WALLPAPER_SET,
+                    set_params(reference, Some(output.as_str()), transition),
+                )?);
+            }
+        }
+        Ok(replies)
     })?;
 
-    Ok(ApplyOutcome {
-        reference: field_str(&reply, "reference"),
-        kind: field_str(&reply, "kind"),
-        outputs: string_list(&reply, "outputs"),
-        notes: string_list(&reply, "notes"),
-    })
+    let mut outcome = ApplyOutcome {
+        reference: reference.to_string(),
+        kind: String::new(),
+        outputs: Vec::new(),
+        notes: Vec::new(),
+    };
+    for reply in replies {
+        if outcome.kind.is_empty() {
+            outcome.kind = field_str(&reply, "kind");
+        }
+        outcome.outputs.extend(string_list(&reply, "outputs"));
+        outcome.notes.extend(string_list(&reply, "notes"));
+    }
+    Ok(outcome)
 }
 
 /// `wallpaper.clear` → the outputs that were cleared.
@@ -224,21 +434,74 @@ fn string_list(value: &serde_json::Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// One wallpaper file the library knows about.
+/// One indexed wallpaper, as the grid renders it.
 #[derive(Debug, Serialize)]
-struct WallpaperEntry {
+struct LibraryItem {
+    id: i64,
     path: String,
     name: String,
+    kind: String,
+    /// `library:<id>` — what `wallpaper.set` accepts, so the UI never has to build
+    /// a reference itself.
+    reference: String,
+    /// Cached thumbnail path, or `null` when the UI must call `library.thumbnail`.
+    thumb: Option<String>,
     bytes: u64,
 }
 
-/// A directory listing from `library.list`.
+/// A page of the indexed library.
 #[derive(Debug, Serialize)]
-struct LibraryListing {
-    dir: String,
-    entries: Vec<WallpaperEntry>,
-    /// What the daemon actually scanned, so the UI never implies more.
-    scope: String,
+struct LibraryPage {
+    items: Vec<LibraryItem>,
+    total: u64,
+    page: u32,
+    pages: u64,
+    per_page: u32,
+    /// Longest edge the daemon generates thumbnails at, for grid sizing.
+    thumbnail_size: u32,
+    /// Roots the daemon is indexing, so the UI can say where it is looking.
+    roots: Vec<String>,
+}
+
+/// What a scan did (the daemon's `ScanReport`, flattened for the UI).
+#[derive(Debug, Serialize)]
+struct ScanSummary {
+    summary: String,
+    roots: Vec<String>,
+    added: u64,
+    updated: u64,
+    removed: u64,
+    unchanged: u64,
+    skipped_unsupported: u64,
+    rows_touched: u64,
+    files_seen: u64,
+    /// Configured roots that were unreachable — the reason a library looks empty.
+    missing_roots: Vec<String>,
+    duration_ms: f64,
+}
+
+/// A materialised thumbnail.
+#[derive(Debug, Serialize)]
+struct Thumbnail {
+    id: i64,
+    /// Where the daemon cached it (shown in the UI's tooltip, not loaded by the
+    /// webview — see [`library_thumb_from`]).
+    path: String,
+    size: u32,
+    /// Whether it was already in the cache (vs generated for this request).
+    cached: bool,
+    /// The wallpaper it was made from.
+    source: String,
+    /// The PNG itself, as a `data:` URL.
+    data_url: String,
+}
+
+/// A transition request: exactly the daemon's `{name, duration_ms, fps}` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransitionRequest {
+    name: String,
+    duration_ms: u64,
+    fps: u32,
 }
 
 /// One output as the daemon describes it.
@@ -286,6 +549,9 @@ struct DaemonStatus {
     shell_backends: Vec<String>,
     content_kinds: Vec<String>,
     media_backends: Vec<String>,
+    /// Transition ids the picker may offer: whatever this build renders **and**
+    /// `render.allow_transitions` currently permits.
+    transitions: Vec<String>,
     /// Planned-but-missing features (`"<id>: <why>"`). Shown, not hidden.
     unavailable: Vec<String>,
     error: Option<String>,
@@ -302,6 +568,7 @@ impl DaemonStatus {
             shell_backends: Vec::new(),
             content_kinds: Vec::new(),
             media_backends: Vec::new(),
+            transitions: Vec::new(),
             unavailable: Vec::new(),
             error: Some(error),
         }
@@ -314,9 +581,18 @@ fn probe_daemon() -> DaemonStatus {
         Ok(path) => path,
         Err(error) => return DaemonStatus::unreachable(String::new(), error.to_string()),
     };
+    probe_socket(&socket)
+}
+
+/// The status probe against a given socket.
+///
+/// Split out from [`probe_daemon`] for the same reason every other request path
+/// takes its socket as an argument: it is what lets the tests read a stub daemon's
+/// `hello` through the exact code the status bar uses.
+fn probe_socket(socket: &Path) -> DaemonStatus {
     let socket_path = socket.display().to_string();
 
-    let mut client = match owe_ipc::Client::connect_with_timeout(&socket, PROBE_TIMEOUT) {
+    let mut client = match owe_ipc::Client::connect_with_timeout(socket, PROBE_TIMEOUT) {
         Ok(client) => client,
         Err(error) => return DaemonStatus::unreachable(socket_path, error.to_string()),
     };
@@ -330,6 +606,7 @@ fn probe_daemon() -> DaemonStatus {
             shell_backends: reply.capabilities.shell_backends,
             content_kinds: reply.capabilities.content_kinds,
             media_backends: reply.capabilities.media_backends,
+            transitions: reply.capabilities.transitions,
             unavailable: reply.capabilities.unavailable,
             error: None,
         },
@@ -347,11 +624,28 @@ async fn daemon_status() -> DaemonStatus {
     }
 }
 
-/// List image files in a directory (the daemon does the scanning, not the GUI).
+/// Query the indexed library (the daemon owns the index; the GUI owns no state).
 #[tauri::command]
-async fn list_wallpapers(dir: String) -> Result<LibraryListing, IpcError> {
+async fn library_index(query: LibraryQuery) -> Result<LibraryPage, IpcError> {
     let socket = daemon_socket()?;
-    run_blocking(move || list_wallpapers_from(&socket, &dir)).await
+    run_blocking(move || library_index_from(&socket, &query)).await
+}
+
+/// Ask the daemon to rescan its configured roots.
+#[tauri::command]
+async fn library_scan(paths: Option<Vec<String>>) -> Result<ScanSummary, IpcError> {
+    let socket = daemon_socket()?;
+    run_blocking(move || library_scan_from(&socket, paths)).await
+}
+
+/// Materialise (or fetch) the cached thumbnail for one library item.
+///
+/// Called per grid cell, not per page: a 500-file page would otherwise decode 500
+/// images to display twelve.
+#[tauri::command]
+async fn library_thumbnail(id: i64) -> Result<Thumbnail, IpcError> {
+    let socket = daemon_socket()?;
+    run_blocking(move || library_thumb_from(&socket, id)).await
 }
 
 /// Ask the daemon about its outputs (the state it also renders on).
@@ -361,11 +655,17 @@ async fn list_outputs() -> Result<OutputsView, IpcError> {
     run_blocking(move || list_outputs_from(&socket)).await
 }
 
-/// Apply a wallpaper to one output (or all of them).
+/// Apply a wallpaper to a set of outputs (empty means all of them), optionally
+/// through a chosen transition.
 #[tauri::command]
-async fn apply_wallpaper(path: String, output: Option<String>) -> Result<ApplyOutcome, IpcError> {
+async fn assign_wallpaper(
+    reference: String,
+    outputs: Vec<String>,
+    transition: Option<TransitionRequest>,
+) -> Result<ApplyOutcome, IpcError> {
     let socket = daemon_socket()?;
-    run_blocking(move || apply_wallpaper_to(&socket, &path, output.as_deref())).await
+    run_blocking(move || assign_wallpaper_to(&socket, &reference, &outputs, transition.as_ref()))
+        .await
 }
 
 /// Remove the wallpaper from one output (or all of them).
@@ -413,14 +713,22 @@ fn main() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             daemon_status,
-            list_wallpapers,
+            library_index,
+            library_scan,
+            library_thumbnail,
             list_outputs,
-            apply_wallpaper,
+            assign_wallpaper,
             clear_wallpaper
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the OWE window");
 }
+
+/// The record/replay harness (IMPLEMENTATION-PLAN Phase 2, "GUI mock-daemon test
+/// harness"). Test-only: it exists to serve a recording to the tests, and nothing
+/// in the shipped binary may depend on a fixture.
+#[cfg(test)]
+mod replay;
 
 #[cfg(test)]
 mod tests {
@@ -440,6 +748,9 @@ mod tests {
         asks: Mutex<Vec<(String, Value)>>,
         hello_count: AtomicUsize,
         fail_with: Option<(ErrorCode, String)>,
+        /// Where the stub claims the cached thumbnail lives. Points nowhere until
+        /// a test aims it at a real file, so "no thumbnail" is the default state.
+        thumbnail_path: Mutex<String>,
     }
 
     impl StubDaemon {
@@ -448,6 +759,7 @@ mod tests {
                 asks: Mutex::new(Vec::new()),
                 hello_count: AtomicUsize::new(0),
                 fail_with: None,
+                thumbnail_path: Mutex::new("/nonexistent/thumb.png".to_string()),
             }
         }
 
@@ -456,6 +768,11 @@ mod tests {
                 fail_with: Some((code, message.to_string())),
                 ..Self::new()
             }
+        }
+
+        /// Aim the stub's `library.thumb` reply at a real file.
+        fn serve_thumbnail(&self, path: &Path) {
+            *self.thumbnail_path.lock().expect("stub lock") = path.display().to_string();
         }
 
         fn ask(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
@@ -477,17 +794,64 @@ mod tests {
                             "shell_backends": ["hyprland"],
                             "content_kinds": ["static-image"],
                             "media_backends": ["image"],
+                            "transitions": ["none", "fade", "wipe"],
                             "unavailable": ["caelestia: planned for P3"],
                         },
                     }))
                 }
-                "library.list" => Ok(json!({
-                    "dir": "/tmp/walls",
-                    "entries": [
-                        { "name": "a.png", "path": "/tmp/walls/a.png", "bytes": 10 },
-                        { "name": "b.jpg", "path": "/tmp/walls/b.jpg", "bytes": 20 },
+                method::LIBRARY_LIST => Ok(json!({
+                    "items": [
+                        {
+                            "id" : 1,
+                            "path": "/walls/a.png",
+                            "name": "a.png",
+                            "kind": "static-image",
+                            "reference": "library:1",
+                            "size_bytes": 10,
+                            "thumb": "/cache/thumbs/256/aaa.png",
+                        },
+                        {
+                            "id": 2,
+                            "path": "/walls/b.jpg",
+                            "name": "b.jpg",
+                            "kind": "static-image",
+                            "reference": "library:2",
+                            "size_bytes": 20,
+                            // Deliberately null: the UI must be able to tell "no
+                            // thumbnail yet" from "thumbnail at the empty path".
+                            "thumb": null,
+                        },
                     ],
-                    "scope": "one level, images only",
+                    "total": 2,
+                    "page": 1,
+                    "per_page": 100,
+                    "pages": 1,
+                    "thumbnail_size": 256,
+                    "roots": ["/walls"],
+                })),
+                method::LIBRARY_SCAN => Ok(json!({
+                    "scan_id": 1,
+                    "finished": true,
+                    "summary": "scanned 1 root(s): 3 file(s) seen, +2 ~0 -0 (0 unchanged, 1 skipped)",
+                    "roots": ["/walls"],
+                    "added": 2,
+                    "updated": 0,
+                    "removed": 0,
+                    "unchanged": 0,
+                    "skipped_unsupported": 1,
+                    "rows_touched": 2,
+                    "files_seen": 3,
+                    "missing_roots": ["/mnt/usb"],
+                    "unreadable_dirs": [],
+                    "duration_ms": 4.5,
+                    "wall_clock_ms": 4.6,
+                })),
+                method::LIBRARY_THUMB => Ok(json!({
+                    "id": request.params["id"],
+                    "path": self.thumbnail_path.lock().expect("stub lock").clone(),
+                    "size": 256,
+                    "cached": false,
+                    "source": "/walls/a.png",
                 })),
                 method::OUTPUTS_LIST => Ok(json!({
                     "outputs": [{
@@ -565,20 +929,40 @@ mod tests {
     }
 
     #[test]
-    fn the_library_listing_reaches_the_shape_the_ui_renders() {
+    fn the_library_page_reaches_the_shape_the_grid_renders() {
         let daemon = Arc::new(StubDaemon::new());
         let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
 
-        let listing = list_wallpapers_from(&socket, "/tmp/walls").expect("listing");
-        assert_eq!(listing.dir, "/tmp/walls");
-        assert_eq!(listing.entries.len(), 2);
-        assert_eq!(listing.entries[0].name, "a.png");
-        assert_eq!(listing.entries[1].bytes, 20);
-        assert_eq!(listing.scope, "one level, images only");
+        let page = library_index_from(
+            &socket,
+            &LibraryQuery {
+                filter: Some("a".to_string()),
+                page: Some(2),
+                scan_if_empty: Some(true),
+                ..LibraryQuery::default()
+            },
+        )
+        .expect("page");
+
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].name, "a.png");
+        assert_eq!(page.items[0].reference, "library:1");
+        assert_eq!(page.items[1].bytes, 20);
+        assert!(page.items[1].thumb.is_none(), "null must stay null");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.pages, 1);
+        assert_eq!(page.thumbnail_size, 256);
+        assert_eq!(page.roots, vec!["/walls".to_string()]);
 
         let asks = daemon.asks.lock().unwrap();
         let (_, params) = asks.last().expect("one request recorded");
-        assert_eq!(params["dir"], json!("/tmp/walls"));
+        assert_eq!(params["filter"], json!("a"));
+        assert_eq!(params["page"], json!(2));
+        assert_eq!(params["scan_if_empty"], json!(true));
+        assert!(
+            params.get("dir").is_none(),
+            "an unset directory must be omitted so the daemon's roots stay authoritative"
+        );
         assert_eq!(
             daemon.hello_count.load(Ordering::Relaxed),
             1,
@@ -587,36 +971,223 @@ mod tests {
     }
 
     #[test]
-    fn applying_uses_the_documented_source_object_and_reads_back_every_field() {
+    fn a_scan_summary_reports_what_the_scan_did_and_what_it_could_not_reach() {
         let daemon = Arc::new(StubDaemon::new());
         let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
 
-        // No output given: the parameter must be *absent*, not `"all"` by hand,
-        // so the daemon's own default stays authoritative.
-        let outcome = apply_wallpaper_to(&socket, "/tmp/walls/a.png", None).expect("apply");
-        assert_eq!(outcome.reference, "/tmp/walls/a.png");
-        assert_eq!(outcome.kind, "static-image");
-        assert_eq!(outcome.outputs, vec!["eDP-1".to_string()]);
+        let summary = library_scan_from(&socket, None).expect("scan");
+        assert_eq!(summary.added, 2);
+        assert_eq!(summary.skipped_unsupported, 1);
+        assert_eq!(summary.files_seen, 3);
+        assert_eq!(summary.rows_touched, 2);
+        assert!((summary.duration_ms - 4.5).abs() < 1e-9);
         assert_eq!(
-            outcome.notes.len(),
-            1,
-            "the daemon's note must reach the UI"
+            summary.missing_roots,
+            vec!["/mnt/usb".to_string()],
+            "an unreachable root is the reason a library looks empty and must be shown"
         );
 
         {
             let asks = daemon.asks.lock().unwrap();
             let (_, params) = asks.last().expect("recorded");
-            assert_eq!(params["source"]["path"], json!("/tmp/walls/a.png"));
-            assert!(params.get("output").is_none(), "omitted means all outputs");
+            assert!(
+                params.get("paths").is_none(),
+                "no paths means the daemon's configured roots, so the key must be absent"
+            );
         }
 
-        // Named output: it must be passed through untouched.
-        apply_wallpaper_to(&socket, "/tmp/walls/b.jpg", Some("HDMI-A-1")).expect("apply");
+        // With explicit paths, they must be sent as given.
+        library_scan_from(&socket, Some(vec!["/tmp/custom".to_string()])).expect("scan");
         {
             let asks = daemon.asks.lock().unwrap();
             let (_, params) = asks.last().expect("recorded");
-            assert_eq!(params["output"], json!("HDMI-A-1"));
+            assert_eq!(params["paths"], json!(["/tmp/custom"]));
         }
+    }
+
+    #[test]
+    fn a_thumbnail_is_inlined_as_a_data_url_and_its_cache_state_survives() {
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+
+        // A real file: the command reads the bytes the daemon wrote, so the test has
+        // to put bytes there. A stubbed path with nothing behind it is asserted in
+        // its own test below.
+        let store = tempfile::tempdir().expect("temp dir");
+        let png = store.path().join("thumb.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 1, 2, 3]).expect("write png");
+        daemon.serve_thumbnail(&png);
+
+        let thumbnail = library_thumb_from(&socket, 1).expect("thumb");
+        assert_eq!(thumbnail.id, 1);
+        assert_eq!(thumbnail.path, png.display().to_string());
+        assert_eq!(thumbnail.size, 256);
+        assert!(
+            !thumbnail.cached,
+            "a freshly generated thumbnail is not cached"
+        );
+        assert_eq!(thumbnail.source, "/walls/a.png");
+        assert_eq!(
+            thumbnail.data_url, "data:image/png;base64,iVBORwECAw==",
+            "the webview receives the bytes, never a path it would have to open"
+        );
+
+        {
+            let asks = daemon.asks.lock().unwrap();
+            let (_, params) = asks.last().expect("recorded");
+            assert_eq!(params["id"], json!(1));
+        }
+    }
+
+    #[test]
+    fn a_thumbnail_that_cannot_be_read_is_reported_rather_than_shown_as_broken() {
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+
+        let failure = library_thumb_from(&socket, 3).expect_err("nothing at that path");
+        assert_eq!(failure.code, "cache");
+        assert!(
+            failure.message.contains("/nonexistent/thumb.png"),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        // Padding is where a hand-rolled encoder goes wrong, so every remainder
+        // class is pinned.
+        for (input, expected) in [
+            (&b""[..], ""),
+            (&b"f"[..], "Zg=="),
+            (&b"fo"[..], "Zm8="),
+            (&b"foo"[..], "Zm9v"),
+            (&b"foob"[..], "Zm9vYg=="),
+            (&b"fooba"[..], "Zm9vYmE="),
+            (&b"foobar"[..], "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn assigning_to_two_outputs_sends_both_over_one_connection() {
+        // The GUI's "assign these two, not those" case. It must not collapse into
+        // "all outputs", and it must not pay for two handshakes either.
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+
+        let outputs = vec!["eDP-1".to_string(), "HDMI-A-1".to_string()];
+        let outcome = assign_wallpaper_to(&socket, "/walls/a.png", &outputs, None).expect("apply");
+        assert_eq!(outcome.reference, "/walls/a.png");
+        assert_eq!(outcome.kind, "static-image");
+        assert_eq!(
+            outcome.outputs,
+            vec!["eDP-1".to_string(), "eDP-1".to_string()]
+        );
+
+        {
+            let asks = daemon.asks.lock().unwrap();
+            let sets: Vec<&Value> = asks
+                .iter()
+                .filter(|(method, _)| method == method::WALLPAPER_SET)
+                .map(|(_, params)| params)
+                .collect();
+            assert_eq!(sets.len(), 2, "one request per assigned output");
+            assert_eq!(sets[0]["output"], json!("eDP-1"));
+            assert_eq!(sets[1]["output"], json!("HDMI-A-1"));
+            assert_eq!(sets[0]["source"]["path"], json!("/walls/a.png"));
+        }
+        assert_eq!(
+            daemon.hello_count.load(Ordering::Relaxed),
+            1,
+            "two outputs must not mean two handshakes"
+        );
+    }
+
+    #[test]
+    fn assigning_nothing_means_every_output() {
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+
+        assign_wallpaper_to(&socket, "/walls/a.png", &[], None).expect("apply all");
+
+        let asks = daemon.asks.lock().unwrap();
+        let (_, params) = asks.last().expect("recorded");
+        assert!(
+            params.get("output").is_none(),
+            "an omitted output means all, which is the daemon's default to state"
+        );
+    }
+
+    #[test]
+    fn a_library_reference_becomes_a_library_id_source() {
+        // `library:<id>` is what the grid applies; sending it as a `path` would
+        // make the daemon look for a file literally named `library:1`.
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+
+        assign_wallpaper_to(&socket, "library:7", &["eDP-1".to_string()], None).expect("apply");
+        {
+            let asks = daemon.asks.lock().unwrap();
+            let (_, params) = asks.last().expect("recorded");
+            assert_eq!(params["source"]["library_id"], json!("7"));
+            assert!(params["source"].get("path").is_none());
+        }
+
+        assign_wallpaper_to(&socket, "/walls/a.png", &[], None).expect("apply");
+        {
+            let asks = daemon.asks.lock().unwrap();
+            let (_, params) = asks.last().expect("recorded");
+            assert_eq!(params["source"]["path"], json!("/walls/a.png"));
+        }
+    }
+
+    #[test]
+    fn a_transition_request_uses_the_documented_table_form() {
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+
+        let transition = TransitionRequest {
+            name: "wave".to_string(),
+            duration_ms: 450,
+            fps: 60,
+        };
+        assign_wallpaper_to(&socket, "/walls/a.png", &[], Some(&transition)).expect("apply");
+
+        // Each lock is its own scope: holding the stub's mutex across the *next*
+        // IPC call deadlocks the server on its own bookkeeping, which surfaces as a
+        // 20-second client timeout rather than as a lock error.
+        {
+            let asks = daemon.asks.lock().unwrap();
+            let (_, params) = asks.last().expect("recorded");
+            assert_eq!(
+                params["transition"],
+                json!({ "name": "wave", "duration_ms": 450, "fps": 60 })
+            );
+        }
+
+        // No transition chosen: the key must be absent, so the daemon's configured
+        // default applies rather than a transition the GUI invented.
+        assign_wallpaper_to(&socket, "/walls/a.png", &[], None).expect("apply");
+        {
+            let asks = daemon.asks.lock().unwrap();
+            let (_, params) = asks.last().expect("recorded");
+            assert!(params.get("transition").is_none());
+        }
+    }
+
+    #[test]
+    fn the_status_view_carries_the_transitions_the_picker_may_offer() {
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+
+        let status = probe_socket(&socket);
+        assert!(status.connected);
+        assert_eq!(
+            status.transitions,
+            vec!["none".to_string(), "fade".to_string(), "wipe".to_string()],
+            "the picker's options come from the daemon, not from a hardcoded list"
+        );
     }
 
     #[test]
@@ -648,7 +1219,7 @@ mod tests {
         let daemon = Arc::new(StubDaemon::failing(ErrorCode::NotFound, "no such file"));
         let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
 
-        let failure = apply_wallpaper_to(&socket, "/nope.png", None).expect_err("must fail");
+        let failure = assign_wallpaper_to(&socket, "/nope.png", &[], None).expect_err("must fail");
         assert_eq!(failure.code, "NOT_FOUND");
         assert_eq!(failure.message, "no such file");
     }
@@ -660,8 +1231,10 @@ mod tests {
         let _ = &dir;
         for failure in [
             list_outputs_from(&missing).expect_err("no daemon"),
-            list_wallpapers_from(&missing, "/tmp").expect_err("no daemon"),
-            apply_wallpaper_to(&missing, "/tmp/a.png", None).expect_err("no daemon"),
+            library_index_from(&missing, &LibraryQuery::default()).expect_err("no daemon"),
+            library_scan_from(&missing, None).expect_err("no daemon"),
+            library_thumb_from(&missing, 1).expect_err("no daemon"),
+            assign_wallpaper_to(&missing, "/tmp/a.png", &[], None).expect_err("no daemon"),
             clear_wallpaper_on(&missing, None).expect_err("no daemon"),
         ] {
             assert_eq!(failure.code, "unreachable", "{}", failure.message);

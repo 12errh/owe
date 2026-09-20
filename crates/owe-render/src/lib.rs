@@ -23,8 +23,10 @@ pub mod golden;
 pub mod gpu;
 pub mod image;
 pub mod surface;
+pub mod transition;
 
 pub use golden::{GoldenImage, GoldenMode, GoldenOutcome, ImageDiff, verify_or_record};
 pub use gpu::{HeadlessGpu, RenderError};
 pub use image::{PixelFormat, QuadPlan, Scaling};
 pub use surface::{Frame, PresentError, PresentOutcome, Presenter};
+pub use transition::{GOLDEN_SIZES, Params, Schedule, TransitionKind, TransitionRenderer};

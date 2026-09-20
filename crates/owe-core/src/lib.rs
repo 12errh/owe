@@ -16,17 +16,25 @@
 
 pub mod config;
 pub mod error;
+pub mod library;
 pub mod model;
 pub mod output;
+pub mod outputs;
 pub mod path;
 pub mod shell;
 pub mod state;
+pub mod supervisor;
+pub mod thumbs;
 pub mod worker;
 
 pub use config::Config;
 pub use error::{ConfigError, ModelError, PathError};
+pub use library::{FileStamp, Item, Library, LibraryError, ListQuery, ScanReport};
 pub use model::{ContentKind, WallpaperRef, WallpaperSource};
 pub use output::{OutputInfo, OutputSelectError, OutputTarget, resolve as resolve_outputs};
+pub use outputs::{OutputResolution, Precedence};
 pub use shell::{Registry as ShellRegistry, SelectError, ShellBackend, ShellError};
 pub use state::{STATE_VERSION, SessionState};
+pub use supervisor::{HotplugEvent, Supervisor, SupervisorAction};
+pub use thumbs::{Decision as ThumbDecision, Scheduler as ThumbnailScheduler, ThumbJob};
 pub use worker::{OutputWorker, WorkerAction, WorkerEvent, WorkerState};

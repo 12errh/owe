@@ -12,6 +12,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+# The library index (FR-LIB-1, ARCHITECTURE §2 puts it in this crate).
+# `bundled` compiles SQLite from source so the daemon's behaviour — mtime
+# resolution, ORDER BY collation, WAL behaviour — is identical on every machine
+# and in CI, instead of varying with whatever libsqlite3 the distro ships.
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

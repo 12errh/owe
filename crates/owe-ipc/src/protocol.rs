@@ -19,7 +19,7 @@ use crate::frame::FrameError;
 pub const SCHEMA_MAJOR: u32 = 1;
 
 /// Schema minor version of this build. Additive change ⇒ bump.
-pub const SCHEMA_MINOR: u32 = 0;
+pub const SCHEMA_MINOR: u32 = 1;
 
 /// A `(major, minor)` schema version pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +75,8 @@ pub mod method {
     pub const LIBRARY_SCAN: &str = "library.scan";
     /// Query the library.
     pub const LIBRARY_LIST: &str = "library.list";
+    /// Materialise a cached thumbnail for one library item.
+    pub const LIBRARY_THUMB: &str = "library.thumb";
     /// Query the governor policy for an output.
     pub const GOVERNOR_POLICY: &str = "governor.policy";
     /// Temporarily override the governor (tray "pause" button).
@@ -97,6 +99,7 @@ pub mod method {
         PLAYBACK_CMD,
         LIBRARY_SCAN,
         LIBRARY_LIST,
+        LIBRARY_THUMB,
         GOVERNOR_POLICY,
         GOVERNOR_OVERRIDE,
         STATS_GET,
@@ -328,6 +331,16 @@ pub struct Capabilities {
     pub content_kinds: Vec<String>,
     /// Media decode backends this build can use.
     pub media_backends: Vec<String>,
+    /// Transition names this build renders **and** the active configuration
+    /// allows, in catalogue order.
+    ///
+    /// Additive field (schema-minor): the GUI's transition picker reads its
+    /// options from here instead of hardcoding a list that drifts from the
+    /// shader's catalogue or from `render.allow_transitions`. Derived from the
+    /// live config, so a daemon with `allow_transitions = ["none"]` cannot offer
+    /// a picker full of transitions every apply will refuse.
+    #[serde(default)]
+    pub transitions: Vec<String>,
     /// Things the project supports on paper but **this build cannot do**, each as
     /// `"<id>: <why>"`.
     ///
@@ -487,6 +500,7 @@ mod tests {
                 shell_backends: vec!["hyprland".into()],
                 content_kinds: vec!["static-image".into()],
                 media_backends: vec!["auto".into()],
+                transitions: vec!["none".into(), "fade".into()],
                 unavailable: vec!["caelestia: planned for P3".into()],
             },
         };

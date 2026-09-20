@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use owe_core::Config;
 use owe_core::config::SUPPORTED_SCHEMA;
+use owe_core::config::Transition;
+use owe_core::library::ListQuery;
 use owe_core::model::ContentKind;
 use owe_core::output::OutputTarget;
 use owe_ipc::protocol::{self, method};
@@ -24,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::engine::{Engine, EngineError};
+use crate::library::{LibraryService, parse_kind};
 
 /// Protocol methods actually implemented by this build, in advertised order.
 ///
@@ -38,7 +41,9 @@ pub const IMPLEMENTED_METHODS: &[&str] = &[
     method::WALLPAPER_SET,
     method::WALLPAPER_CLEAR,
     method::GOVERNOR_OVERRIDE,
+    method::LIBRARY_SCAN,
     method::LIBRARY_LIST,
+    method::LIBRARY_THUMB,
 ];
 
 /// Media decode backends this build actually has.
@@ -65,8 +70,9 @@ const KNOWN_BUT_NOT_YET: &[(&str, &str)] = &[
         "content kind planned for P5 (WGSL packs, previews)",
     ),
     (
-        "transitions",
-        "planned for P2; `wallpaper.set` accepts a transition request and says so in its reply",
+        "avif",
+        "AVIF/HEIC decoding is compiled out by default (P2 decision): the decoder is a large \
+         C dependency chain and the reference profile decodes JPEG/PNG/WebP only",
     ),
 ];
 
@@ -151,11 +157,44 @@ struct OverrideParams {
     policy: String,
 }
 
-/// Parameters of `library.list`.
+/// Parameters of `library.list` (schema 1.1: `dir` is an index filter, not a
+/// one-level directory scan).
+#[derive(Debug, Default, Deserialize)]
+struct LibraryListParams {
+    /// Case-insensitive substring match against the file name and path.
+    #[serde(default)]
+    filter: Option<String>,
+    /// Restrict to a directory (inclusive of subdirectories).
+    #[serde(default)]
+    dir: Option<String>,
+    /// Restrict to one content kind id (`static-image`, …).
+    #[serde(default)]
+    kind: Option<String>,
+    /// 1-based page number; defaults to 1.
+    #[serde(default)]
+    page: Option<u32>,
+    /// Rows per page (clamped to 500); defaults to 100.
+    #[serde(default)]
+    per_page: Option<u32>,
+    /// Start the scan before listing, so the first GUI call has something to show
+    /// without a second round trip.
+    #[serde(default)]
+    scan_if_empty: Option<bool>,
+}
+
+/// Parameters of `library.scan`.
+#[derive(Debug, Default, Deserialize)]
+struct LibraryScanParams {
+    /// Roots to scan; omitted means "the configured `library.paths`".
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+}
+
+/// Parameters of `library.thumb`.
 #[derive(Debug, Deserialize)]
-struct LibraryParams {
-    /// Directory to scan (one level deep, P1 scope).
-    dir: String,
+struct LibraryThumbParams {
+    /// Library id, as returned by `library.list`.
+    id: i64,
 }
 
 /// State shared between the IPC handler and the engine.
@@ -164,7 +203,10 @@ pub struct DaemonState {
     config: Config,
     socket_path: PathBuf,
     shutdown: Shutdown,
-    engine: Engine,
+    /// Shared with the hotplug listener, which re-applies wallpapers on the same
+    /// engine when an output appears.
+    engine: Arc<Engine>,
+    library: Arc<LibraryService>,
 }
 
 #[allow(
@@ -177,13 +219,30 @@ impl DaemonState {
     ///
     /// The [`Shutdown`] handle is shared with the IPC server, so a `daemon.kill`
     /// request actually stops the accept loop (one flag, one truth).
-    pub fn new(config: Config, socket_path: PathBuf, shutdown: Shutdown, engine: Engine) -> Self {
+    pub fn new(
+        config: Config,
+        socket_path: PathBuf,
+        shutdown: Shutdown,
+        engine: Arc<Engine>,
+        library: Arc<LibraryService>,
+    ) -> Self {
         Self {
             config,
             socket_path,
             shutdown,
             engine,
+            library,
         }
+    }
+
+    /// The library index and thumbnail cache.
+    pub fn library(&self) -> &Arc<LibraryService> {
+        &self.library
+    }
+
+    /// The render engine, shared with the hotplug listener.
+    pub fn shared_engine(&self) -> &Arc<Engine> {
+        &self.engine
     }
 
     /// The effective configuration.
@@ -245,6 +304,9 @@ impl IpcHandler {
                 .iter()
                 .map(|id| (*id).to_string())
                 .collect(),
+            // The live config's allow-list, not the full catalogue: a picker that
+            // offers what `wallpaper.set` will refuse is worse than a short list.
+            transitions: self.state.config.render.allow_transitions.clone(),
             unavailable: KNOWN_BUT_NOT_YET
                 .iter()
                 .map(|(id, why)| format!("{id}: {why}"))
@@ -316,11 +378,18 @@ impl IpcHandler {
             .unwrap_or(OutputTarget::All);
         let reference = source_reference(&params.source)?;
 
+        // `transition` is either a name (`"wave"`) or a table
+        // (`{name, duration_ms, fps}`); both forms are what a user types.
+        let transition = match &params.transition {
+            Some(value) => Some(parse_transition(value)?),
+            None => None,
+        };
+
         tracing::info!(spec = %reference, "applying wallpaper");
         let applied = self
             .state
             .engine
-            .apply(&reference, &target)
+            .apply_with(&reference, &target, transition.as_ref())
             .map_err(|error| engine_error(&error))?;
         tracing::info!(
             spec = %applied.reference,
@@ -328,16 +397,7 @@ impl IpcHandler {
             "wallpaper applied"
         );
 
-        let mut value = serde_json::to_value(applied)
-            .map_err(|error| ErrorBody::internal(error.to_string()))?;
-        if params.transition.is_some() {
-            // Silent ignoring is how a user ends up believing a feature shipped.
-            value["notes"] = json!([
-                "transition requests are not applied yet: the transition engine lands in P2 \
-                 (docs/IMPLEMENTATION-PLAN.md)"
-            ]);
-        }
-        Ok(value)
+        serde_json::to_value(applied).map_err(|error| ErrorBody::internal(error.to_string()))
     }
 
     fn wallpaper_clear(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
@@ -384,44 +444,227 @@ impl IpcHandler {
         }))
     }
 
-    fn library_list(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
-        let params: LibraryParams = request.params_as()?;
-        let directory = owe_core::path::expand(&params.dir)
-            .map_err(|error| ErrorBody::new(ErrorCode::BadRequest, error.to_string()))?;
+    /// `library.scan` (FR-LIB-1): bring the index up to date.
+    ///
+    /// Synchronous in P2, and it says so: the reply carries the scan report, so a
+    /// client never has to guess whether the scan finished. Progress *events* need
+    /// the shell-event bus (P3); until then a long scan simply blocks its own
+    /// request, which is honest and easy to reason about.
+    fn library_scan(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
+        let params: LibraryScanParams = request.params_as()?;
+        let roots = match &params.paths {
+            Some(paths) => {
+                let mut expanded = Vec::with_capacity(paths.len());
+                for path in paths {
+                    expanded.push(
+                        owe_core::path::expand(path)
+                            .map_err(|error| ErrorBody::bad_request(error.to_string()))?,
+                    );
+                }
+                Some(expanded)
+            }
+            None => None,
+        };
 
-        let entries = scan_directory(&directory)
-            .map_err(|error| ErrorBody::new(ErrorCode::NotFound, error.to_string()))?;
+        let started = std::time::Instant::now();
+        let report = self
+            .state
+            .library
+            .scan(roots.as_deref())
+            .map_err(|error| ErrorBody::internal(error.to_string()))?;
+
+        tracing::info!(summary = %report.summary(), "library scan finished");
+        Ok(json!({
+            "scan_id": 1,
+            "finished": true,
+            "summary": report.summary(),
+            "roots": report.roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
+            "added": report.added,
+            "updated": report.updated,
+            "removed": report.removed,
+            "unchanged": report.unchanged,
+            "skipped_unsupported": report.skipped_unsupported,
+            "rows_touched": report.rows_touched(),
+            "files_seen": report.files_seen(),
+            "missing_roots": report.missing_roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
+            "unreadable_dirs": report.unreadable_dirs.iter().map(|dir| dir.display().to_string()).collect::<Vec<_>>(),
+            "duration_ms": report.duration.as_secs_f64() * 1000.0,
+            "wall_clock_ms": started.elapsed().as_secs_f64() * 1000.0,
+        }))
+    }
+
+    /// `library.list`: paged, filtered, index-backed.
+    fn library_list(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
+        let params: LibraryListParams = request.params_as()?;
+
+        if params.scan_if_empty.unwrap_or(false) {
+            let indexed = self
+                .state
+                .library
+                .count(&ListQuery::default())
+                .map_err(|error| ErrorBody::internal(error.to_string()))?;
+            if indexed == 0 {
+                // First GUI connect on a fresh install: scan once so the grid is
+                // not mysteriously empty on a machine that has wallpapers.
+                let report = self
+                    .state
+                    .library
+                    .scan(None)
+                    .map_err(|error| ErrorBody::internal(error.to_string()))?;
+                tracing::info!(summary = %report.summary(), "library scanned on first list");
+            }
+        }
+
+        let kind = match params.kind.as_deref() {
+            Some(kind) => Some(parse_kind(kind).ok_or_else(|| {
+                ErrorBody::bad_request(format!(
+                    "unknown content kind `{kind}` (known: {})",
+                    ContentKind::ALL
+                        .iter()
+                        .map(|kind| kind.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?),
+            None => None,
+        };
+        let under = match params.dir.as_deref() {
+            Some(dir) => Some(
+                owe_core::path::expand(dir)
+                    .map_err(|error| ErrorBody::bad_request(error.to_string()))?,
+            ),
+            None => None,
+        };
+
+        let per_page = params
+            .per_page
+            .unwrap_or(100)
+            .clamp(1, owe_core::library::MAX_PAGE);
+        let page = params.page.unwrap_or(1).max(1);
+        let query = ListQuery {
+            filter: params.filter.clone(),
+            kind,
+            under: under.clone(),
+            limit: Some(per_page),
+            offset: Some((page - 1).saturating_mul(per_page)),
+        };
+
+        let items = self
+            .state
+            .library
+            .list(&query)
+            .map_err(|error| ErrorBody::internal(error.to_string()))?;
+        let total = self
+            .state
+            .library
+            .count(&ListQuery {
+                limit: None,
+                offset: None,
+                ..query.clone()
+            })
+            .map_err(|error| ErrorBody::internal(error.to_string()))?;
+
+        let library = &self.state.library;
+        let entries: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                let mut value = item.to_json();
+                // The cache path when the thumbnail already exists, `null` when the
+                // client must ask for it via `library.thumb`. Computing it is a
+                // stat, so a page costs one stat per row and nothing decodes.
+                value["thumb"] = match library.cached_thumbnail(item) {
+                    Some(path) => json!(path.display().to_string()),
+                    None => Value::Null,
+                };
+                value
+            })
+            .collect();
 
         Ok(json!({
-            "dir": directory.display().to_string(),
-            "entries": entries,
-            // P2 replaces this one-level scan with the indexed library, thumbnails
-            // and incremental rescan. Until then, say what this actually is.
-            "scope": "one level, images only",
+            "items": entries,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": total.div_ceil(u64::from(per_page)),
+            "thumbnail_size": library.thumbnail_size(),
+            "roots": library.roots().iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `library.thumb`: materialise one cached thumbnail (FR-LIB-2).
+    fn library_thumb(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
+        let params: LibraryThumbParams = request.params_as()?;
+        let item = self
+            .state
+            .library
+            .get(params.id)
+            .map_err(|error| ErrorBody::internal(error.to_string()))?
+            .ok_or_else(|| {
+                ErrorBody::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "library item {} is not in the index (it may have been removed since \
+                         the last scan)",
+                        params.id
+                    ),
+                )
+            })?;
+
+        let thumbnail = self
+            .state
+            .library
+            .thumbnail(&item)
+            // A file that cannot be decoded is not a server fault: the caller can
+            // act on it (skip this wallpaper, fix the file).
+            .map_err(|reason| ErrorBody::new(ErrorCode::BadRequest, reason))?;
+
+        Ok(json!({
+            "id": item.id,
+            "path": thumbnail.path.display().to_string(),
+            "size": thumbnail.size,
+            "cached": thumbnail.cached,
+            "source": item.path.display().to_string(),
         }))
     }
 }
 
-/// One directory level of image files.
-fn scan_directory(directory: &Path) -> Result<Vec<Value>, std::io::Error> {
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+/// Parse a `transition` parameter: a name, or a table with name/duration/fps.
+fn parse_transition(value: &Value) -> Result<Transition, ErrorBody> {
+    match value {
+        Value::String(name) => Ok(Transition {
+            name: name.clone(),
+            ..Transition::default()
+        }),
+        Value::Object(map) => {
+            let name = map.get("name").and_then(Value::as_str).ok_or_else(|| {
+                ErrorBody::bad_request(
+                    "`transition` object must contain a `name` (e.g. \
+                     {name: \"wipe\", duration_ms: 400})",
+                )
+            })?;
+            let defaults = Transition::default();
+            let duration_ms = match map.get("duration_ms") {
+                Some(value) => value.as_u64().ok_or_else(|| {
+                    ErrorBody::bad_request("`transition.duration_ms` must be a positive integer")
+                })?,
+                None => defaults.duration_ms,
+            };
+            let fps = match map.get("fps") {
+                Some(value) => value.as_u64().ok_or_else(|| {
+                    ErrorBody::bad_request("`transition.fps` must be a positive integer")
+                })? as u32,
+                None => defaults.fps,
+            };
+            Ok(Transition {
+                name: name.to_string(),
+                duration_ms,
+                fps,
+            })
         }
-        let Some(kind) = ContentKind::from_path(&path) else {
-            continue;
-        };
-        entries.push(json!({
-            "path": path.display().to_string(),
-            "name": path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default(),
-            "kind": kind.as_str(),
-        }));
+        other => Err(ErrorBody::bad_request(format!(
+            "`transition` must be a name or an object, got `{other}`"
+        ))),
     }
-    entries.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-    Ok(entries)
 }
 
 /// Map an engine failure onto the protocol error code a client can act on.
@@ -454,9 +697,19 @@ fn engine_error(error: &EngineError) -> ErrorBody {
         }
 
         // Both buffers held: the client may retry, so say so instead of "internal".
-        EngineError::Present(owe_render::PresentError::Busy(_)) => {
+        EngineError::Present(owe_render::PresentError::Busy(_)) | EngineError::Superseded(_) => {
             ErrorBody::new(ErrorCode::Busy, error.to_string())
         }
+
+        // A transition the build does not render or the config disallows is a
+        // request the client can fix; the message carries the allowed list.
+        EngineError::Transition(_) => ErrorBody::new(ErrorCode::BadRequest, error.to_string()),
+
+        // A library id that resolves to nothing is "not found", not an internal
+        // fault: the row can have been removed by a rescan since the GUI listed it.
+        EngineError::Library(_) => ErrorBody::new(ErrorCode::NotFound, error.to_string()),
+
+        EngineError::Unsupported(_) => ErrorBody::unsupported(error.to_string()),
 
         EngineError::Shell(_)
         | EngineError::Render(_)
@@ -477,6 +730,10 @@ impl Handler for IpcHandler {
             method::WALLPAPER_CLEAR => self.wallpaper_clear(request),
             method::GOVERNOR_OVERRIDE => self.governor_override(request),
             method::LIBRARY_LIST => self.library_list(request),
+            method::LIBRARY_SCAN => self.library_scan(request),
+            // `library.thumb` is the other half of `library.list`: the list says
+            // which cells have a cached thumbnail, this materialises the rest.
+            method::LIBRARY_THUMB => self.library_thumb(request),
             other => Err(ErrorBody::unsupported(format!(
                 "`{other}` is not implemented in this build yet; see docs/IMPLEMENTATION-PLAN.md \
                  for the phase that lands it"
@@ -500,14 +757,36 @@ mod tests {
     use owe_ipc::ReplyFrame;
     use owe_ipc::protocol::SchemaVersion;
 
-    fn handler() -> IpcHandler {
+    /// A handler over a throwaway XDG tree.
+    ///
+    /// The temporary directory is deliberately kept (`TempDir::keep`) rather than
+    /// deleted: the daemon state holds paths into it and outlives this function.
+    /// A few kilobytes in the OS temp directory per test process is a fine price
+    /// for not teaching `DaemonState` a special test-only lifetime.
+    fn handler_in_tree(config: Config) -> (IpcHandler, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let paths = XdgPaths {
+            config_file: dir.join("config.toml"),
+            state_dir: dir.join("state"),
+            cache_dir: dir.join("cache"),
+            data_dir: dir.join("data"),
+            runtime_dir: Some(dir.join("run")),
+        };
+        let library = Arc::new(LibraryService::open(&config, &paths));
+        let engine = Arc::new(Engine::new(config.clone(), paths));
+        engine.set_library(Arc::clone(&library) as Arc<dyn crate::engine::LibraryResolver>);
         let state = Arc::new(DaemonState::new(
-            Config::default(),
+            config,
             PathBuf::from("/run/user/1000/owe/socket"),
             Shutdown::new(),
-            Engine::new(Config::default(), XdgPaths::resolve().unwrap()),
+            engine,
+            library,
         ));
-        IpcHandler::new(state)
+        (IpcHandler::new(state), dir)
+    }
+
+    fn handler() -> IpcHandler {
+        handler_in_tree(Config::default()).0
     }
 
     fn state_of(handler: &IpcHandler) -> Arc<DaemonState> {
@@ -530,8 +809,32 @@ mod tests {
         let value = handler.handle(&request).expect("hello ok");
         let reply: HelloReply = serde_json::from_value(value).unwrap();
         assert_eq!(reply.server_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(reply.schema, SchemaVersion::CURRENT);
+        // The client offered minor 0, so that is what it gets: the negotiated
+        // version is the *client's* ceiling, never the server's latest.
+        assert_eq!(
+            reply.schema,
+            SchemaVersion { major: 1, minor: 0 },
+            "negotiation must not answer with a newer minor than the client sent"
+        );
         assert_eq!(reply.capabilities.methods, IMPLEMENTED_METHODS.to_vec());
+    }
+
+    #[test]
+    fn hello_with_a_current_client_negotiates_the_current_minor() {
+        let handler = handler();
+        let request = RequestFrame::new(
+            "c1",
+            method::HELLO,
+            json!({
+                "client": "test",
+                "client_version": "0.2.0",
+                "schema": [{ "major": 1, "minor": 1 }],
+            }),
+        );
+        let value = handler.handle(&request).expect("hello ok");
+        let reply: HelloReply = serde_json::from_value(value).unwrap();
+        assert_eq!(reply.schema, SchemaVersion::CURRENT);
+        assert_eq!(SchemaVersion::CURRENT.minor, 1, "P2 bumped the minor");
     }
 
     #[test]
@@ -552,7 +855,6 @@ mod tests {
             method::STATS_GET,
             method::CONFIG_PATCH,
             method::GOVERNOR_POLICY,
-            method::LIBRARY_SCAN,
         ] {
             assert!(
                 !capabilities.methods.iter().any(|m| m == unimplemented),
@@ -596,8 +898,8 @@ mod tests {
                 .find(|entry| entry.starts_with(&format!("{feature}:")))
                 .unwrap_or_else(|| panic!("`{feature}` should be reported as unavailable"));
             assert!(
-                entry.contains('P') && entry.contains("planned"),
-                "`{entry}` must say when it lands, not just that it is missing"
+                entry.contains('P') && (entry.contains("planned") || entry.contains("decision")),
+                "`{entry}` must say when or why it lands, not just that it is missing"
             );
             assert!(
                 !capabilities.shell_backends.iter().any(|id| id == feature),
@@ -680,8 +982,11 @@ mod tests {
 
     #[test]
     fn unimplemented_methods_answer_unsupported_with_a_pointer() {
+        // `playback.cmd` is the next method the plan lands (P4). Using it here
+        // proves the unsupported path still exists now that every library method
+        // is implemented.
         let handler = handler();
-        let request = RequestFrame::new("c1", method::LIBRARY_SCAN, json!({}));
+        let request = RequestFrame::new("c1", method::PLAYBACK_CMD, json!({}));
 
         let error = handler.handle(&request).unwrap_err();
         assert_eq!(error.code, ErrorCode::Unsupported);
@@ -700,7 +1005,7 @@ mod tests {
     #[test]
     fn error_bodies_serialize_into_reply_frames() {
         let handler = handler();
-        let request = RequestFrame::new("c1", method::LIBRARY_SCAN, json!({}));
+        let request = RequestFrame::new("c1", method::PLAYBACK_CMD, json!({}));
         let error = handler.handle(&request).unwrap_err();
         let frame = ReplyFrame::err("c1", error);
         let value = serde_json::to_value(frame).unwrap();
@@ -798,36 +1103,287 @@ mod tests {
         assert!(with_extras.transition.is_some());
     }
 
-    #[test]
-    fn library_list_reports_missing_directories_as_not_found() {
-        let handler = handler();
-        let request = RequestFrame::new(
-            "c1",
-            method::LIBRARY_LIST,
-            json!({"dir": "/definitely/not/a/real/directory"}),
-        );
-        let error = handler.handle(&request).unwrap_err();
-        assert_eq!(error.code, ErrorCode::NotFound);
+    /// A config whose library roots are `paths` and whose thumbnail size is set.
+    fn library_config(paths: &[&Path], thumbnail_size: u32) -> Config {
+        let mut config = Config::default();
+        config.library.paths = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        config.library.thumbnail_size = thumbnail_size;
+        config
+    }
+
+    fn write_png(path: &Path, width: u32, height: u32) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut buffer = image::RgbaImage::new(width, height);
+        for pixel in buffer.pixels_mut() {
+            *pixel = image::Rgba([40, 80, 120, 255]);
+        }
+        // PNG bytes under any extension: the scanner keys on the extension and the
+        // decoder sniffs the bytes, so this is a valid fixture either way.
+        buffer
+            .save_with_format(path, image::ImageFormat::Png)
+            .unwrap();
     }
 
     #[test]
-    fn library_list_finds_images_and_ignores_other_files() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("wall.png"), b"not really a png").unwrap();
-        std::fs::write(directory.path().join("notes.txt"), b"text").unwrap();
-        std::fs::create_dir(directory.path().join("nested")).unwrap();
+    fn library_scan_indexes_the_configured_roots_and_reports_what_it_did() {
+        let root = tempfile::tempdir().unwrap();
+        write_png(&root.path().join("a.png"), 16, 16);
+        write_png(&root.path().join("nested/b.jpg"), 16, 16);
+        std::fs::write(root.path().join("notes.txt"), b"text").unwrap();
 
+        let (handler, _tree) = handler_in_tree(library_config(&[root.path()], 64));
+        let request = RequestFrame::new("c1", method::LIBRARY_SCAN, json!({}));
+        let value = handler.handle(&request).expect("library.scan ok");
+
+        assert_eq!(value["finished"], json!(true), "the scan is synchronous");
+        assert_eq!(value["added"], json!(2));
+        assert_eq!(value["skipped_unsupported"], json!(1));
+        assert_eq!(value["rows_touched"], json!(2));
+        let summary = value["summary"].as_str().unwrap();
+        assert!(summary.contains("3 file(s) seen"), "{summary}");
+        assert!(summary.contains("+2"), "{summary}");
+        assert!(summary.contains("1 skipped"), "{summary}");
+    }
+
+    #[test]
+    fn a_second_scan_of_an_unchanged_library_touches_no_rows() {
+        // The incremental-rescan property, over IPC: it is what keeps a rescan on
+        // a 20 000-file library cheap enough to run on a timer.
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            write_png(&root.path().join(format!("w{index}.png")), 8, 8);
+        }
+        let (handler, _tree) = handler_in_tree(library_config(&[root.path()], 64));
+
+        let request = RequestFrame::new("c1", method::LIBRARY_SCAN, json!({}));
+        handler.handle(&request).expect("first scan");
+        let value = handler.handle(&request).expect("second scan");
+        assert_eq!(value["rows_touched"], json!(0), "{value}");
+        assert_eq!(value["unchanged"], json!(5));
+    }
+
+    #[test]
+    fn library_list_returns_indexed_items_with_their_references() {
+        let root = tempfile::tempdir().unwrap();
+        write_png(&root.path().join("wall.png"), 16, 16);
+        std::fs::write(root.path().join("notes.txt"), b"text").unwrap();
+
+        let (handler, _tree) = handler_in_tree(library_config(&[root.path()], 64));
+        handler
+            .handle(&RequestFrame::new("c1", method::LIBRARY_SCAN, json!({})))
+            .expect("scan");
+        let value = handler
+            .handle(&RequestFrame::new("c1", method::LIBRARY_LIST, json!({})))
+            .expect("library.list ok");
+
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{value}");
+        assert_eq!(items[0]["name"], json!("wall.png"));
+        assert_eq!(items[0]["kind"], json!("static-image"));
+        assert!(
+            items[0]["reference"]
+                .as_str()
+                .unwrap()
+                .starts_with("library:"),
+            "every item must carry the reference the CLI applies: {value}"
+        );
+        assert_eq!(value["total"], json!(1));
+        assert_eq!(value["page"], json!(1));
+        assert_eq!(value["thumbnail_size"], json!(64));
+        assert!(
+            value["roots"].as_array().unwrap().len() == 1,
+            "the client is told which roots are indexed: {value}"
+        );
+    }
+
+    #[test]
+    fn library_list_filters_pages_and_validates_the_kind() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            write_png(&root.path().join(format!("wall-{index}.png")), 8, 8);
+        }
+        let (handler, _tree) = handler_in_tree(library_config(&[root.path()], 32));
+        handler
+            .handle(&RequestFrame::new("c1", method::LIBRARY_SCAN, json!({})))
+            .expect("scan");
+
+        let page = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::LIBRARY_LIST,
+                json!({"page": 2, "per_page": 2}),
+            ))
+            .expect("page 2");
+        assert_eq!(page["items"].as_array().unwrap().len(), 2);
+        assert_eq!(page["pages"], json!(3));
+        assert_eq!(page["total"], json!(5));
+
+        let filtered = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::LIBRARY_LIST,
+                json!({"filter": "wall-3"}),
+            ))
+            .expect("filter");
+        assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+
+        // An unknown kind is a bad request naming the known ones, not an empty
+        // page that makes the GUI look broken.
+        let error = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::LIBRARY_LIST,
+                json!({"kind": "hologram"}),
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert!(error.msg.contains("static-image"), "{}", error.msg);
+    }
+
+    #[test]
+    fn library_thumb_materialises_a_png_and_then_serves_it_from_cache() {
+        let root = tempfile::tempdir().unwrap();
+        write_png(&root.path().join("wide.png"), 400, 100);
+        let (handler, _tree) = handler_in_tree(library_config(&[root.path()], 64));
+        handler
+            .handle(&RequestFrame::new("c1", method::LIBRARY_SCAN, json!({})))
+            .expect("scan");
+        let listed = handler
+            .handle(&RequestFrame::new("c1", method::LIBRARY_LIST, json!({})))
+            .expect("list");
+        let id = listed["items"][0]["id"].as_i64().unwrap();
+        assert!(
+            listed["items"][0]["thumb"].is_null(),
+            "nothing is cached before it is asked for: {listed}"
+        );
+
+        let first = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::LIBRARY_THUMB,
+                json!({"id": id}),
+            ))
+            .expect("first thumbnail");
+        assert_eq!(first["cached"], json!(false));
+        assert_eq!(first["size"], json!(64));
+        let thumb_path = PathBuf::from(first["path"].as_str().unwrap());
+        let decoded = image::open(&thumb_path).expect("thumbnail file").to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (64, 16));
+
+        let second = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::LIBRARY_THUMB,
+                json!({"id": id}),
+            ))
+            .expect("second thumbnail");
+        assert_eq!(second["cached"], json!(true));
+        assert_eq!(second["path"], first["path"]);
+
+        // And the list now advertises the cached path, so the GUI can draw the
+        // cell without a second round trip on the next page load.
+        let relisted = handler
+            .handle(&RequestFrame::new("c1", method::LIBRARY_LIST, json!({})))
+            .expect("relist");
+        assert_eq!(relisted["items"][0]["thumb"], first["path"]);
+    }
+
+    #[test]
+    fn library_thumb_for_an_unknown_id_is_not_found() {
+        let (handler, _tree) = handler_in_tree(Config::default());
+        let error = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::LIBRARY_THUMB,
+                json!({"id": 987654}),
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert!(error.msg.contains("987654"), "{}", error.msg);
+    }
+
+    #[test]
+    fn library_list_can_scan_an_empty_index_on_first_connect() {
+        // The GUI's first call. Without this, a fresh install shows an empty grid
+        // and the user has to find the "rescan" button before seeing anything.
+        let root = tempfile::tempdir().unwrap();
+        write_png(&root.path().join("wall.png"), 8, 8);
+        let (handler, _tree) = handler_in_tree(library_config(&[root.path()], 32));
+
+        let value = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::LIBRARY_LIST,
+                json!({"scan_if_empty": true}),
+            ))
+            .expect("list with scan");
+        assert_eq!(value["items"].as_array().unwrap().len(), 1, "{value}");
+    }
+
+    #[test]
+    fn an_unknown_transition_is_refused_with_the_allowed_list() {
+        // Refusing is the point: substituting a transition silently is how a user
+        // concludes the feature is broken.
         let handler = handler();
         let request = RequestFrame::new(
             "c1",
-            method::LIBRARY_LIST,
-            json!({"dir": directory.path().display().to_string()}),
+            method::WALLPAPER_SET,
+            json!({"source": "/tmp/x.png", "transition": "explode"}),
         );
-        let value = handler.handle(&request).expect("library.list ok");
+        let error = handler.handle(&request).unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert!(error.msg.contains("explode"), "{}", error.msg);
+        assert!(error.msg.contains("fade"), "{}", error.msg);
+    }
 
-        let entries = value["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 1, "{value}");
-        assert_eq!(entries[0]["name"], json!("wall.png"));
-        assert_eq!(entries[0]["kind"], json!("static-image"));
+    #[test]
+    fn a_transition_the_config_disallows_is_refused_and_says_so() {
+        let mut config = Config::default();
+        config.render.allow_transitions = vec!["none".to_string(), "fade".to_string()];
+        let (handler, _tree) = handler_in_tree(config);
+
+        let request = RequestFrame::new(
+            "c1",
+            method::WALLPAPER_SET,
+            json!({"source": "/tmp/x.png", "transition": "wave"}),
+        );
+        let error = handler.handle(&request).unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert!(
+            error.msg.contains("allow_transitions"),
+            "the message must name the config key that disallows it: {}",
+            error.msg
+        );
+    }
+
+    #[test]
+    fn transition_parameters_accept_a_name_and_a_table_and_reject_junk() {
+        assert_eq!(
+            parse_transition(&json!("wipe")).unwrap(),
+            Transition {
+                name: "wipe".to_string(),
+                ..Transition::default()
+            }
+        );
+        let table = parse_transition(&json!({"name": "slide", "duration_ms": 450, "fps": 30}))
+            .expect("table form");
+        assert_eq!(table.name, "slide");
+        assert_eq!(table.duration_ms, 450);
+        assert_eq!(table.fps, 30);
+
+        for bad in [
+            json!({}),
+            json!({"duration_ms": 100}),
+            json!(7),
+            json!(null),
+        ] {
+            let error = parse_transition(&bad).expect_err("invalid transition");
+            assert_eq!(error.code, ErrorCode::BadRequest, "{bad}");
+        }
     }
 }

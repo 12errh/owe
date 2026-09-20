@@ -45,6 +45,25 @@ impl ContentKind {
         }
     }
 
+    /// Map a stable kind id back to its enum value.
+    ///
+    /// The inverse of [`ContentKind::as_str`], used wherever a kind has been
+    /// persisted or sent over the wire (the library index, `library.list`
+    /// filters, the GUI's kind dropdown). Unknown ids are `None` rather than a
+    /// silent default, so a caller can tell "newer OWE wrote this" from "still
+    /// image".
+    pub fn from_id(id: &str) -> Option<Self> {
+        let kind = match id.trim().to_ascii_lowercase().as_str() {
+            "static-image" => Self::StaticImage,
+            "animated-image" => Self::AnimatedImage,
+            "video" => Self::Video,
+            "shader" => Self::Shader,
+            "plugin" => Self::Plugin,
+            _ => return None,
+        };
+        Some(kind)
+    }
+
     /// Map a file extension (with or without a leading dot, any case) to a kind.
     ///
     /// `webp` is treated as a still image even though animated webp exists; the

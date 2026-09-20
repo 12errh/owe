@@ -35,6 +35,7 @@ impl Handler for TestHandler {
                         shell_backends: vec!["hyprland".to_string()],
                         content_kinds: vec!["static-image".to_string()],
                         media_backends: vec!["auto".to_string()],
+                        transitions: vec!["none".to_string()],
                         unavailable: Vec::new(),
                     },
                 };

@@ -151,6 +151,15 @@ pub enum MediaError {
         /// Kind id that was requested.
         kind: &'static str,
     },
+
+    /// A thumbnail could not be encoded.
+    #[error("cannot encode a thumbnail for `{path}`: {detail}")]
+    Encode {
+        /// File the thumbnail was for.
+        path: String,
+        /// Encoder's own message.
+        detail: String,
+    },
 }
 
 /// Default decode budget: ~80 megapixels, which covers 8K comfortably while
@@ -213,6 +222,97 @@ pub fn decode_file_with_budget(path: &Path, max_pixels: u64) -> Result<DecodedIm
 
     let rgba = decoded.to_rgba8();
     DecodedImage::new(rgba.width(), rgba.height(), rgba.into_raw())
+}
+
+/// Longest edge of a generated thumbnail, in pixels.
+///
+/// 512 is the default in `library.thumbnail_size`: big enough to look sharp in a
+/// GUI grid cell on a HiDPI panel, small enough that a PNG encode stays in the
+/// tens of milliseconds and the cache stays a few tens of kilobytes per file.
+pub const THUMBNAIL_MAX_EDGE: u32 = 512;
+
+/// Decode `path` and produce a PNG thumbnail whose longest edge is `max_edge`.
+///
+/// Kept here (rather than in the library scanner) because it is a media concern:
+/// the scanner knows about paths and stamps, this knows about pixels. The scale
+/// is computed from the source size so the aspect ratio is preserved, and the
+/// image is never **up**scaled — a 64×64 icon should not be blown up to 512.
+pub fn thumbnail_png(path: &Path, max_edge: u32) -> Result<Vec<u8>, MediaError> {
+    let decoded = decode_file(path)?;
+    thumbnail_png_from(&decoded, max_edge, path)
+}
+
+/// Encode a PNG thumbnail from already-decoded pixels.
+///
+/// Split out so a caller that has already paid for the decode (the daemon
+/// generating a thumbnail right after rendering a wallpaper) does not pay twice.
+pub fn thumbnail_png_from(
+    decoded: &DecodedImage,
+    max_edge: u32,
+    path: &Path,
+) -> Result<Vec<u8>, MediaError> {
+    if max_edge == 0 {
+        return Err(MediaError::Encode {
+            path: path.display().to_string(),
+            detail: "thumbnail size 0".to_string(),
+        });
+    }
+
+    let (width, height) = thumbnail_size(decoded.size(), max_edge);
+    let buffer =
+        image::RgbaImage::from_raw(decoded.width(), decoded.height(), decoded.pixels().to_vec())
+            .ok_or_else(|| MediaError::Encode {
+                path: path.display().to_string(),
+                detail: format!(
+                    "decoded buffer is not {}x{} RGBA8",
+                    decoded.width(),
+                    decoded.height()
+                ),
+            })?;
+
+    // Triangle (bilinear) is the right trade here: it is what makes a 4K photo
+    // readable at 512 px, and unlike Lanczos it does not cost tens of
+    // milliseconds per file on the reference laptop.
+    let scaled = if (width, height) == decoded.size() {
+        buffer
+    } else {
+        image::imageops::resize(
+            &buffer,
+            width,
+            height,
+            image::imageops::FilterType::Triangle,
+        )
+    };
+
+    let mut png = Vec::new();
+    scaled
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|error| MediaError::Encode {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    Ok(png)
+}
+
+/// The size a thumbnail of `source` will have, capped to `max_edge` on the
+/// longest side and never magnified.
+///
+/// Pure and public because it is the part worth asserting on: a 4000×2000 photo
+/// becomes 512×256, and a 100×50 image stays 100×50.
+pub fn thumbnail_size(source: (u32, u32), max_edge: u32) -> (u32, u32) {
+    let (width, height) = source;
+    if width == 0 || height == 0 || max_edge == 0 {
+        return (width.max(1), height.max(1));
+    }
+    let longest = width.max(height);
+    if longest <= max_edge {
+        return (width, height);
+    }
+    let scale = f64::from(max_edge) / f64::from(longest);
+    (
+        ((f64::from(width) * scale).round() as u32).max(1),
+        ((f64::from(height) * scale).round() as u32).max(1),
+    )
 }
 
 /// Check that a content kind is something this build can actually render, with a
@@ -361,6 +461,73 @@ mod tests {
             DecodedImage::new(0, 4, vec![]).unwrap_err(),
             MediaError::EmptyImage { .. }
         ));
+    }
+
+    #[test]
+    fn thumbnail_sizes_preserve_aspect_and_never_magnify() {
+        // The pure part, so the rules are asserted without any pixels.
+        assert_eq!(thumbnail_size((4000, 2000), 512), (512, 256));
+        assert_eq!(thumbnail_size((2000, 4000), 512), (256, 512));
+        assert_eq!(thumbnail_size((512, 512), 512), (512, 512));
+        assert_eq!(
+            thumbnail_size((100, 50), 512),
+            (100, 50),
+            "a small image must not be blown up"
+        );
+        // Rounding must never produce a zero dimension.
+        let (width, height) = thumbnail_size((10000, 3), 512);
+        assert_eq!((width, height), (512, 1));
+        assert_eq!(thumbnail_size((0, 0), 512), (1, 1));
+    }
+
+    #[test]
+    fn a_thumbnail_is_a_png_matching_the_source_colour() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_png(dir.path(), "wall.png", 64, 32, [7, 200, 90, 255]);
+
+        let png = thumbnail_png(&path, 16).expect("thumbnail");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "must be a real PNG");
+
+        let decoded = image::load_from_memory(&png)
+            .expect("decode thumbnail")
+            .to_rgba8();
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (16, 8),
+            "the aspect ratio survives the downscale"
+        );
+        // Triangle filtering of a solid image is exact, so the colour must match.
+        assert_eq!(decoded.get_pixel(8, 4).0, [7, 200, 90, 255]);
+    }
+
+    #[test]
+    fn a_thumbnail_of_a_small_image_keeps_its_own_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_png(dir.path(), "icon.png", 24, 24, [1, 2, 3, 255]);
+
+        let png = thumbnail_png(&path, 512).expect("thumbnail");
+        let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (24, 24));
+    }
+
+    #[test]
+    fn thumbnailing_a_broken_file_reports_the_decode_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.png");
+        std::fs::write(&path, b"not an image at all").unwrap();
+
+        let error = thumbnail_png(&path, 256).unwrap_err();
+        assert!(matches!(error, MediaError::Decode { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_zero_thumbnail_size_is_an_encode_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_png(dir.path(), "wall.png", 8, 8, [0, 0, 0, 255]);
+        let decoded = decode_file(&path).unwrap();
+
+        let error = thumbnail_png_from(&decoded, 0, &path).unwrap_err();
+        assert!(matches!(error, MediaError::Encode { .. }), "{error}");
     }
 
     #[test]

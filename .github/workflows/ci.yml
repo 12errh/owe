@@ -5,6 +5,10 @@
 #
 # NOTE: there is deliberately no fuzz job yet. Fuzz targets land with the media
 # parsers in P4 (TRD NFR-SEC-2); a job that fuzzes nothing would be theatre.
+#
+# Re-recording the GUI's replay fixture (app/src-tauri/tests/fixtures) is a
+# deliberate maintainer action, not a CI step: scripts/record-gui-fixtures.sh runs
+# the real daemon and writes a diff to review and commit.
 
 name: CI
 
@@ -45,6 +49,11 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: nextest
         run: cargo nextest run --workspace --no-fail-fast
+      # Phase 2 gate, given its own named step so the measured number shows up in
+      # the CI log instead of only inside a test result: a 500-file library must
+      # scan inside the 2 s budget, warm (IMPLEMENTATION-PLAN Phase 2 exit gate).
+      - name: library scale gate (500 files, warm scan < 2 s)
+        run: cargo test -p owe-core --test library_scale -- --nocapture
       - name: doctests
         run: cargo test --workspace --doc
 
@@ -112,11 +121,13 @@ jobs:
       - name: app crate — build
         working-directory: app/src-tauri
         run: cargo build
-      # The GUI's daemon-facing path is tested against a stub daemon hosted in
-      # process (its own `tests` module), so this needs no compositor and no
-      # running daemon. It is what stops "the GUI compiles" from counting as
-      # "the GUI works" (P1 gate: GUI apply).
-      - name: app crate — tests (stub-daemon IPC contract)
+      # The GUI's daemon-facing path is tested two ways, neither needing a
+      # compositor or a running daemon: against a stub daemon hosted in process
+      # (the `tests` module) and against the recorded real-daemon traffic in
+      # tests/fixtures/daemon-session.json (the `replay` module). It is what stops
+      # "the GUI compiles" from counting as "the GUI works" (P1: GUI apply; P2: the
+      # library grid, per-output assignment, and transition request shapes).
+      - name: app crate — tests (stub daemon + recorded replay)
         working-directory: app/src-tauri
         run: cargo test
 
@@ -138,8 +149,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends sway wayland-utils xwayland
       - name: build
         run: cargo build --workspace
-      # P0 scope: proves the harness (headless compositor comes up, protocol
-      # probe works, owed serves IPC, clean shutdown). Surface creation and
-      # screencopy assertions are added in P1 when there is a surface to assert.
+      # Scope today: proves the harness (headless compositor comes up, protocol
+      # probe works, owed serves IPC, clean shutdown). Pixel assertions arrived
+      # with the P1 E2E work and run in `scripts/e2e-hyprland.sh` on a real
+      # session; what this job still cannot do is drive a drivable output, which is
+      # why the two-output rendering half of the P2 gate is a hardware-checklist
+      # item rather than a CI assertion (see IMPLEMENTATION-PLAN §2.2).
       - name: smoke
         run: ./scripts/headless-smoke.sh

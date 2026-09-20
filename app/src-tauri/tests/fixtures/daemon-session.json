@@ -1,0 +1,117 @@
+{
+  "recorded_with": "owed 0.1.0",
+  "note": "Recorded by scripts/record-gui-fixtures.sh against the real owed binary running headless (no compositor). Replies are verbatim daemon output; $FIXTURE_DIR is substituted by the replay daemon at serve time. Re-run the script and commit the diff when the wire shape changes.",
+  "replies": {
+    "hello": {
+      "capabilities": {
+        "content_kinds": [
+          "static-image"
+        ],
+        "media_backends": [
+          "image"
+        ],
+        "methods": [
+          "hello",
+          "config.get",
+          "daemon.kill",
+          "outputs.list",
+          "wallpaper.set",
+          "wallpaper.clear",
+          "governor.override",
+          "library.scan",
+          "library.list",
+          "library.thumb"
+        ],
+        "shell_backends": [
+          "hyprland",
+          "generic-layer-shell"
+        ],
+        "transitions": [
+          "none",
+          "fade",
+          "wipe",
+          "slide",
+          "grow",
+          "wave",
+          "outer"
+        ],
+        "unavailable": [
+          "caelestia: shell backend planned for P3 (P1 renders natively on Hyprland)",
+          "animated-image: content kind planned for P4 (decode + frame pacing)",
+          "video: content kind planned for P4 (GStreamer path)",
+          "shader: content kind planned for P5 (WGSL packs, previews)",
+          "avif: AVIF/HEIC decoding is compiled out by default (P2 decision): the decoder is a large C dependency chain and the reference profile decodes JPEG/PNG/WebP only"
+        ]
+      },
+      "schema": {
+        "major": 1,
+        "minor": 1
+      },
+      "server_version": "0.1.0"
+    },
+    "library.scan": {
+      "added": 0,
+      "duration_ms": 0.8805529999999999,
+      "files_seen": 2,
+      "finished": true,
+      "missing_roots": [],
+      "removed": 0,
+      "roots": [
+        "/tmp/tmp.mhHlCDsywt/walls"
+      ],
+      "rows_touched": 0,
+      "scan_id": 1,
+      "skipped_unsupported": 0,
+      "summary": "scanned 1 root(s): 2 file(s) seen, +0 ~0 -0 (2 unchanged, 0 skipped), 0 unreadable, 0 missing, 880.553\u00b5s",
+      "unchanged": 2,
+      "unreadable_dirs": [],
+      "updated": 0,
+      "wall_clock_ms": 1.10866
+    },
+    "library.list": {
+      "items": [
+        {
+          "dir": "/tmp/tmp.mhHlCDsywt/walls",
+          "id": 2,
+          "kind": "static-image",
+          "mtime_secs": 1789888871,
+          "name": "aurora.png",
+          "path": "/tmp/tmp.mhHlCDsywt/walls/aurora.png",
+          "reference": "library:2",
+          "size_bytes": 19766,
+          "thumb": null
+        },
+        {
+          "dir": "/tmp/tmp.mhHlCDsywt/walls",
+          "id": 1,
+          "kind": "static-image",
+          "mtime_secs": 1789888871,
+          "name": "forest.png",
+          "path": "/tmp/tmp.mhHlCDsywt/walls/forest.png",
+          "reference": "library:1",
+          "size_bytes": 42913,
+          "thumb": null
+        }
+      ],
+      "page": 1,
+      "pages": 1,
+      "per_page": 50,
+      "roots": [
+        "/tmp/tmp.mhHlCDsywt/walls"
+      ],
+      "thumbnail_size": 256,
+      "total": 2
+    },
+    "library.thumb": {
+      "cached": false,
+      "id": 2,
+      "path": "$FIXTURE_DIR/thumb.png",
+      "size": 256,
+      "source": "/tmp/tmp.mhHlCDsywt/walls/aurora.png"
+    },
+    "outputs.list": {
+      "outputs": [],
+      "paused": false
+    }
+  }
+}

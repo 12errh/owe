@@ -3,13 +3,17 @@
 // daemon-facing surface reviewable (ARCHITECTURE §1: the GUI owns no state, it
 // only asks the daemon).
 //
-// Every function here returns a plain value or throws an `IpcFailure`. Nothing
-// caches and nothing polls — the UI does work when the user asks for it, which is
-// the whole point of a resource-first tool.
+// Field names are snake_case throughout because they mirror the Rust structs and,
+// below them, the daemon's JSON — the same names `owectl --json` prints. Renaming
+// them for JavaScript's sake would put a translation layer between the UI and the
+// protocol, which is exactly where a "the GUI shows the wrong thing" bug lives.
+//
+// Nothing caches and nothing polls: the UI does work when the user asks for it,
+// which is the whole point of a resource-first tool.
 
 import { invoke } from "@tauri-apps/api/core";
 
-/** Mirrors `DaemonStatus` in `app/src-tauri/src/main.rs` (serde snake_case). */
+/** Mirrors `DaemonStatus` in `app/src-tauri/src/main.rs`. */
 export interface DaemonStatus {
   connected: boolean;
   socket_path: string;
@@ -18,29 +22,76 @@ export interface DaemonStatus {
   shell_backends: string[];
   content_kinds: string[];
   media_backends: string[];
+  /** Transitions the picker may offer (what the daemon renders *and* allows). */
+  transitions: string[];
   /** Planned-but-missing features, as `"<id>: <why>"`. */
   unavailable: string[];
   error: string | null;
 }
 
-/** Mirrors `IpcError`: a protocol code, or `unreachable`/`protocol`. */
+/** Mirrors `IpcError`: a protocol code, or `unreachable`/`protocol`/`cache`. */
 export interface IpcFailure {
   code: string;
   message: string;
 }
 
-/** One wallpaper file. */
-export interface WallpaperEntry {
+/** One indexed wallpaper, as the grid renders it. */
+export interface LibraryItem {
+  id: number;
   path: string;
   name: string;
+  kind: string;
+  /** `library:<id>` — what an apply takes, so the UI never builds one itself. */
+  reference: string;
+  /** Cached thumbnail *path*, or null. Informational: the grid shows `data_url`. */
+  thumb: string | null;
   bytes: number;
 }
 
-/** A directory listing, with the scope the daemon actually used. */
-export interface LibraryListing {
-  dir: string;
-  entries: WallpaperEntry[];
-  scope: string;
+/** A page of the indexed library. */
+export interface LibraryPage {
+  items: LibraryItem[];
+  total: number;
+  page: number;
+  pages: number;
+  per_page: number;
+  thumbnail_size: number;
+  roots: string[];
+}
+
+/** The `library.list` parameters the UI sets; unset keys are omitted. */
+export interface LibraryQuery {
+  filter?: string;
+  dir?: string;
+  kind?: string;
+  page?: number;
+  per_page?: number;
+  scan_if_empty?: boolean;
+}
+
+/** What a scan did. */
+export interface ScanSummary {
+  summary: string;
+  roots: string[];
+  added: number;
+  updated: number;
+  removed: number;
+  unchanged: number;
+  skipped_unsupported: number;
+  rows_touched: number;
+  files_seen: number;
+  missing_roots: string[];
+  duration_ms: number;
+}
+
+/** A materialised thumbnail. The PNG arrives inline; the webview opens no files. */
+export interface Thumbnail {
+  id: number;
+  path: string;
+  size: number;
+  cached: boolean;
+  source: string;
+  data_url: string;
 }
 
 /** One output. */
@@ -54,7 +105,7 @@ export interface OutputView {
   wallpaper: string | null;
   kind: string | null;
   state: string;
-  /** Recorded in the session file but not applied this run (restore is P2). */
+  /** Recorded in the session file but not applied this run. */
   recorded: string | null;
   error: string | null;
 }
@@ -71,6 +122,13 @@ export interface ApplyOutcome {
   notes: string[];
 }
 
+/** A transition request: exactly the daemon's `{name, duration_ms, fps}` table. */
+export interface TransitionRequest {
+  name: string;
+  duration_ms: number;
+  fps: number;
+}
+
 function disconnected(error: string, socketPath = ""): DaemonStatus {
   return {
     connected: false,
@@ -80,6 +138,7 @@ function disconnected(error: string, socketPath = ""): DaemonStatus {
     shell_backends: [],
     content_kinds: [],
     media_backends: [],
+    transitions: [],
     unavailable: [],
     error,
   };
@@ -111,9 +170,19 @@ export function asFailure(error: unknown): IpcFailure {
   return { code: "unknown", message: String(error) };
 }
 
-/** List the image files the daemon can see in `dir`. */
-export function listWallpapers(dir: string): Promise<LibraryListing> {
-  return invoke<LibraryListing>("list_wallpapers", { dir });
+/** Ask the daemon for a page of its wallpaper index. */
+export function libraryIndex(query: LibraryQuery): Promise<LibraryPage> {
+  return invoke<LibraryPage>("library_index", { query });
+}
+
+/** Ask the daemon to rescan its configured roots (or the given ones). */
+export function libraryScan(paths: string[] | null = null): Promise<ScanSummary> {
+  return invoke<ScanSummary>("library_scan", { paths });
+}
+
+/** Fetch one thumbnail as a data URL (the daemon generates it on first ask). */
+export function libraryThumbnail(id: number): Promise<Thumbnail> {
+  return invoke<Thumbnail>("library_thumbnail", { id });
 }
 
 /** Ask the daemon about its outputs. */
@@ -121,12 +190,20 @@ export function listOutputs(): Promise<OutputsView> {
   return invoke<OutputsView>("list_outputs");
 }
 
-/** Apply a wallpaper to one output, or to every output when `output` is null. */
-export function applyWallpaper(
-  path: string,
-  output: string | null = null,
+/**
+ * Apply a wallpaper reference to specific outputs, or to every output when
+ * `outputs` is empty.
+ */
+export function assignWallpaper(
+  reference: string,
+  outputs: string[] = [],
+  transition: TransitionRequest | null = null,
 ): Promise<ApplyOutcome> {
-  return invoke<ApplyOutcome>("apply_wallpaper", { path, output });
+  return invoke<ApplyOutcome>("assign_wallpaper", {
+    reference,
+    outputs,
+    transition,
+  });
 }
 
 /** Remove the wallpaper from one output, or from every output. */

@@ -24,12 +24,32 @@
 //! size we rendered at is the size we should present; when they differ we report
 //! it and let the caller re-render. That is what makes scale/HiDPI/output changes
 //! a normal event instead of a subtle wrong-size bug.
+//!
+//! **Two event sources, no polling (P2).** The loop waits on the Wayland socket
+//! and on a command channel through `calloop` (ARCHITECTURE §4 names calloop as
+//! the event loop). P1 polled its command channel every 50 ms, which cost 37
+//! timer ticks and 0.6 % of a core over a minute *while doing nothing*; a
+//! wallpaper engine that burns CPU with a static image on screen has failed its
+//! own thesis. Now an idle daemon blocks in `poll(2)` and wakes for nothing.
+//!
+//! **The first present of an output is completed by its configure.** The old code
+//! created the surface and then *blocked* in a roundtrip waiting for the
+//! compositor to configure it, which needs the event queue mid-callback and forced
+//! a nested dispatch. Instead the frame is parked, and the `configure` handler
+//! finishes the present when it arrives — which is also what makes the loop a
+//! single flat dispatch machine.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, sync_channel};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use calloop::channel::{
+    Channel as CalloopChannel, Event as ChannelEvent, Sender as ChannelSender,
+    channel as calloop_channel,
+};
+use calloop::{EventLoop, LoopHandle};
+use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
@@ -139,6 +159,18 @@ pub enum PresenterEvent {
         /// Output name.
         output: String,
     },
+    /// An output was plugged in (FR-LIB-4). The daemon's supervisor turns this
+    /// into "spawn a worker and apply the configured wallpaper".
+    OutputAdded {
+        /// Output name.
+        output: String,
+    },
+    /// An output was unplugged. Its surface is released, but the daemon keeps the
+    /// session entry so a replug restores the same wallpaper (PRD-F-08).
+    OutputRemoved {
+        /// Output name.
+        output: String,
+    },
 }
 
 /// Presenter failures.
@@ -207,8 +239,13 @@ enum Command {
 
 /// The handle the daemon uses to present frames.
 pub struct Presenter {
-    tx: Option<Sender<Command>>,
-    events: Receiver<PresenterEvent>,
+    /// A calloop channel sender, not a `std::sync::mpsc` one: the receiving end is
+    /// registered as an event-loop source, so the presenter thread blocks until a
+    /// command actually arrives instead of waking up to look for one.
+    tx: Option<ChannelSender<Command>>,
+    /// `None` once the receiver has been handed to the daemon's hotplug thread
+    /// (see [`Presenter::take_events`]).
+    events: Option<Receiver<PresenterEvent>>,
     join: Option<JoinHandle<()>>,
     outputs: Vec<String>,
 }
@@ -227,14 +264,16 @@ impl Presenter {
     /// Fails fast with [`PresentError::NoSession`] when there is no session —
     /// that is a normal state for CI, not a crash.
     pub fn start(namespace: &str) -> Result<Self, PresentError> {
-        let (command_tx, command_rx) = channel::<Command>();
-        let (event_tx, event_rx) = channel::<PresenterEvent>();
+        // The command channel is calloop's, so the presenter thread can block on it
+        // as an event source rather than polling it.
+        let (command_tx, command_rx) = calloop_channel::<Command>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<PresenterEvent>();
         let (ready_tx, ready_rx) = sync_channel::<Result<Vec<String>, PresentError>>(1);
 
         let namespace = namespace.to_string();
         let join = std::thread::Builder::new()
             .name("owe-presenter".to_string())
-            .spawn(move || run_presenter(&namespace, &command_rx, &event_tx, &ready_tx))
+            .spawn(move || run_presenter(&namespace, command_rx, &event_tx, &ready_tx))
             .map_err(|error| {
                 PresentError::NoSession(format!("cannot spawn presenter thread: {error}"))
             })?;
@@ -244,7 +283,7 @@ impl Presenter {
         match ready_rx.recv() {
             Ok(Ok(outputs)) => Ok(Self {
                 tx: Some(command_tx),
-                events: event_rx,
+                events: Some(event_rx),
                 join: Some(join),
                 outputs,
             }),
@@ -270,10 +309,15 @@ impl Presenter {
             frame,
             reply: reply_tx,
         })
-        .map_err(|_| PresentError::NotRunning)?;
+        .map_err(|error| PresentError::Wayland(format!("cannot reach the presenter: {error}")))?;
+        // A timeout is a timeout, not "the presenter died": the old mapping sent
+        // a confused compositor away as `NotRunning`, which reads like a crash.
         reply_rx
             .recv_timeout(DEFAULT_TIMEOUT * 4)
-            .map_err(|_| PresentError::NotRunning)?
+            .map_err(|_| PresentError::ConfigureTimeout {
+                output: output.to_string(),
+                timeout: DEFAULT_TIMEOUT * 4,
+            })?
     }
 
     /// Remove OWE's surface from an output.
@@ -284,19 +328,36 @@ impl Presenter {
             output: output.to_string(),
             reply: reply_tx,
         })
-        .map_err(|_| PresentError::NotRunning)?;
+        .map_err(|error| PresentError::Wayland(format!("cannot reach the presenter: {error}")))?;
         reply_rx
             .recv_timeout(DEFAULT_TIMEOUT * 2)
-            .map_err(|_| PresentError::NotRunning)?
+            .map_err(|_| PresentError::ConfigureTimeout {
+                output: output.to_string(),
+                timeout: DEFAULT_TIMEOUT * 2,
+            })?
     }
 
     /// Take everything the presenter has reported since the last call.
+    ///
+    /// Returns nothing once the receiver has been taken by [`Self::take_events`],
+    /// because there is only one receiver: the caller either polls or blocks, and
+    /// doing both is how events get lost.
     pub fn drain_events(&self) -> Vec<PresenterEvent> {
         let mut events = Vec::new();
-        while let Ok(event) = self.events.try_recv() {
-            events.push(event);
+        if let Some(receiver) = self.events.as_ref() {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
         }
         events
+    }
+
+    /// Hand the event stream to a blocking consumer (the daemon's hotplug thread).
+    ///
+    /// Blocking on the channel is what keeps hotplug-free sessions at zero wakeups:
+    /// the supervisor sleeps until the compositor says something.
+    pub fn take_events(&mut self) -> Option<Receiver<PresenterEvent>> {
+        self.events.take()
     }
 
     /// Stop the presenter thread.
@@ -328,6 +389,16 @@ struct OutputSurface {
     size: Option<(u32, u32)>,
 }
 
+/// A present whose surface does not exist (or is not configured) yet.
+///
+/// Parked here rather than waited for: the configure arrives on the Wayland socket
+/// a few microseconds later, and the loop is already going to be woken by it.
+/// Blocking for it would need the event queue inside a callback.
+struct PendingPresent {
+    frame: Frame,
+    reply: SyncSender<Result<PresentOutcome, PresentError>>,
+}
+
 struct PresenterState {
     registry_state: RegistryState,
     output_state: OutputState,
@@ -339,6 +410,16 @@ struct PresenterState {
     /// Output name by `wl_output` protocol id, for hotplug callbacks.
     output_names: HashMap<u32, String>,
     events: Sender<PresenterEvent>,
+    /// Presents waiting for their surface's first configure, by output.
+    pending: HashMap<String, PendingPresent>,
+    /// Set by the shutdown command; the loop checks it after each dispatch.
+    stop: bool,
+    /// A clone of the connection, for flushing after commits. Cheap: the
+    /// underlying socket is shared.
+    connection: Connection,
+    /// A handle to the event queue, stored so protocol objects can be created from
+    /// inside a callback (the queue itself belongs to the Wayland event source).
+    queue_handle: QueueHandle<PresenterState>,
 }
 
 impl ProvidesRegistryState for PresenterState {
@@ -413,7 +494,13 @@ impl OutputHandler for PresenterState {
     ) {
         if let Some(name) = self.output_state.info(&output).and_then(|info| info.name) {
             tracing_note(format!("output appeared: {name}"));
-            self.output_names.insert(output.id().protocol_id(), name);
+            self.output_names
+                .insert(output.id().protocol_id(), name.clone());
+            // FR-LIB-4: the daemon has to give this output a worker and a
+            // wallpaper, and it can only know that from this event.
+            let _ = self
+                .events
+                .send(PresenterEvent::OutputAdded { output: name });
         }
     }
 
@@ -432,21 +519,43 @@ impl OutputHandler for PresenterState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        output: wl_output::WlOutput,
     ) {
+        let Some(name) = self.output_names.remove(&output.id().protocol_id()) else {
+            return;
+        };
+        tracing_note(format!("output disappeared: {name}"));
+
+        // Release the surface and its buffers right away: a torn-down output is
+        // exactly where a pool leak would hide (the P2 gate measures RSS across
+        // twenty plug cycles).
+        if let Some(surface) = self.surfaces.remove(&name) {
+            surface.layer.wl_surface().destroy();
+        }
+        self.pending.remove(&name);
+        let _ = self
+            .events
+            .send(PresenterEvent::OutputRemoved { output: name });
     }
 }
 
 impl LayerShellHandler for PresenterState {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
         let id = layer.wl_surface().id().protocol_id();
-        if let Some((name, _)) = self
+        if let Some(name) = self
             .surfaces
             .iter()
             .find(|(_, surface)| surface.surface_id == id)
-            .map(|(name, surface)| (name.clone(), surface))
+            .map(|(name, _)| name.clone())
         {
             self.surfaces.remove(&name);
+            // A pending present can never complete now: answer it instead of
+            // letting the caller sit until its timeout.
+            if let Some(pending) = self.pending.remove(&name) {
+                let _ = pending
+                    .reply
+                    .send(Err(PresentError::UnknownOutput(name.clone())));
+            }
             let _ = self.events.send(PresenterEvent::Closed { output: name });
         }
     }
@@ -472,32 +581,66 @@ impl LayerShellHandler for PresenterState {
             return;
         }
 
-        let Some((name, surface)) = self
+        // The output name is copied out (not borrowed) so the rest of the handler
+        // can borrow `self` mutably: `finish_present` needs the whole state.
+        let Some(output) = self
             .surfaces
             .iter_mut()
             .find(|(_, surface)| surface.surface_id == id)
+            .map(|(name, _)| name.clone())
         else {
             return;
         };
 
-        let changed = surface.size != Some(size);
-        if changed {
+        let mut changed = false;
+        if let Some(surface) = self.surfaces.get_mut(&output)
+            && surface.size != Some(size)
+        {
             // A different size invalidates the parked buffers (and their pool).
             surface.size = Some(size);
             surface.buffers = [None, None];
             surface.pool = match SlotPool::new(pool_bytes(size), &self.shm) {
                 Ok(pool) => pool,
                 Err(error) => {
-                    tracing_note(format!("cannot resize the shm pool for {name}: {error}"));
+                    tracing_note(format!("cannot resize the shm pool for {output}: {error}"));
                     return;
                 }
             };
+            changed = true;
+        }
+
+        // A parked present finishes here: this is the whole reason the first
+        // present of an output does not block waiting for a configure.
+        if let Some(pending) = self.pending.remove(&output) {
+            let outcome = finish_present(self, &output, &pending.frame, size);
+            let _ = pending.reply.send(outcome);
+        }
+
+        if changed {
             let _ = self.events.send(PresenterEvent::Configured {
-                output: name.clone(),
+                output: output.clone(),
                 size,
             });
         }
     }
+}
+
+/// Upload a frame to an already-configured surface, or report the size the
+/// compositor actually wants.
+fn finish_present(
+    state: &mut PresenterState,
+    output: &str,
+    frame: &Frame,
+    configured: (u32, u32),
+) -> Result<PresentOutcome, PresentError> {
+    if configured != frame.size() {
+        // Hand the truth back instead of uploading a wrongly sized buffer, which
+        // the compositor would stretch.
+        return Ok(PresentOutcome::ResizeRequired { size: configured });
+    }
+    let connection = state.connection.clone();
+    upload(&connection, state, output, frame)?;
+    Ok(PresentOutcome::Presented { size: configured })
 }
 
 impl ShmHandler for PresenterState {
@@ -534,7 +677,7 @@ fn tracing_note(message: String) {
 
 fn run_presenter(
     namespace: &str,
-    commands: &Receiver<Command>,
+    commands: CalloopChannel<Command>,
     events: &Sender<PresenterEvent>,
     ready: &SyncSender<Result<Vec<String>, PresentError>>,
 ) {
@@ -587,9 +730,15 @@ fn run_presenter(
         surfaces: HashMap::new(),
         output_names: HashMap::new(),
         events: events.clone(),
+        pending: HashMap::new(),
+        stop: false,
+        connection: connection.clone(),
+        // Cloned before the queue is moved into the event source.
+        queue_handle: queue.handle(),
     };
 
-    // First roundtrip: we need the output list before we can name one.
+    // First roundtrip: we need the output list before we can name one. Before the
+    // loop exists, so the queue is still ours to use directly.
     if let Err(error) = queue.roundtrip(&mut state) {
         let _ = ready.send(Err(PresentError::NoSession(error.to_string())));
         return;
@@ -610,84 +759,132 @@ fn run_presenter(
         })
         .collect();
 
-    let _ = ready.send(Ok(outputs.clone()));
+    // --- the event loop -------------------------------------------------------
+    //
+    // Two sources, both blocking: the Wayland socket and the command channel.
+    // `dispatch` parks in `poll(2)` until one of them has work, which is what makes
+    // an idle wallpaper cost nothing at all (NFR-PERF-1, re-measured in P2).
+    let mut event_loop: EventLoop<PresenterState> = match EventLoop::try_new() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            let _ = ready.send(Err(PresentError::Wayland(format!(
+                "cannot create the event loop: {error}"
+            ))));
+            return;
+        }
+    };
+    let handle: LoopHandle<PresenterState> = event_loop.handle();
+
+    // Wayland first: its source owns the queue and dispatches pending events, so a
+    // configure or an output change wakes the loop (and runs the handlers) without
+    // a single wakeup of our own.
+    if let Err(error) = WaylandSource::new(connection.clone(), queue).insert(handle.clone()) {
+        let _ = ready.send(Err(PresentError::Wayland(format!(
+            "cannot register the wayland source: {error}"
+        ))));
+        return;
+    }
+
+    if let Err(error) = handle.insert_source(commands, |event, _, state: &mut PresenterState| {
+        match event {
+            ChannelEvent::Msg(command) => handle_command(state, command),
+            // The sender lives in the `Presenter` handle, so this only fires when
+            // the daemon dropped it: stop rather than spin on a dead channel.
+            ChannelEvent::Closed => state.stop = true,
+        }
+    }) {
+        let _ = ready.send(Err(PresentError::Wayland(format!(
+            "cannot register the command source: {error}"
+        ))));
+        return;
+    }
+
+    if let Err(error) = ready.send(Ok(outputs.clone())) {
+        tracing_note(format!("cannot report readiness: {error}"));
+        return;
+    }
     tracing_note(format!("presenter ready, outputs: {}", outputs.join(", ")));
 
-    loop {
-        // Drain protocol events before waiting for work: this is what keeps
-        // configure/resize notices from piling up while we sleep.
-        if let Err(error) = queue.dispatch_pending(&mut state) {
-            tracing_note(format!("dispatch failed: {error}"));
+    while !state.stop {
+        // `None` means "block until something happens", which is the point.
+        if let Err(error) = event_loop.dispatch(None, &mut state) {
+            tracing_note(format!("event loop failed: {error}"));
             break;
-        }
-        let _ = connection.flush();
-
-        match commands.recv_timeout(Duration::from_millis(50)) {
-            Ok(Command::Present {
-                output,
-                frame,
-                reply,
-            }) => {
-                let result = present_frame(&connection, &mut queue, &mut state, &output, frame);
-                let _ = reply.send(result);
-            }
-            Ok(Command::Clear { output, reply }) => {
-                let removed = state.surfaces.remove(&output).is_some();
-                let _ = connection.flush();
-                if removed {
-                    tracing_note(format!("cleared {output}"));
-                }
-                let _ = reply.send(Ok(()));
-            }
-            Ok(Command::Shutdown) => break,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
     tracing_note("presenter stopped".to_string());
     state.surfaces.clear();
+    state.pending.clear();
     let _ = connection.flush();
 }
 
-fn present_frame(
-    connection: &Connection,
-    queue: &mut wayland_client::EventQueue<PresenterState>,
-    state: &mut PresenterState,
-    output: &str,
-    frame: Frame,
-) -> Result<PresentOutcome, PresentError> {
-    // Create the surface on first use.
-    if !state.surfaces.contains_key(output) {
-        create_surface(queue, state, output)?;
-        wait_for_configure(queue, state, output, DEFAULT_TIMEOUT)?;
-    }
-
-    let size = match state.surfaces.get(output).and_then(|surface| surface.size) {
-        Some(size) => size,
-        None => {
-            return Err(PresentError::ConfigureTimeout {
-                output: output.to_string(),
-                timeout: DEFAULT_TIMEOUT,
-            });
+/// Handle one command from a client.
+fn handle_command(state: &mut PresenterState, command: Command) {
+    match command {
+        Command::Present {
+            output,
+            frame,
+            reply,
+        } => {
+            match begin_present(state, &output, &frame) {
+                PresentStart::Done(result) => {
+                    let _ = reply.send(result);
+                }
+                // The surface has no configure yet: the reply is sent from the
+                // configure handler, so the caller still gets its answer.
+                PresentStart::Parked => {
+                    state
+                        .pending
+                        .insert(output, PendingPresent { frame, reply });
+                }
+            }
         }
-    };
-
-    if size != frame.size() {
-        // Hand the truth back to the caller instead of uploading a wrongly sized
-        // buffer (which the compositor would stretch).
-        return Ok(PresentOutcome::ResizeRequired { size });
+        Command::Clear { output, reply } => {
+            let removed = state.surfaces.remove(&output).is_some();
+            if let Some(pending) = state.pending.remove(&output) {
+                let _ = pending.reply.send(Ok(PresentOutcome::Presented {
+                    size: pending.frame.size(),
+                }));
+            }
+            let _ = state.connection.flush();
+            if removed {
+                tracing_note(format!("cleared {output}"));
+            }
+            let _ = reply.send(Ok(()));
+        }
+        Command::Shutdown => state.stop = true,
     }
-
-    upload(connection, state, output, &frame)?;
-    Ok(PresentOutcome::Presented { size })
+    let _ = state.connection.flush();
 }
 
-fn create_surface(
-    queue: &mut wayland_client::EventQueue<PresenterState>,
-    state: &mut PresenterState,
-    output: &str,
-) -> Result<(), PresentError> {
+/// Whether a present finished immediately or had to wait for a configure.
+enum PresentStart {
+    /// The frame was uploaded (or the size matches not): answer the caller now.
+    Done(Result<PresentOutcome, PresentError>),
+    /// No configure yet: park the frame and answer from the configure handler.
+    Parked,
+}
+
+/// Start presenting `frame` on `output`.
+fn begin_present(state: &mut PresenterState, output: &str, frame: &Frame) -> PresentStart {
+    // Create the surface on first use. Its configure arrives on the Wayland
+    // socket right after, which is what wakes the loop to finish the present.
+    if !state.surfaces.contains_key(output) {
+        return match create_surface(state, output) {
+            Ok(()) => PresentStart::Parked,
+            Err(error) => PresentStart::Done(Err(error)),
+        };
+    }
+
+    match state.surfaces.get(output).and_then(|surface| surface.size) {
+        Some(size) => PresentStart::Done(finish_present(state, output, frame, size)),
+        None => PresentStart::Parked,
+    }
+}
+
+fn create_surface(state: &mut PresenterState, output: &str) -> Result<(), PresentError> {
+    let queue_handle = state.queue_handle.clone();
     let target = state
         .output_state
         .outputs()
@@ -701,10 +898,9 @@ fn create_surface(
         })
         .ok_or_else(|| PresentError::UnknownOutput(output.to_string()))?;
 
-    let qh = queue.handle();
-    let surface = state.compositor_state.create_surface(&qh);
+    let surface = state.compositor_state.create_surface(&queue_handle);
     let layer = state.layer_shell.create_layer_surface(
-        &qh,
+        &queue_handle,
         surface,
         // Background: below every window, above the desktop. The whole point.
         Layer::Background,
@@ -720,12 +916,12 @@ fn create_surface(
     let region = state
         .compositor_state
         .wl_compositor()
-        .create_region(&qh, ());
+        .create_region(&queue_handle, ());
     layer.wl_surface().set_input_region(Some(&region));
 
-    // Buffer scale is fixed at 1 in P1: we render exactly at the compositor's
-    // configured (logical) size. HiDPI/fractional scaling needs physical-size
-    // rendering and is tracked for P2.
+    // Buffer scale is fixed at 1: we render exactly at the compositor's configured
+    // (logical) size. Fractional scaling is applied by the compositor, so the
+    // buffer it asks for is already the right size.
     layer.wl_surface().set_buffer_scale(1);
     layer.commit();
     region.destroy();
@@ -753,55 +949,6 @@ fn create_surface(
     );
     tracing_note(format!("created a background surface on {output}"));
     Ok(())
-}
-
-/// Block until the compositor has configured `output`'s surface (or the deadline
-/// passes).
-///
-/// `dispatch_pending` alone is **not** enough here, and this function used to get
-/// that wrong: it only dispatches events that have already been read off the
-/// socket, and nothing reads the socket unless we ask. Since the configure is
-/// produced *by* the commit we just made, a loop of `dispatch_pending` can wait
-/// forever for an event that is sitting unread in the kernel buffer. The E2E gate
-/// caught exactly that: "compositor did not configure the surface within 2s" on a
-/// session where the same surface maps instantly.
-///
-/// `roundtrip` reads the socket and blocks for the sync callback. A Wayland
-/// compositor emits events in the order it processes requests, and our commit went
-/// out before the sync request, so by the time the callback arrives the configure
-/// has already been read and dispatched.
-fn wait_for_configure(
-    queue: &mut wayland_client::EventQueue<PresenterState>,
-    state: &mut PresenterState,
-    output: &str,
-    timeout: Duration,
-) -> Result<(u32, u32), PresentError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        // Anything already read (a configure that raced with our commit).
-        let _ = queue.dispatch_pending(state);
-        if let Some(size) = state.surfaces.get(output).and_then(|surface| surface.size) {
-            return Ok(size);
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        if let Err(error) = queue.roundtrip(state) {
-            return Err(PresentError::Wayland(format!(
-                "roundtrip while waiting for the configure of {output}: {error}"
-            )));
-        }
-    }
-    // One last look after the final roundtrip, then give up honestly.
-    let _ = queue.dispatch_pending(state);
-    state
-        .surfaces
-        .get(output)
-        .and_then(|surface| surface.size)
-        .ok_or_else(|| PresentError::ConfigureTimeout {
-            output: output.to_string(),
-            timeout,
-        })
 }
 
 fn upload(

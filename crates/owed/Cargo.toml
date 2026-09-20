@@ -27,6 +27,9 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Test fixtures only: the library and thumbnail tests write real PNGs, because a
+# scanner test that fakes the pixels would not prove the thumbnail path works.
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg"] }
 
 [lints.rust]
 missing_debug_implementations = "warn"

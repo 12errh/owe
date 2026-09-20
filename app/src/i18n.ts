@@ -1,7 +1,10 @@
 // Every user-visible string goes through here from day one (TRD NRF-I18N-1 /
 // UI-DESIGN §3): shipping a second language must not require touching a single
-// component. Only English ships in P0 — that is a translation gap, not a design
-// decision made by hardcoding strings.
+// component. Only English ships today — that is a translation gap, not a design
+// decision taken by hardcoding strings in JSX.
+//
+// `StringKey` is derived from this object, so a typo in `t("...")` is a type error
+// rather than a blank label.
 
 export const strings = {
   appTitle: "OWE",
@@ -30,21 +33,47 @@ export const strings = {
   wallpaperLabel: "Wallpaper",
   wallpaperNone: "no wallpaper applied by OWE",
   recordedLabel: "Recorded",
-  recordedHint: "not applied this run; restore lands in P2",
+  recordedHint: "not applied this run",
   stateLabel: "State",
   clear: "Clear",
   clearedLabel: "Cleared",
   clearNothing: "Nothing was set on that output.",
+  goSlash: "Only",
+  assignHere: "Apply selected",
+  assignHereHint: "Apply the selected wallpaper to this output",
   governorPaused: "The governor is paused: nothing new will be drawn until it resumes.",
 
   libraryTitle: "Library",
-  chooseFolder: "Choose folder…",
-  libraryEmpty: "Pick a folder to see the wallpapers in it.",
-  libraryNoneInFolder: "No images found in that folder.",
+  librarySearchPlaceholder: "Search wallpapers",
+  libraryEmpty: "Nothing indexed yet. Scan your folders to fill the grid.",
+  libraryNoneMatching: "No wallpaper matches that search.",
+  libraryRootsLabel: "Indexed",
+  libraryNoRoots: "no folders configured — set `library.paths` in the daemon config",
   scopeLabel: "Scanned",
-  apply: "Apply",
+  scan: "Rescan",
+  scanning: "Scanning…",
+  scanningLabel: "Scanned",
+  scanSummaryLabel: "Scan",
+  scanMissingRoots: "Unreachable folders (kept, not forgotten)",
+  kindAll: "All kinds",
+  thumbnailsPending: "Generating…",
+  thumbnailUnavailable: "No preview",
+  loadingMore: "Loading…",
+  previousPage: "Previous",
+  nextPage: "Next",
+  pageLabel: "Page",
+  totalsLabel: "Wallpapers",
+  ofLabel: "of",
+
+  selectionNone: "Select a wallpaper in the grid, then apply it.",
+  selectionLabel: "Selected",
+  applyAll: "Apply to all outputs",
   appliedLabel: "Applied",
   noOutputsMatched: "no outputs matched",
+  transitionLabel: "Transition",
+  transitionNone: "No transition",
+  transitionDuration: "Duration (ms)",
+  transitionUnavailable: "This daemon's config allows no transitions.",
 
   unavailableTitle: "Not in this build",
   failureLabel: "The daemon refused",

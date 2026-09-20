@@ -25,7 +25,8 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
-    fn to_wgpu(self) -> wgpu::TextureFormat {
+    /// The wgpu format a render target in this pixel order needs.
+    pub(crate) fn to_wgpu(self) -> wgpu::TextureFormat {
         match self {
             PixelFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
             PixelFormat::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,

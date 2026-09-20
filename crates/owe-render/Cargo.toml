@@ -19,6 +19,13 @@ wgpu = "26.0.1"
 smithay-client-toolkit = { version = "0.19", default-features = false }
 wayland-client = "0.31"
 
+# The event loop (ARCHITECTURE §4: "Event loop | calloop (no tokio)"). The
+# presenter waits on the Wayland socket and its command channel as two event
+# sources, so an idle wallpaper engine wakes for nothing at all instead of
+# polling a channel every 50 ms (the P1 debt in IMPLEMENTATION-PLAN §1.2.3).
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 

@@ -16,6 +16,8 @@
 mod cli;
 mod engine;
 mod handler;
+mod hotplug;
+mod library;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -28,6 +30,8 @@ use tracing_subscriber::EnvFilter;
 use crate::cli::Cli;
 use crate::engine::Engine;
 use crate::handler::{DaemonState, IpcHandler};
+use crate::hotplug::HotplugDriver;
+use crate::library::LibraryService;
 
 /// Process exit codes (see the table in the module docs).
 pub mod exit_code {
@@ -164,7 +168,7 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
 
     // Start the engine before serving: its report is the honest summary of what
     // this session can actually do, and it never fails (see Engine::start).
-    let engine = Engine::new(config.clone(), paths.clone());
+    let engine = Arc::new(Engine::new(config.clone(), paths.clone()));
     let report = engine.start();
 
     match (&report.backend, &report.backend_error) {
@@ -202,13 +206,51 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
         tracing::warn!("{warning}");
     }
 
+    // The library: indexed folders plus the thumbnail worker. Opening it never
+    // fails fatally (a broken database degrades to an in-memory index with a
+    // warning), and the engine needs the resolver before any `library:<id>` apply.
+    let library = Arc::new(LibraryService::open(&config, &paths));
+    for warning in library.warnings() {
+        tracing::warn!("{warning}");
+    }
+    engine.set_library(Arc::clone(&library) as Arc<dyn crate::engine::LibraryResolver>);
+
+    // Initial scan: the GUI's library page must have something to show, and a
+    // scan of an unchanged library is one stat per file. Failures are logged and
+    // swallowed — a daemon that refuses to serve IPC because a wallpaper folder is
+    // unreadable would be useless exactly when the user is fixing that folder.
+    match library.scan(None) {
+        Ok(report) => tracing::info!(summary = %report.summary(), "library indexed"),
+        Err(error) => tracing::warn!(%error, "library scan failed; the index may be stale"),
+    }
+
+    // Session restore (FR-LIB-5): put back what was on screen before this run.
+    let restored = engine.restore();
+    for (output, reference) in &restored.restored {
+        tracing::info!(%output, %reference, "restored wallpaper");
+    }
+    for (output, reason) in &restored.skipped {
+        tracing::debug!(%output, %reason, "nothing to restore");
+    }
+    for (output, reason) in &restored.failures {
+        tracing::warn!(%output, %reason, "restore failed");
+    }
+
+    // Hotplug: the presenter's output events drive re-apply and teardown
+    // (FR-LIB-4). The listener blocks on the channel, so it costs nothing until
+    // a monitor is actually plugged or unplugged.
+    let hotplug = engine
+        .take_presenter_events()
+        .map(|events| HotplugDriver::spawn(events, Arc::clone(&engine)));
+
     // One shutdown signal shared by the IPC handler and the accept loop.
     let shutdown = Shutdown::new();
     let state = Arc::new(DaemonState::new(
         config,
         socket_path.clone(),
         shutdown.clone(),
-        engine,
+        Arc::clone(&engine),
+        Arc::clone(&library),
     ));
     let server = Server::bind_with_shutdown(
         &socket_path,
@@ -245,6 +287,17 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
         )
     })?;
 
-    tracing::info!("owed stopped");
+    // Shutdown order: the presenter first (this is what releases the hotplug
+    // listener's blocking recv), then the listener, then the leftovers.
+    engine.stop_presenter();
+    drop(hotplug);
+
+    let stats = library.thumbnail_stats();
+    tracing::info!(
+        thumbnails = stats.generated,
+        served_from_cache = stats.served_from_cache,
+        failures = stats.failures,
+        "owed stopped"
+    );
     Ok(exit_code::OK)
 }

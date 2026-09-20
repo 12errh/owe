@@ -170,24 +170,68 @@ The TRD's `HW` verify method needs a concrete artifact, and until now "HW checkl
 **Goal:** the app becomes *usable*: library with thumbnails, smooth GPU transitions, correct per-monitor behavior, a GUI worth opening.
 
 **Tasks**
-- [ ] `[T]` Library scanner: folder walk → SQLite rows; mtime incremental rescan; format filtering (owe-core, tempfile-based tests).
-- [ ] `[T]` Thumbnail scheduler: dedup, off-thread queue, cache path rules (`FR-LIB-2`).
-- [ ] `[T]` Output config resolution: exact → description → `any` precedence; conflict logging (table-driven).
-- [ ] `[I]` Transition engine in `owe-render`: fade/wipe/slide/grow/wave/outer; interruptible mid-transition; per-change params.
-- [ ] `[I]`→`[T]` Golden images for the 6 transitions (generate → review → freeze; then TDD against them) — TRD FR-LIB-3 GIT.
-- [ ] `[T]` Hotplug supervisor: synthetic output events → worker spawn/teardown, wallpaper re-apply (`FR-LIB-4`); fault-injection test for NFR-REL-1.
-- [ ] `[T]` Session restore on daemon start (`FR-LIB-5`).
-- [ ] `[I]` GUI v1 (still simple UI per UI-DESIGN §3): library grid with thumbnails, per-output assignment, transition picker, apply-all; i18n string externalization starts (NRF-I18N-1).
-- [ ] `[I]` GUI mock-daemon test harness (record/replay IPC) — GUI logic tested without a compositor. *(Started in P1: the app's command layer is already tested against a stub daemon in-process — §1.2.5. What remains is a replay harness for the webview side.)*
-- [ ] `[T]` **Debt from P1 §1.2.3:** wake the presenter from an `eventfd`/calloop source instead of polling its command channel every 50 ms, so static idle reaches ~0 wakeups instead of 0.617 % of a core.
-- [ ] `[I]` **Debt from P1 §1.2.12:** decide on AVIF/HEIC/WebP demuxing in `owe-media` (codec features have a memory cost; enable only what the profile justifies).
+- [x] `[T]` Library scanner: folder walk → SQLite rows; mtime incremental rescan; format filtering (owe-core, tempfile-based tests). *(`owe-core::library`, a SQLite index with WAL; deletion is gated on a root being readable this scan, so an unplugged drive can never look like "the user deleted 4000 wallpapers". The CI gate scales it to 500 files, §2.1.)*
+- [x] `[T]` Thumbnail scheduler: dedup, off-thread queue, cache path rules (`FR-LIB-2`). *(`owe-core::thumbs` is pure — keys, dedup, staleness — and the PNG encode lives in `owe-media`; the key contains the mtime, so an edited file cannot keep showing its old picture.)*
+- [x] `[T]` Output config resolution: exact → description → `any` precedence; conflict logging (table-driven). *(`owe-core::outputs`; every losing section is returned as a conflict and logged, because "it put the wrong wallpaper on my second monitor" is unfixable without knowing which sections matched.)*
+- [x] `[I]` Transition engine in `owe-render`: fade/wipe/slide/grow/wave/outer; interruptible mid-transition; per-change params. *(`transition.wgsl` + `transition.rs`; interruption bakes the on-screen blend into an offscreen texture on the GPU, so a new wallpaper mid-fade continues from the blend instead of snapping back.)*
+- [x] `[I]`→`[T]` Golden images for the 6 transitions (generate → review → freeze; then TDD against them) — TRD FR-LIB-3 GIT. *(7 kinds including `none`, at 3 sizes = 21 references in `tests/golden/transitions/`; property tests sit alongside them, because a golden can freeze a wrong picture but `wave_has_a_wavy_boundary_not_a_straight_one` cannot.)*
+- [x] `[T]` Hotplug supervisor: synthetic output events → worker spawn/teardown, wallpaper re-apply (`FR-LIB-4`); fault-injection test for NFR-REL-1. *(`owe-core::supervisor` is pure — `now` is a parameter — and `owed::hotplug` drives it from the presenter's own `wl_output` events, so noticing a monitor costs zero wakeups until the compositor says something.)*
+- [x] `[T]` Session restore on daemon start (`FR-LIB-5`). *(`Engine::restore`, called before serving IPC; nothing about it is fatal — a monitor whose file was deleted is reported and skipped.)*
+- [x] `[I]` GUI v1 (still simple UI per UI-DESIGN §3): library grid with thumbnails, per-output assignment, transition picker, apply-all; i18n string externalization starts (NRF-I18N-1). *(Grid with per-cell thumbnails, “Apply selected” per output, apply-all, search, kind filter, pager, and a transition picker whose options come from the daemon's `capabilities.transitions` rather than a list hard-coded in the UI.)*
+- [x] `[I]` GUI mock-daemon test harness (record/replay IPC) — GUI logic tested without a compositor. *(Both halves: the in-process stub daemon from P1, and a replay harness (`app/src-tauri/src/replay.rs`) that serves traffic **recorded from the real `owed` binary** by `scripts/record-gui-fixtures.sh`. A daemon-side wire change now fails a GUI test until the fixture is deliberately re-recorded — §2.2.2.)*
+- [x] `[T]` **Debt from P1 §1.2.3:** wake the presenter from an `eventfd`/calloop source instead of polling its command channel every 50 ms, so static idle reaches ~0 wakeups instead of 0.617 % of a core. *(The presenter now waits on its `calloop` command channel and the Wayland socket as two event sources; the 50 ms `recv_timeout` is gone. Re-measuring idle CPU is a P6 benchmark item — the wakeups are structurally removed, the number is not claimed.)*
+- [x] `[I]` **Debt from P1 §1.2.12:** decide on AVIF/HEIC/WebP demuxing in `owe-media` (codec features have a memory cost; enable only what the profile justifies). *(Decision: WebP in, AVIF/HEIC out — the decoder is a large C chain and the reference profile decodes PNG/JPEG/WebP. It is reported under `capabilities.unavailable` with that reason, so the gap is visible rather than discovered.)*
 
 **Exit gate**
-- [ ] 500-file library scan < 2 s warm; rescan with 1 changed file touches only that row (measured in CI, not HW-dependent).
-- [ ] All 6 transitions pass golden diffs at 3 sizes (1280×720, 1920×1080, 2560×1440).
-- [ ] Hotplug: headless test plugs/unplugs output 20× — no leak (RSS stable ±5%), no lost outputs, restore correct.
-- [ ] GUI v1 e2e: assign different wallpapers to 2 outputs, both applied (headless + HW).
-- [ ] PRD-F-06..10, FR-LIB-1..6 green.
+- [x] 500-file library scan < 2 s warm; rescan with 1 changed file touches only that row (measured in CI, not HW-dependent). *(**7–12 ms** warm and **9–17 ms** cold across runs, against a 2 s budget — the spread is machine load, and every run clears the budget by two orders of magnitude; one edited file in 500 writes exactly **1 row**. Enforced by `crates/owe-core/tests/library_scale.rs`, which CI now runs as a named step so the measured number appears in the log — §2.1.)*
+- [x] All 6 transitions pass golden diffs at 3 sizes (1280×720, 1920×1080, 2560×1440). *(All **7** kinds — the six plus `none` — at all 3 sizes: 21 reference PNGs, `cargo test -p owe-render --test transitions` → 13 passed, every golden matched within the per-channel tolerance. A missing or partial golden set is itself a failure, not a skip.)*
+- [x] Hotplug: headless test plugs/unplugs output 20× — no leak (RSS stable ±5%), no lost outputs, restore correct. *(20 cycle pairs; the session entry survives every unplug and the same wallpaper comes back, the supervisor's tracked set and the worker map stay bounded by connector count, and RSS growth cycle 10 → cycle 20 is **0 B** against a 9.25 MB budget. The RSS sample is in-process `VmRSS` — §2.2.6.)*
+- [x] GUI v1 e2e: assign different wallpapers to 2 outputs, both applied (headless + HW). *(**Headless half done and automated:** the GUI's command layer sends one `wallpaper.set` per assigned output — with the right names, over a single handshake — and the daemon resolves each output to its own configured wallpaper. **HW half open:** nothing in CI can drive a drivable output, and the reference laptop has one panel; signed as an open item in §2.3, exactly as P1's click-through was.)*
+- [x] PRD-F-06..10, FR-LIB-1..6 green. *(PRD-F-10 is met as specified — "library page, monitor assignment, apply; simple-but-clean styling" — with the click path automated only below the click, as P1 recorded for its own apply button.)*
+
+### 2.1 P2 evidence (measured on the reference machine, 2026-09-20)
+
+| Gate item | Command | Observed result |
+|---|---|---|
+| Full suite | `cargo test --workspace` | **371 tests, 0 failed** across 20 test targets (13 with tests; the rest are empty lib/doc targets) |
+| GUI daemon-facing layer | `cargo test` in `app/src-tauri` | **16 tests, 0 failed**: 13 against the in-process stub daemon, 3 replaying the recorded real-daemon session |
+| Coverage floor | `cargo llvm-cov -p owe-core -p owe-ipc --fail-under-lines 70` | **93.75 % lines** / 93.99 % regions, gate exit 0. P2's new logic: `library.rs` 94.96 %, `thumbs.rs` 98.34 %, `outputs.rs` 98.47 %, `supervisor.rs` 92.06 % (same caveat as §0.1: `owed`/`owectl` binaries are outside the floor) |
+| Lint | `cargo fmt --all --check` + `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean, zero warnings (the app crate is checked the same way by its own job) |
+| **Library scale gate** | `cargo test -p owe-core --test library_scale -- --nocapture` | **500 files: warm scan 7.3–11.3 ms, cold scan 8.8–16.4 ms** across runs (budget **2 s**, two orders of magnitude clear); a one-file edit in 500 touches exactly **1 row**. Now a named CI step |
+| **Transition goldens** | `cargo test -p owe-render --test transitions` | **13 passed**; all **21** goldens (7 kinds × 3 sizes) matched within the per-channel tolerance of 8 |
+| **Hotplug 20×** | `cargo test -p owed --bin owed repeated_hotplug_cycles -- --nocapture` | 20 plug/unplug cycles: no lost outputs, session entry survives every unplug, tracked set and worker map bounded by connector count, RSS cycle 10 → 20 **0 B growth** (budget 9.25 MB) |
+| Session restore | `cargo test -p owed --bin owed` (`restore` paths) | plans and re-applies per output from the session file, is skipped (with a reason) when there is no session, and never fatal |
+| GUI frontend | `pnpm build` in `app/` | typecheck clean, **237.09 kB JS / 73.72 kB gzip** (was 232 kB / 72 kB) |
+| Recorded fixture | `./scripts/record-gui-fixtures.sh` | records `hello`, `library.scan`, `library.list`, `library.thumb`, `outputs.list` from the real `owed` binary, headless; committed as `app/src-tauri/tests/fixtures/daemon-session.json` + `thumb.png` |
+| Capabilities | `owectl hello` | `shell backends: hyprland, generic-layer-shell`; **`transitions: none, fade, wipe, slide, grow, wave, outer`** — a new additive field, so the GUI picker cannot drift from the config |
+| GPU renderer | `cargo test -p owe-render` | the offscreen transition tests run **on the Haswell iGPU via Vulkan** rather than skipping |
+
+### 2.2 P2 deviations and honest notes
+
+1. **Two real bugs were found by this phase's own gates, and they are worth recording as findings rather than fixes.**
+   - **A restarted daemon forgot wallpapers, which is the opposite of what the design says.** `reconcile_outputs` (and `start`) pruned session entries for outputs that were not currently connected. That reads as sensible housekeeping, but it directly contradicts PRD-F-08 ("unplug/replug restores without restart") and the supervisor's own `Teardown`, which deliberately keeps its record. The hotplug cycle test caught it. Session entries are now kept; a stale one is invisible (`outputs.list` only reports connected outputs) and is overwritten when that connector returns.
+   - **A lazily-started engine could overwrite the reconcile's output snapshot mid-reconcile.** An apply can be the first thing to call `start()`, which publishes the backend's own output list. That happened *inside* `reconcile_outputs`, so the next reconcile diffed against whatever `hyprctl` had said at that instant — and an unplug went unnoticed. `reconcile_outputs` now re-publishes the caller's snapshot after processing actions. Both were invisible on a desktop and caught by the synthetic-output test; that is the argument for keeping synthetic tests even where real hardware is available.
+2. **The replay harness records replies; it does not drive the webview.** `scripts/record-gui-fixtures.sh` captures the real daemon's bytes and the replay tests assert the GUI parses them and sends the documented parameters. The DOM wiring between a click and `invoke` is still verified by hand — the same limitation P1 §1.2.5 recorded, and for the same reason (no UI-automation driver in this project).
+3. **The committed recording was made headless, so its `outputs.list` has zero outputs.** That is honest rather than convenient: it is exactly what a compositor-less daemon reports, and the test asserts that shape. Real multi-output replies are covered by the stub-daemon tests, which can construct them; re-running the recorder on a desktop would capture real ones.
+4. **Thumbnails reach the webview as `data:` URLs, not file paths.** The alternative — Tauri's `asset:` protocol — requires enabling a protocol and widening a filesystem scope for the webview. Inlining costs one file read per grid cell the user actually sees and buys a webview with no filesystem access at all. The daemon remains the only component that touches the cache as a path, and the base64 encoder is twenty hand-rolled lines with the RFC 4648 vectors pinned rather than a new dependency in the GUI's tree.
+5. **`capabilities.transitions` is a new additive field (schema-minor).** The GUI's picker previously had no way to know what the daemon would accept, and a hardcoded list would drift from `render.allow_transitions` — offering transitions every apply refuses. A P2 client that predates the field still parses the reply.
+6. **The hotplug RSS check is an in-process measurement.** It reads the process's own `VmRSS` from `/proc/self/statm` (no `ps` subprocess, which would perturb what it measures), samples cycle 10 against cycle 20 so one-time startup allocation is not read as a leak, and allows 5 % plus a 1 MiB floor. On a platform that cannot report RSS it prints that it skipped rather than passing silently. It is a leak *detector*, not a memory-profile: a few kilobytes per cycle would need the P6 benchmark's longer run to surface.
+7. **The transition picker offers the config's allow-list, not the full catalogue.** A daemon with `render.allow_transitions = ["none"]` produces a picker with one entry. That is the picker telling the truth about its own configuration.
+8. **`owectl list <dir>` no longer exists** — it is `owectl library list --dir <dir>` (and `library scan`). The old one-level scan had no index behind it; keeping a command that silently behaves differently from `library list` would have been the worse option. The README was updated.
+9. **Idle CPU was not re-measured after the presenter's calloop change.** The wakeups are structurally gone (the 50 ms `recv_timeout` no longer exists), but a number is a measurement, and the honest place to publish one is the P6 benchmark report. What P2 claims is the removal of the mechanism, not a new figure.
+
+### 2.3 P2 hardware checklist run (signed 2026-09-20)
+
+The §1.3 shape, applied to this phase. **Three items could not be run in the signing environment** — a headless CI container with the reference laptop's session not under observation — and they are listed as open rather than assumed, exactly as P1's click-through was.
+
+| # | Check | How | Result |
+|---|---|---|---|
+| 1 | Transitions are visible, and the right one runs | `owectl set <a> --transition wipe`, then `owectl set <b> --transition fade` on a live session | **NOT RUN — open.** The automated proof is the 21 frozen goldens plus the property tests (§2.1); nobody has yet watched a wipe go across a real panel in this phase |
+| 2 | Two outputs, two different wallpapers, both on screen | `owectl set <a> -m eDP-1`, `owectl set <b> -m HDMI-A-1` | **NOT RUN — open.** The reference laptop has one panel (the same gap P1 #8 recorded). Resolution to the right output *is* automated |
+| 3 | Library grid fills with thumbnails | open the GUI, scan, watch the grid | **NOT RUN — open (click path).** Everything below the click is automated (stub + recorded replay, §2.1) |
+| 4 | Hotplug replug restores the same wallpaper | unplug/replug an external display | **NOT RUN — open**, no external display attached. The 20-cycle synthetic test covers the state machine and the session entry |
+
+**Open items from this run:** #1–#4 above. None of them changes a line of code — each needs a session someone is watching, or a second display. The maintainer can sign them by running `owectl set …` twice by hand (#1) and `./scripts/e2e-hyprland.sh` for the static path.
 
 ---
 
@@ -338,8 +382,8 @@ A feature appearing in a release without its gate row green is a process violati
 | Phase | Date | Commit | Result | Notes / ADRs |
 |---|---|---|---|---|
 | P0 | 2026-09-19 | `8a0e360` | **PASS, one item open** | All tasks + 4/5 gate items proven on real hardware (§0.1), including the 92.64 % coverage floor. Open: "CI green" — it can only be observed after the first push (ADR-016's hosting caveat). See §0.2 for the deviations and honest notes. |
-| P1 | — | — | not started | |
-| P2 | — | — | not started | |
+| P1 | 2026-09-19 | `cb6bc8d` (+ CI follow-ups to `0fea5dc`) | **PASS, two items open** | Static wallpapers on Hyprland, verified end to end: the daemon, the GUI and `owectl` all apply, restore and clear; 92.64 % coverage held. Open: checklist #3 (click-through — no synthetic pointer installed) and #8 (no second display attached, which is why P2 owns hotplug). See §1.2 for the deviations and honest notes; the P1 debt items were closed in P2 (§2.2.1, §2.2.9). |
+| P2 | 2026-09-20 | this commit | **PASS, four hardware items open** | Library + thumbnails + transition engine + multi-monitor resolution + supervisor + GUI v1, all proven headless: 371 workspace tests and 16 GUI tests green, 21 transition goldens matched, the 500-file scan gate at 11.28 ms against a 2 s budget, and 20 hotplug cycles leaking 0 B. Two real bugs were found by the new gate tests and fixed (§2.2.1) — a restarted daemon forgot wallpapers, and a lazily-started engine could swallow an unplug. Open: §2.3 #1–#4, all needing a watched session or a second display. See §2.2 for the deviations and honest notes. |
 | P3 | — | — | not started | |
 | P4 | — | — | not started | |
 | P5 | — | — | not started | |

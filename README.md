@@ -8,13 +8,16 @@ A low-resource live-wallpaper engine and manager for Wayland Linux, targeting **
 - **`owe`** — Tauri v2 + React desktop app (library, per-monitor assignment, settings).
 - **`owectl`** — thin CLI for scripts and keybinds.
 
-> **Status: pre-alpha — Phase 0 complete (foundations).** The workspace, IPC, config model, CI
-> harness, and GUI shell exist and are tested; the daemon does not render wallpapers yet.
-> Nothing here is usable as a wallpaper engine today. Performance targets in the docs are
-> marked `UNVERIFIED` until the Phase 6 benchmark publishes measurements.
+> **Status: alpha — Phases 0–2 complete (v0.2).** Static images render on Hyprland
+> layer-shell background surfaces, with GPU transitions on change, an indexed wallpaper
+> library with cached thumbnails, hotplug handling, and session restore; the GUI is a
+> library-grid-and-assignment window. **Animated images, video, shader wallpapers, and the
+> resource governor are not implemented** (Phases 4–6) — the daemon reports them as
+> `not in this build` instead of pretending. Performance targets stay `UNVERIFIED` until the
+> Phase 6 benchmark publishes measurements.
 >
-> Phase 0's evidence table (commands + observed results) is in
-> [`docs/IMPLEMENTATION-PLAN.md` §0.1](./docs/IMPLEMENTATION-PLAN.md).
+> Evidence tables (commands + observed results) are in
+> [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) §0.1, §1.1, and §2.1.
 
 ## Documentation
 
@@ -60,10 +63,18 @@ owed &
 
 owectl hello                                  # version, capabilities, what this build cannot do yet
 owectl monitors                               # every output: size, state, current wallpaper
+
+# Index your folders once, then browse them by reference.
+owectl library scan                           # walks `library.paths` from the config
+owectl library scan ~/Pictures/Wallpapers    # or an explicit folder
+owectl library list --filter aurora --page 1
+
+# Apply: a path or a `library:<id>` reference, to one output or all of them.
 owectl set ~/Pictures/wallpapers/one.png      # every output
-owectl set ~/Pictures/wallpapers/two.png -m eDP-1
+owectl set library:12 -m eDP-1                # one output, by its stable library id
+owectl set library:12 --transition wave --duration-ms 450
 owectl get --monitor eDP-1                    # prints the path, or nothing if OWE applied none
-owectl list ~/Pictures/wallpapers             # what the daemon can see in that folder
+owectl library thumb 12                       # materialise (or find) one cached thumbnail
 owectl pause  # / resume: governor override
 owectl clear -m eDP-1
 owectl kill
@@ -71,8 +82,12 @@ owectl kill
 
 `--json` prints the raw reply for scripting. Exit codes: `0` success, `1` the daemon refused
 (with a protocol code such as `CONFIG_INVALID` or `NOT_FOUND`), `2` the daemon could not be
-reached. The GUI (`cd app && pnpm tauri dev`) does the same four things: status, outputs,
-choose a folder, apply — and says when the daemon is not running instead of failing silently.
+reached.
+
+The GUI (`cd app && pnpm tauri dev`) shows the same state as a library grid: thumbnail per
+wallpaper, a transition picker fed from the daemon's own config, per-output assignment
+(“Apply selected” on each output), apply-all, rescan, and search — and says when the daemon
+is not running instead of failing silently.
 
 After `owectl clear` the output has no OWE wallpaper, so a previous wallpaper tool
 (`swaybg`, `swww`, Caelestia) needs to be re-run if you were using one.
@@ -104,8 +119,13 @@ cargo run -p owe-render --example gen-app-icons
 # NFR-PERF-1: 60 s of idle with a wallpaper on screen must stay under 1% of a core.
 ./scripts/idle-cpu.sh 60
 
-# The GUI's daemon-facing layer, tested against a stub daemon (no compositor needed)
+# The GUI's daemon-facing layer: a stub daemon, plus a replay of recorded real
+# daemon traffic (no compositor, no running daemon needed)
 cd app/src-tauri && cargo test
+
+# Re-record that fixture against the real daemon binary. Writes a reviewable diff
+# into app/src-tauri/tests/fixtures/ — commit it when the wire shape changes.
+./scripts/record-gui-fixtures.sh
 ```
 
 ## License

@@ -67,6 +67,14 @@ enum Command {
         /// Transition id (see the config's `render.allow_transitions`).
         #[arg(long)]
         transition: Option<String>,
+
+        /// Transition duration in milliseconds (with `--transition`).
+        #[arg(long, default_value_t = 300)]
+        duration_ms: u64,
+
+        /// Transition frame rate (with `--transition`).
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
     },
 
     /// Ask the governor to stop drawing (manual override).
@@ -87,17 +95,51 @@ enum Command {
         monitor: Option<String>,
     },
 
-    /// List image files in a directory.
-    ///
-    /// P1 scans one level; the indexed library with thumbnails is P2.
-    List {
-        /// Directory to scan.
-        #[arg(default_value = "~/Pictures")]
-        dir: String,
-    },
+    /// Browse and rescan the indexed wallpaper library.
+    #[command(subcommand)]
+    Library(LibraryCommand),
 
     /// Ask the daemon to shut down.
     Kill,
+}
+
+/// `owectl library …`: the indexed library (FR-LIB-1/2).
+#[derive(Debug, Subcommand)]
+enum LibraryCommand {
+    /// Rescan the configured folders (or an explicit list of folders).
+    Scan {
+        /// Folders to scan; omit to use `library.paths` from the config.
+        paths: Vec<String>,
+    },
+
+    /// List indexed wallpapers, paged and filtered.
+    List {
+        /// Substring matched against the name and path.
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Restrict to a directory.
+        #[arg(long)]
+        dir: Option<String>,
+
+        /// Restrict to a content kind id (`static-image`, …).
+        #[arg(long)]
+        kind: Option<String>,
+
+        /// 1-based page number.
+        #[arg(long, default_value_t = 1)]
+        page: u32,
+
+        /// Rows per page.
+        #[arg(long, default_value_t = 50)]
+        per_page: u32,
+    },
+
+    /// Generate (or find) the cached thumbnail for one item.
+    Thumb {
+        /// Library id, as printed by `owectl library list`.
+        id: i64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -242,6 +284,28 @@ fn render(command: &Command, value: &Value) -> String {
                     ));
                 }
             }
+            // Which transition ran, and over how many frames, is the difference
+            // between "it faded" and "it snapped" — so it is printed, not implied.
+            if let Some(transitions) = value["transitions"].as_array() {
+                for entry in transitions {
+                    lines.push(format!(
+                        "  {}: transition {}",
+                        entry[0].as_str().unwrap_or("?"),
+                        entry[1].as_str().unwrap_or("?")
+                    ));
+                }
+            }
+            if let Some(frames) = value["frames"].as_array() {
+                for entry in frames {
+                    let count = entry[1].as_u64().unwrap_or(0);
+                    if count > 1 {
+                        lines.push(format!(
+                            "  {}: {count} frames rendered",
+                            entry[0].as_str().unwrap_or("?")
+                        ));
+                    }
+                }
+            }
             append_notes(&mut lines, value);
             lines.join("\n")
         }
@@ -265,27 +329,72 @@ fn render(command: &Command, value: &Value) -> String {
             }
         }
         Command::Kill => "daemon is shutting down".to_string(),
-        Command::List { .. } => {
-            let entries = value["entries"].as_array().cloned().unwrap_or_default();
+        Command::Library(command) => render_library(command, value),
+    }
+}
+
+/// Human-readable rendering of a `library.*` reply.
+fn render_library(command: &LibraryCommand, value: &Value) -> String {
+    match command {
+        LibraryCommand::Scan { .. } => {
             let mut lines = vec![format!(
-                "{} ({} entries)",
-                value["dir"].as_str().unwrap_or("?"),
-                entries.len()
+                "scanned {} ({})",
+                join_strings(&value["roots"].as_array().cloned().unwrap_or_default()),
+                value["summary"].as_str().unwrap_or("?")
             )];
-            for entry in entries {
+            // Missing roots are the reason a library looks empty; say so loudly
+            // rather than reporting a successful scan of nothing.
+            for root in value["missing_roots"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
                 lines.push(format!(
-                    "  {}  {}x{}  {}",
-                    entry["name"].as_str().unwrap_or("?"),
-                    entry["width"].as_u64().unwrap_or(0),
-                    entry["height"].as_u64().unwrap_or(0),
-                    entry["path"].as_str().unwrap_or("")
+                    "warning: `{}` does not exist (nothing indexed from it)",
+                    root.as_str().unwrap_or("?")
                 ));
             }
-            if let Some(scope) = value["scope"].as_str() {
-                lines.push(format!("  scope: {scope}"));
+            lines.push(format!(
+                "  rows touched: {} (files seen: {})",
+                value["rows_touched"].as_u64().unwrap_or(0),
+                value["files_seen"].as_u64().unwrap_or(0)
+            ));
+            lines.join("\n")
+        }
+        LibraryCommand::List { .. } => {
+            let items = value["items"].as_array().cloned().unwrap_or_default();
+            let mut lines = vec![format!(
+                "{} items (page {} of {}, {} total)",
+                items.len(),
+                value["page"].as_u64().unwrap_or(1),
+                value["pages"].as_u64().unwrap_or(0),
+                value["total"].as_u64().unwrap_or(0)
+            )];
+            for item in items {
+                lines.push(format!(
+                    "  {}  {}  {}  {}",
+                    item["id"].as_i64().unwrap_or(0),
+                    item["kind"].as_str().unwrap_or("?"),
+                    item["name"].as_str().unwrap_or("?"),
+                    match item["thumb"].as_str() {
+                        Some(path) => format!("thumb: {path}"),
+                        None => "thumb: (not generated)".to_string(),
+                    }
+                ));
             }
             lines.join("\n")
         }
+        LibraryCommand::Thumb { id } => format!(
+            "thumbnail for {} ({}, {} px): {}",
+            id,
+            if value["cached"] == json!(true) {
+                "already cached"
+            } else {
+                "generated"
+            },
+            value["size"].as_u64().unwrap_or(0),
+            value["path"].as_str().unwrap_or("?")
+        ),
     }
 }
 
@@ -343,11 +452,11 @@ fn render_outputs(command: &Command, value: &Value) -> String {
             output["wallpaper"].as_str().unwrap_or("none")
         ));
         // A reference the session file remembers but this run has not applied is
-        // shown as what it is. Printing it as the wallpaper would claim something
-        // is on screen when it is not (restore lands in P2).
+        // shown as what it is. Restore (P2) normally closes this gap at startup, so
+        // seeing it means the restore itself failed — which is worth saying.
         if let Some(recorded) = output["recorded"].as_str() {
             lines.push(format!(
-                "    recorded: {recorded} (not applied this run; restore lands in P2)"
+                "    recorded: {recorded} (not on screen; the startup restore did not apply it)"
             ));
         }
         if let Some(error) = output["error"].as_str() {
@@ -398,10 +507,18 @@ fn dispatch(client: &mut Client, command: &Command) -> Result<Value, Failure> {
             target,
             monitor,
             transition,
+            duration_ms,
+            fps,
         } => client
             .call(
                 method::WALLPAPER_SET,
-                set_params(target, monitor.as_deref(), transition.as_deref()),
+                set_params(
+                    target,
+                    monitor.as_deref(),
+                    transition.as_deref(),
+                    *duration_ms,
+                    *fps,
+                ),
             )
             .map_err(map_client_error),
         Command::Pause { monitor } => client
@@ -422,23 +539,72 @@ fn dispatch(client: &mut Client, command: &Command) -> Result<Value, Failure> {
                 json!({ "output": monitor.clone().unwrap_or_else(|| "all".into()) }),
             )
             .map_err(map_client_error),
-        Command::List { dir } => client
-            .call(method::LIBRARY_LIST, json!({ "dir": dir }))
-            .map_err(map_client_error),
+        Command::Library(command) => dispatch_library(client, command),
         Command::Kill => client
             .call(method::DAEMON_KILL, json!({}))
             .map_err(map_client_error),
     }
 }
 
-/// Parameters for `wallpaper.set` (protocol v1).
-fn set_params(target: &str, monitor: Option<&str>, transition: Option<&str>) -> Value {
+fn dispatch_library(client: &mut Client, command: &LibraryCommand) -> Result<Value, Failure> {
+    match command {
+        LibraryCommand::Scan { paths } => {
+            let params = if paths.is_empty() {
+                json!({})
+            } else {
+                json!({ "paths": paths })
+            };
+            client
+                .call(method::LIBRARY_SCAN, params)
+                .map_err(map_client_error)
+        }
+        LibraryCommand::List {
+            filter,
+            dir,
+            kind,
+            page,
+            per_page,
+        } => {
+            let mut params = json!({ "page": page, "per_page": per_page });
+            if let Some(filter) = filter {
+                params["filter"] = json!(filter);
+            }
+            if let Some(dir) = dir {
+                params["dir"] = json!(dir);
+            }
+            if let Some(kind) = kind {
+                params["kind"] = json!(kind);
+            }
+            client
+                .call(method::LIBRARY_LIST, params)
+                .map_err(map_client_error)
+        }
+        LibraryCommand::Thumb { id } => client
+            .call(method::LIBRARY_THUMB, json!({ "id": id }))
+            .map_err(map_client_error),
+    }
+}
+
+/// Parameters for `wallpaper.set` (protocol v1.1).
+fn set_params(
+    target: &str,
+    monitor: Option<&str>,
+    transition: Option<&str>,
+    duration_ms: u64,
+    fps: u32,
+) -> Value {
     let mut params = json!({
         "output": monitor.unwrap_or("all"),
         "source": target,
     });
     if let Some(transition) = transition {
-        params["transition"] = json!({ "name": transition });
+        // Always the table form: it carries the timing the user asked for, and the
+        // daemon accepts a bare name only as a convenience.
+        params["transition"] = json!({
+            "name": transition,
+            "duration_ms": duration_ms,
+            "fps": fps,
+        });
     }
     params
 }
@@ -463,18 +629,20 @@ mod tests {
 
     #[test]
     fn set_params_default_to_all_outputs() {
-        let params = set_params("/data/wall.png", None, None);
+        let params = set_params("/data/wall.png", None, None, 300, 60);
         assert_eq!(params["output"], json!("all"));
         assert_eq!(params["source"], json!("/data/wall.png"));
         assert!(params.get("transition").is_none());
     }
 
     #[test]
-    fn set_params_carry_monitor_and_transition() {
-        let params = set_params("shader:aurora", Some("DP-1"), Some("slide"));
+    fn set_params_carry_monitor_and_transition_timing() {
+        let params = set_params("shader:aurora", Some("DP-1"), Some("slide"), 450, 30);
         assert_eq!(params["output"], json!("DP-1"));
         assert_eq!(params["source"], json!("shader:aurora"));
         assert_eq!(params["transition"]["name"], json!("slide"));
+        assert_eq!(params["transition"]["duration_ms"], json!(450));
+        assert_eq!(params["transition"]["fps"], json!(30));
     }
 
     #[test]
@@ -516,6 +684,9 @@ mod tests {
             method::WALLPAPER_SET,
             method::GOVERNOR_OVERRIDE,
             method::DAEMON_KILL,
+            method::LIBRARY_SCAN,
+            method::LIBRARY_LIST,
+            method::LIBRARY_THUMB,
         ] {
             assert!(protocol::method::ALL.contains(&named), "{named}");
         }
