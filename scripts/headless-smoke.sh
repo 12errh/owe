@@ -178,12 +178,22 @@ echo "[smoke] starting owed"
 "$owe" --config "$root/docs/examples/config.toml" >"$work/owed.log" 2>&1 &
 daemon_pid=$!
 
+# Starting `owed` is not instant on a machine with no GPU: Vulkan is probed,
+# found wanting (Zink cannot create an instance), and the compositor falls back
+# to a software path. That took over 10 s on a loaded runner once and failed this
+# check, so the budget is a startup-sanity number, not a latency gate — NFR-PERF-1
+# is measured by scripts/idle-cpu.sh, not here.
 socket="$XDG_RUNTIME_DIR/owe/socket"
-for _ in $(seq 1 100); do
+waited=0
+for _ in $(seq 1 600); do
   [ -S "$socket" ] && break
   sleep 0.1
+  waited=$((waited + 1))
 done
-[ -S "$socket" ] || fail "owed never listened on $socket"
+if [ ! -S "$socket" ]; then
+  fail "owed never listened on $socket after $((waited / 10)) s"
+fi
+echo "[smoke] owed is listening after $((waited / 10)) s"
 
 mode="$(stat -c '%a' "$socket")"
 [ "$mode" = "600" ] || fail "socket mode is $mode, expected 600"
