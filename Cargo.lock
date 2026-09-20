@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "owe-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "owe-ipc"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "owe-media"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "owe-core",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "owe-render"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -1343,8 +1343,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "owe-shell-caelestia"
+version = "0.3.0"
+dependencies = [
+ "owe-core",
+ "owe-shell-hyprland",
+ "tempfile",
+]
+
+[[package]]
 name = "owe-shell-generic"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "owe-core",
  "smithay-client-toolkit",
@@ -1355,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "owe-shell-hyprland"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "owe-core",
  "serde",
@@ -1365,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "owectl"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "owe-core",
@@ -1375,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "owed"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "image",
@@ -1383,6 +1392,7 @@ dependencies = [
  "owe-ipc",
  "owe-media",
  "owe-render",
+ "owe-shell-caelestia",
  "owe-shell-generic",
  "owe-shell-hyprland",
  "serde",

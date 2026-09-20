@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Generic Wayland shell backend: output enumeration with no compositor-specific code"
 
 [dependencies]
-owe-core = { path = "../owe-core" }
+owe-core = { workspace = true }
 smithay-client-toolkit = { version = "0.19", default-features = false }
 thiserror = "2"
 tracing = "0.1"

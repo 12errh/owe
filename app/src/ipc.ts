@@ -35,6 +35,51 @@ export interface IpcFailure {
   message: string;
 }
 
+/** One registered shell backend and what it says about this session. */
+export interface ShellBackendRow {
+  id: string;
+  /** `strong`, `weak` or `none`. */
+  confidence: string;
+  /** Why, in the backend's own words — the whole point of the card. */
+  reason: string;
+  selected: boolean;
+  /** `daemon-drawn` or `shell-routed` for this backend under the live config. */
+  mode: string;
+}
+
+/** The shell situation, as the settings/status card shows it. */
+export interface ShellStatus {
+  connected: boolean;
+  backend: string | null;
+  reason: string | null;
+  mode: string;
+  routed: boolean;
+  patched: boolean;
+  detect_order: string[];
+  backends: ShellBackendRow[];
+  /** The daemon's event-bus counters, or null when it publishes none. */
+  events: {
+    listening: boolean;
+    published: number;
+    dropped: number;
+    reconnects: number;
+    subscribers: number;
+  } | null;
+  /** Verbatim notices about wallpaper tools fighting over the same screens. */
+  competing_tools: string[];
+  /** The patch's own note — shown after a change, never invented by the UI. */
+  runtime_note: string | null;
+  error: string | null;
+}
+
+/** The `config.patch` shell subtree; unset keys are left alone by the daemon. */
+export interface ShellPatch {
+  backend?: string;
+  caelestia_mode?: string;
+  theme_hook?: boolean;
+  detect_order?: string[];
+}
+
 /** One indexed wallpaper, as the grid renders it. */
 export interface LibraryItem {
   id: number;
@@ -144,8 +189,7 @@ function disconnected(error: string, socketPath = ""): DaemonStatus {
   };
 }
 
-/**
- * Ask the daemon for its status (a real `hello` handshake over the IPC socket).
+/** Ask the daemon for its status (a real `hello` handshake over the IPC socket).
  * Never throws: an unreachable daemon is a normal, displayable state.
  */
 export async function daemonStatus(): Promise<DaemonStatus> {
@@ -154,6 +198,37 @@ export async function daemonStatus(): Promise<DaemonStatus> {
   } catch (error) {
     return disconnected(String(error));
   }
+}
+
+/**
+ * Ask the daemon which shell backend is live and why (`shell.status`).
+ * Never throws, for the same reason `daemonStatus` does not: "cannot reach the
+ * daemon" is a state the card displays, not an error dialog.
+ */
+export async function shellStatus(): Promise<ShellStatus> {
+  try {
+    return await invoke<ShellStatus>("shell_status");
+  } catch (error) {
+    return {
+      connected: false,
+      backend: null,
+      reason: null,
+      mode: "daemon-drawn",
+      routed: false,
+      patched: false,
+      detect_order: [],
+      backends: [],
+      events: null,
+      competing_tools: [],
+      runtime_note: null,
+      error: String(error),
+    };
+  }
+}
+
+/** Change the shell backend, draw mode or theme hook at runtime. */
+export function patchShell(patch: ShellPatch): Promise<ShellStatus> {
+  return invoke<ShellStatus>("patch_shell", { patch });
 }
 
 /** Normalise anything thrown by `invoke` into an `IpcFailure`. */

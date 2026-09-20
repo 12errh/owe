@@ -280,18 +280,32 @@ impl LibraryService {
 
 /// The engine asks the library for `library:<id>` paths through this trait, so
 /// `owed`'s engine module never learns that SQLite exists.
-impl crate::engine::LibraryResolver for LibraryService {
-    fn resolve(&self, id: &str) -> Result<PathBuf, String> {
+impl LibraryService {
+    /// The indexed row for `library:<id>`, with the wording shared by `resolve`
+    /// and `kind_of` so both answers can never drift apart.
+    fn library_item(&self, id: &str) -> Result<Item, String> {
         let id: i64 = id.trim().parse().map_err(|_| {
             format!("`{id}` is not a library id (expected the number from `library.list`)")
         })?;
         match self.get(id) {
-            Ok(Some(item)) => Ok(item.path),
+            Ok(Some(item)) => Ok(item),
             Ok(None) => Err(format!(
                 "library item {id} is not in the index (it may have been removed by a rescan)"
             )),
             Err(error) => Err(error.to_string()),
         }
+    }
+}
+
+/// The engine asks the library for `library:<id>` paths and kinds through this
+/// trait, so `owed`'s engine module never learns that SQLite exists.
+impl crate::engine::LibraryResolver for LibraryService {
+    fn resolve(&self, id: &str) -> Result<PathBuf, String> {
+        self.library_item(id).map(|item| item.path)
+    }
+
+    fn kind_of(&self, id: &str) -> Result<ContentKind, String> {
+        self.library_item(id).map(|item| item.kind)
     }
 }
 

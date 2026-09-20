@@ -1,0 +1,26 @@
+[package]
+name = "owe-shell-caelestia"
+description = "OWE shell backend for Caelestia: detection and shell-routed wallpaper changes via the pinned caelestia CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+owe-core = { workspace = true }
+# Caelestia is a Hyprland shell, so its outputs are Hyprland's. Reusing the
+# recorder and the JSON parser keeps one `hyprctl monitors -j` parser in the
+# tree instead of two that can drift apart.
+owe-shell-hyprland = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

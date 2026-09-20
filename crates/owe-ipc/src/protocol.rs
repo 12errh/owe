@@ -85,6 +85,13 @@ pub mod method {
     pub const STATS_GET: &str = "stats.get";
     /// Read the effective configuration.
     pub const CONFIG_GET: &str = "config.get";
+    /// Report the shell backend situation: which backend is selected, why, what
+    /// each registered backend detects, and whether the event bus is live.
+    ///
+    /// A method of its own rather than fields bolted onto `capabilities` because
+    /// the answers change while the daemon runs (a shell starts, a socket appears),
+    /// and `capabilities` is the "what is this build" handshake.
+    pub const SHELL_STATUS: &str = "shell.status";
     /// Hot-apply a configuration change.
     pub const CONFIG_PATCH: &str = "config.patch";
     /// Shut the daemon down gracefully.
@@ -105,6 +112,7 @@ pub mod method {
         STATS_GET,
         CONFIG_GET,
         CONFIG_PATCH,
+        SHELL_STATUS,
         DAEMON_KILL,
     ];
 }

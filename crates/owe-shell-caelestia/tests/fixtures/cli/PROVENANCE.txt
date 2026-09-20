@@ -1,0 +1,8 @@
+# Recorded by scripts/record-caelestia-cli.sh
+# Host: Linux 7.0.0-31-generic x86_64
+# Binary: /home/rehan/.local/bin/caelestia
+# Date: 2026-09-20T08:12:42Z
+#
+# These files are verbatim output. They are the source of truth for the
+# command shapes in owe-shell-caelestia: if the tool changes, re-record and
+# the diff shows exactly what moved.

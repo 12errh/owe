@@ -1,0 +1,60 @@
+target drawers
+  function list(): string
+  function isOpen(drawer: string): string
+  function toggle(drawer: string): void
+target nexus
+  function open(): void
+target picker
+  function openFreeze(): void
+  function open(): void
+  function openFreezeClip(): void
+  function openClip(): void
+target idleInhibitor
+  function enable(): void
+  function disable(): void
+  function isEnabled(): bool
+  function toggle(): void
+target audio
+  function cycleOutput(): void
+target brightness
+  function get(): real
+  function setFor(query: string, value: string): string
+  function set(value: string): string
+  function getFor(query: string): real
+target hypr
+  function listSpecialWorkspaces(): string
+  function refreshDevices(): void
+  function cycleSpecialWorkspace(direction: string): void
+target mpris
+  function stop(): void
+  function list(): string
+  function pause(): void
+  function next(): void
+  function playPause(): void
+  function play(): void
+  function getActive(prop: string): string
+  function previous(): void
+target toaster
+  function error(title: string, message: string, icon: string): void
+  function info(title: string, message: string, icon: string): void
+  function success(title: string, message: string, icon: string): void
+  function warn(title: string, message: string, icon: string): void
+target wallpaper
+  function list(): string
+  function get(): string
+  function set(path: string): void
+target gameMode
+  function enable(): void
+  function disable(): void
+  function isEnabled(): bool
+  function toggle(): void
+target lock
+  function unlock(): void
+  function isLocked(): bool
+  function lock(): void
+target notifs
+  function toggleDnd(): void
+  function clear(): void
+  function disableDnd(): void
+  function isDndEnabled(): bool
+  function enableDnd(): void

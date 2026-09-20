@@ -168,11 +168,23 @@ impl XdgPaths {
             .filter(|value| !value.is_empty())
             .map(|value| PathBuf::from(value).join("owe"));
 
+        // `OWE_STATE_DIR` overrides only OWE's own state dir. Redirecting
+        // `XDG_STATE_HOME` instead looks like the obvious sandbox trick, but the
+        // shell backends spawn children (`caelestia wallpaper …`) that inherit
+        // the environment — and the Caelestia CLI derives its own state dir
+        // from the very same variable, so a redirected daemon quietly writes a
+        // shadow state tree the running shell never reads. A whole-sale env
+        // redirect must never be needed to isolate OWE.
+        let state = lookup("OWE_STATE_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| base("XDG_STATE_HOME", ".local/state").join("owe"));
+
         Ok(Self {
             config_file: base("XDG_CONFIG_HOME", ".config")
                 .join("owe")
                 .join("config.toml"),
-            state_dir: base("XDG_STATE_HOME", ".local/state").join("owe"),
+            state_dir: state,
             cache_dir: base("XDG_CACHE_HOME", ".cache").join("owe"),
             data_dir: base("XDG_DATA_HOME", ".local/share").join("owe"),
             runtime_dir: runtime,
@@ -235,6 +247,33 @@ mod tests {
         assert_eq!(
             paths.socket_path().unwrap(),
             PathBuf::from("/tmp/run/owe/socket")
+        );
+    }
+
+    /// The Caelestia backend spawns `caelestia` children that derive *their*
+    /// state dir from `XDG_STATE_HOME`; a daemon that isolated itself by
+    /// redirecting that variable would leave the shell writing a shadow state
+    /// tree. Isolating OWE therefore gets its own variable, so the session
+    /// environment is never something OWE has to bend.
+    #[test]
+    fn owe_state_dir_overrides_only_owes_own_state() {
+        let paths = XdgPaths::resolve_with(env(&[
+            ("HOME", "/home/owe"),
+            ("OWE_STATE_DIR", "/tmp/owe-only-state"),
+            ("XDG_STATE_HOME", "/tmp/real-session-state"),
+        ]))
+        .unwrap();
+        assert_eq!(paths.state_dir, PathBuf::from("/tmp/owe-only-state"));
+
+        // Without the override the XDG default applies, unchanged.
+        let paths = XdgPaths::resolve_with(env(&[
+            ("HOME", "/home/owe"),
+            ("XDG_STATE_HOME", "/tmp/real-session-state"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            paths.state_dir,
+            PathBuf::from("/tmp/real-session-state/owe")
         );
     }
 

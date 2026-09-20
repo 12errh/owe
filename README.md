@@ -8,16 +8,20 @@ A low-resource live-wallpaper engine and manager for Wayland Linux, targeting **
 - **`owe`** — Tauri v2 + React desktop app (library, per-monitor assignment, settings).
 - **`owectl`** — thin CLI for scripts and keybinds.
 
-> **Status: alpha — Phases 0–2 complete (v0.2).** Static images render on Hyprland
+> **Status: alpha — Phases 0–3 complete (v0.3).** Static images render on Hyprland
 > layer-shell background surfaces, with GPU transitions on change, an indexed wallpaper
 > library with cached thumbnails, hotplug handling, and session restore; the GUI is a
-> library-grid-and-assignment window. **Animated images, video, shader wallpapers, and the
-> resource governor are not implemented** (Phases 4–6) — the daemon reports them as
-> `not in this build` instead of pretending. Performance targets stay `UNVERIFIED` until the
-> Phase 6 benchmark publishes measurements.
+> library-grid-and-assignment window. **Caelestia Shell is a first-class target**: the
+> daemon auto-detects it, routes wallpaper changes through the shell in `shell-routed`
+> mode (the shell keeps its theming pipeline; OWE runs none — no double-theme), streams
+> Hyprland socket2 events into a typed event bus, and warns about `hyprpaper`/`swww`
+> coexistence. **Animated images, video, shader wallpapers, and the resource governor are
+> not implemented** (Phases 4–6) — the daemon reports them as `not in this build` instead
+> of pretending. Performance targets stay `UNVERIFIED` until the Phase 6 benchmark
+> publishes measurements.
 >
 > Evidence tables (commands + observed results) are in
-> [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) §0.1, §1.1, and §2.1.
+> [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) §0.1, §1.1, §2.1, and §3.1.
 
 ## Documentation
 
@@ -33,6 +37,7 @@ crates/owe-ipc     IPC protocol v1: framing, server, client
 crates/owe-render  wgpu rendering helpers (headless golden-image tooling)
 crates/owed        the daemon binary
 crates/owectl      control CLI
+crates/owe-shell-* shell backends: hyprland, caelestia, generic-layer-shell
 app/               Tauri v2 + React GUI
 docs/              the doc set (start at docs/README.md)
 reference/         pinned clones of studied repos (gitignored, never built — see docs/REFERENCE-CODE-MAP.md)

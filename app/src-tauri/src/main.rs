@@ -413,6 +413,79 @@ fn clear_wallpaper_on(socket: &Path, output: Option<&str>) -> Result<Vec<String>
     Ok(string_list(&reply, "cleared"))
 }
 
+/// `shell.status` → what the backend card shows.
+///
+/// A failure is not an error dialog: "cannot reach the daemon" is a state the card
+/// displays, the same way the status bar does.
+fn shell_status_from(socket: &Path) -> ShellStatus {
+    let reply = match with_daemon(socket, |client| {
+        client.call(owe_ipc::protocol::method::SHELL_STATUS, serde_json::json!({}))
+    }) {
+        Ok(reply) => reply,
+        Err(error) => return ShellStatus::unreachable(error.message),
+    };
+
+    let shell = &reply["shell"];
+    let backends = shell["backends"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| BackendRow {
+                    id: field_str(row, "id"),
+                    confidence: field_str(row, "confidence"),
+                    reason: field_str(row, "reason"),
+                    selected: row["selected"].as_bool().unwrap_or(false),
+                    mode: field_str(row, "mode"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    ShellStatus {
+        connected: true,
+        backend: shell["backend"].as_str().map(str::to_string),
+        reason: shell["reason"].as_str().map(str::to_string),
+        mode: shell["mode"].as_str().unwrap_or("daemon-drawn").to_string(),
+        routed: shell["routed"].as_bool().unwrap_or(false),
+        patched: shell["patched"].as_bool().unwrap_or(false),
+        detect_order: string_list(shell, "detect_order"),
+        backends,
+        events: reply.get("events").filter(|value| !value.is_null()).cloned(),
+        competing_tools: reply["competing_tools"]["notices"]
+            .as_array()
+            .map(|notes| {
+                notes
+                    .iter()
+                    .filter_map(|note| note.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        runtime_note: None,
+        error: None,
+    }
+}
+
+/// `config.patch` → the new shell situation.
+///
+/// The daemon validates, applies and re-selects; this only shapes the request and
+/// reads the answer, so there is exactly one implementation of "what a patch means".
+fn patch_shell_from(socket: &Path, patch: &ShellPatch) -> Result<ShellStatus, IpcError> {
+    let body = serde_json::to_value(patch)
+        .map_err(|error| IpcError::unreachable(format!("cannot encode the patch: {error}")))?;
+    let reply = with_daemon(socket, |client| {
+        client.call(
+            owe_ipc::protocol::method::CONFIG_PATCH,
+            serde_json::json!({ "patch": body }),
+        )
+    })?;
+
+    // The reply carries the patch's own note, and the status call right after it
+    // carries the new state — so the card never has to guess what changed.
+    let mut status = shell_status_from(socket);
+    status.runtime_note = reply["note"].as_str().map(str::to_string);
+    Ok(status)
+}
+
 /// A JSON string field, or an empty string when the daemon omitted it.
 ///
 /// "Missing" and "empty" are the same thing to a label in the UI, and inventing a
@@ -432,6 +505,63 @@ fn string_list(value: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// One registered shell backend and what it says about this session (`shell.status`).
+#[derive(Debug, Clone, Serialize)]
+struct BackendRow {
+    id: String,
+    /// `strong`, `weak` or `none`.
+    confidence: String,
+    /// Why, in the backend's own words — the whole point of the card.
+    reason: String,
+    selected: bool,
+    /// `daemon-drawn` or `shell-routed` for this backend under the live config.
+    mode: String,
+}
+
+/// The shell situation, as the settings/status card shows it.
+#[derive(Debug, Clone, Serialize)]
+struct ShellStatus {
+    connected: bool,
+    backend: Option<String>,
+    reason: Option<String>,
+    mode: String,
+    /// Whether the shell owns the pixels, which decides whether per-output
+    /// assignment is possible at all in this mode.
+    routed: bool,
+    /// Whether the running config was changed by a patch instead of the file.
+    patched: bool,
+    detect_order: Vec<String>,
+    backends: Vec<BackendRow>,
+    /// Events from the shell's socket (`null` when the bus is not running).
+    events: Option<serde_json::Value>,
+    /// Competing wallpaper tools (hyprpaper/swww), one sentence each.
+    competing_tools: Vec<String>,
+    /// What the daemon said about a just-applied patch (e.g. "the config file is
+    /// unchanged, so a restart restores the file's values").
+    runtime_note: Option<String>,
+    error: Option<String>,
+}
+
+impl ShellStatus {
+    /// The state where the daemon could not be reached.
+    fn unreachable(message: String) -> Self {
+        Self {
+            connected: false,
+            backend: None,
+            reason: None,
+            mode: "daemon-drawn".to_string(),
+            routed: false,
+            patched: false,
+            detect_order: Vec::new(),
+            backends: Vec::new(),
+            events: None,
+            competing_tools: Vec::new(),
+            runtime_note: None,
+            error: Some(message),
+        }
+    }
 }
 
 /// One indexed wallpaper, as the grid renders it.
@@ -502,6 +632,17 @@ struct TransitionRequest {
     name: String,
     duration_ms: u64,
     fps: u32,
+}
+
+/// A runtime `[shell]` patch, as `config.patch` takes it: every field optional, and
+/// the ones the UI does not set stay as they are.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellPatch {
+    backend: Option<String>,
+    caelestia_mode: Option<String>,
+    theme_hook: Option<bool>,
+    detect_order: Option<Vec<String>>,
 }
 
 /// One output as the daemon describes it.
@@ -675,6 +816,20 @@ async fn clear_wallpaper(output: Option<String>) -> Result<Vec<String>, IpcError
     run_blocking(move || clear_wallpaper_on(&socket, output.as_deref())).await
 }
 
+/// Ask the daemon which shell backend it is using, and why.
+#[tauri::command]
+async fn shell_status() -> Result<ShellStatus, IpcError> {
+    let socket = daemon_socket()?;
+    run_blocking(move || Ok(shell_status_from(&socket))).await
+}
+
+/// Change the shell backend, draw mode or theme switch for the running daemon.
+#[tauri::command]
+async fn patch_shell(patch: ShellPatch) -> Result<ShellStatus, IpcError> {
+    let socket = daemon_socket()?;
+    run_blocking(move || patch_shell_from(&socket, &patch)).await
+}
+
 /// Run blocking IPC work off the UI thread.
 ///
 /// Every command goes through here: a slow decode must never freeze the webview,
@@ -718,7 +873,9 @@ fn main() {
             library_thumbnail,
             list_outputs,
             assign_wallpaper,
-            clear_wallpaper
+            clear_wallpaper,
+            shell_status,
+            patch_shell
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the OWE window");

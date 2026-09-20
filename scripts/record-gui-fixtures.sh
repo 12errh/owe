@@ -11,8 +11,12 @@
 #   diff of real traffic instead of a silently updated stub.
 #
 # WHAT IT RECORDS
-#   hello, library.scan, library.list, library.thumb, outputs.list — every method
-#   the GUI v1 screens call.
+#   hello, library.scan, library.list, library.thumb, outputs.list, shell.status,
+#   config.patch — every method the GUI v1 screens call (the shell card included).
+#
+#   The `config.patch` recording uses a no-op-shaped patch (the already-selected
+#   backend); the reply shape is what matters for the replay test, not the state
+#   change, and a real patch's `note` text depends on what changed.
 #
 # THE `$FIXTURE_DIR` PLACEHOLDER
 #   The recorded thumbnail path points into the recorder's temporary directory, so
@@ -95,6 +99,13 @@ echo "recording replies…"
 item_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["items"][0]["id"])' "$tmp/list.json")
 "$owectl" library thumb "$item_id" --json > "$tmp/thumb.json"
 
+# The shell card: the live backend decision, then a patch round-trip. The patch
+# names whatever the status call just selected, so it exercises the reply shape
+# without moving the sandbox's state to a backend this build may not have.
+"$owectl" shell status --json > "$tmp/shell-status.json"
+selected=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["shell"]["backend"] or "auto")' "$tmp/shell-status.json")
+"$owectl" shell patch --backend "$selected" --json > "$tmp/shell-patch.json"
+
 thumb_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$tmp/thumb.json")
 if [ ! -f "$thumb_path" ]; then
   echo "the daemon reported a thumbnail at $thumb_path but wrote nothing there" >&2
@@ -133,6 +144,8 @@ fixture = {
         "library.list": load("list.json"),
         "library.thumb": thumb,
         "outputs.list": load("outputs.json"),
+        "shell.status": load("shell-status.json"),
+        "config.patch": load("shell-patch.json"),
     },
 }
 

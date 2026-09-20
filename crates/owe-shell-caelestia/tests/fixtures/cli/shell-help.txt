@@ -1,0 +1,14 @@
+usage: caelestia shell [-h] [-d] [-r] [-s] [-l] [-k] [--log-rules RULES]
+                       [message ...]
+
+positional arguments:
+  message            a message to send to the shell
+
+options:
+  -h, --help         show this help message and exit
+  -d, --daemon       start the shell detached
+  -r, --restart      kill and restart the shell
+  -s, --show         print all shell IPC commands
+  -l, --log          print the shell log
+  -k, --kill         kill the shell
+  --log-rules RULES  log rules to apply

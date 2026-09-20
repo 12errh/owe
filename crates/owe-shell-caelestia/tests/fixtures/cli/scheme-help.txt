@@ -1,0 +1,10 @@
+usage: caelestia scheme [-h] {list,get,set} ...
+
+options:
+  -h, --help      show this help message and exit
+
+subcommands:
+  {list,get,set}
+    list          list available schemes
+    get           get scheme properties
+    set           set the current scheme

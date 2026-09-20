@@ -99,6 +99,10 @@ enum Command {
     #[command(subcommand)]
     Library(LibraryCommand),
 
+    /// Shell integration: which backend is live, and how wallpapers are drawn.
+    #[command(subcommand)]
+    Shell(ShellCommand),
+
     /// Ask the daemon to shut down.
     Kill,
 }
@@ -139,6 +143,32 @@ enum LibraryCommand {
     Thumb {
         /// Library id, as printed by `owectl library list`.
         id: i64,
+    },
+}
+
+/// `owectl shell …`: shell-backend inspection and switching (FR-SHELL-3/4).
+#[derive(Debug, Subcommand)]
+enum ShellCommand {
+    /// Which shell backend is live, why it was chosen, and how wallpapers are drawn.
+    Status,
+
+    /// Switch backend, draw mode or theme hook at runtime (`config.patch`).
+    Patch {
+        /// Backend id to select (`auto`, `hyprland`, `caelestia`, `generic`).
+        #[arg(long)]
+        backend: Option<String>,
+
+        /// Draw mode: `daemon-drawn` or `shell-routed`.
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// Enable or disable the shell's own theme switching for OWE wallpapers.
+        #[arg(long)]
+        theme_hook: Option<bool>,
+
+        /// Auto-detection order (backend ids, most preferred first).
+        #[arg(long, value_delimiter = ',')]
+        detect_order: Option<Vec<String>>,
     },
 }
 
@@ -330,6 +360,65 @@ fn render(command: &Command, value: &Value) -> String {
         }
         Command::Kill => "daemon is shutting down".to_string(),
         Command::Library(command) => render_library(command, value),
+        Command::Shell(command) => render_shell(command, value),
+    }
+}
+
+/// Human-readable rendering of a `shell …` reply.
+///
+/// `shell.status` is the answer to "why does my wallpaper look the way it does?",
+/// so every backend gets its own line with its own reason, and the competing-tool
+/// notices are printed verbatim — they are the daemon speaking, not us paraphrasing.
+fn render_shell(command: &ShellCommand, value: &Value) -> String {
+    match command {
+        ShellCommand::Status | ShellCommand::Patch { .. } => {
+            let shell = &value["shell"];
+            let mut lines = Vec::new();
+            if let Some(note) = value["note"].as_str() {
+                lines.push(note.to_string());
+            }
+            let backend = shell["backend"].as_str().unwrap_or("none");
+            let mode = shell["mode"].as_str().unwrap_or("daemon-drawn");
+            let reason = shell["reason"].as_str().unwrap_or("");
+            lines.push(format!(
+                "backend {backend} ({mode}){}",
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {reason}")
+                }
+            ));
+            if let Some(order) = shell["detect_order"].as_array() {
+                let order: Vec<&str> = order.iter().filter_map(|entry| entry.as_str()).collect();
+                if !order.is_empty() {
+                    lines.push(format!("detect order: {}", order.join(" → ")));
+                }
+            }
+            for row in shell["backends"].as_array().cloned().unwrap_or_default() {
+                let selected = if row["selected"].as_bool().unwrap_or(false) {
+                    "*"
+                } else {
+                    " "
+                };
+                lines.push(format!(
+                    " {} {} [{}] {}",
+                    selected,
+                    row["id"].as_str().unwrap_or("?"),
+                    row["confidence"].as_str().unwrap_or("?"),
+                    row["reason"].as_str().unwrap_or("")
+                ));
+            }
+            for notice in value["competing_tools"]["notices"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                if let Some(text) = notice.as_str() {
+                    lines.push(format!("! {text}"));
+                }
+            }
+            lines.join("\n")
+        }
     }
 }
 
@@ -540,9 +629,48 @@ fn dispatch(client: &mut Client, command: &Command) -> Result<Value, Failure> {
             )
             .map_err(map_client_error),
         Command::Library(command) => dispatch_library(client, command),
+        Command::Shell(command) => dispatch_shell(client, command),
         Command::Kill => client
             .call(method::DAEMON_KILL, json!({}))
             .map_err(map_client_error),
+    }
+}
+
+/// Wire a `shell …` command to its method (FR-SHELL-3/4).
+fn dispatch_shell(client: &mut Client, command: &ShellCommand) -> Result<Value, Failure> {
+    match command {
+        ShellCommand::Status => client
+            .call(method::SHELL_STATUS, json!({}))
+            .map_err(map_client_error),
+        ShellCommand::Patch {
+            backend,
+            mode,
+            theme_hook,
+            detect_order,
+        } => {
+            let mut patch = serde_json::Map::new();
+            if let Some(backend) = backend {
+                patch.insert("backend".into(), json!(backend));
+            }
+            if let Some(mode) = mode {
+                patch.insert("caelestia_mode".into(), json!(mode));
+            }
+            if let Some(theme_hook) = theme_hook {
+                patch.insert("theme_hook".into(), json!(theme_hook));
+            }
+            if let Some(order) = detect_order {
+                patch.insert("detect_order".into(), json!(order));
+            }
+            if patch.is_empty() {
+                return Err(Failure::new(
+                    EXIT_CONNECTION_ERROR,
+                    "a patch needs at least one of --backend, --mode, --theme-hook, --detect-order",
+                ));
+            }
+            client
+                .call(method::CONFIG_PATCH, json!({ "patch": patch }))
+                .map_err(map_client_error)
+        }
     }
 }
 

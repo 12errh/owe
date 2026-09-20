@@ -149,8 +149,8 @@ fn fixture_path() -> PathBuf {
 use std::sync::Arc;
 
 use crate::{
-    LibraryQuery, library_index_from, library_scan_from, library_thumb_from, list_outputs_from,
-    probe_socket,
+    LibraryQuery, ShellPatch, library_index_from, library_scan_from, library_thumb_from,
+    list_outputs_from, patch_shell_from, probe_socket, shell_status_from,
 };
 
 /// A fixture hosted on a temporary socket, stopped when this is dropped.
@@ -203,6 +203,8 @@ fn the_recording_covers_every_method_the_gui_v1_screens_call() {
         "library.list",
         "library.thumb",
         "outputs.list",
+        "shell.status",
+        "config.patch",
     ] {
         assert!(
             fixture.covers(method),
@@ -361,6 +363,70 @@ fn a_recorded_session_replays_through_the_command_layer() {
         .find(|(method, _)| method == "library.thumb")
         .expect("library.thumb was asked");
     assert_eq!(thumb.1["id"], serde_json::json!(id));
+}
+
+#[test]
+fn the_shell_card_replays_the_daemons_own_decision() {
+    let fixture = load();
+    let (socket, _dir, _running) = start(Arc::clone(&fixture));
+
+    // Status: the card must show exactly what the daemon decided, including the
+    // backends it did *not* pick and their reasons — that is the whole point of
+    // the card, so the test asserts row-for-row against the recorded reply.
+    let status = shell_status_from(&socket);
+    assert!(status.connected, "the recorded shell.status must parse");
+    let recorded = fixture.reply_for("shell.status").expect("shell.status reply");
+    let shell = &recorded["shell"];
+    assert_eq!(status.backend.as_deref(), shell["backend"].as_str());
+    assert_eq!(status.mode, shell["mode"].as_str().unwrap_or("daemon-drawn"));
+    assert_eq!(status.reason.as_deref(), shell["reason"].as_str());
+    assert_eq!(status.routed, shell["routed"].as_bool().unwrap_or(false));
+    assert_eq!(
+        status.detect_order,
+        shell["detect_order"]
+            .as_array()
+            .map(|items| items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|entry| entry.to_string())
+                .collect::<Vec<String>>())
+            .unwrap_or_default()
+    );
+    let rows = shell["backends"].as_array().expect("recorded backend rows");
+    assert_eq!(status.backends.len(), rows.len());
+    for (row, parsed) in rows.iter().zip(&status.backends) {
+        assert_eq!(parsed.id, row["id"].as_str().unwrap_or_default());
+        assert_eq!(parsed.confidence, row["confidence"].as_str().unwrap_or_default());
+        assert_eq!(parsed.reason, row["reason"].as_str().unwrap_or_default());
+        assert_eq!(parsed.selected, row["selected"].as_bool().unwrap_or(false));
+        assert_eq!(parsed.mode, row["mode"].as_str().unwrap_or_default());
+    }
+
+    // Patch: the daemon's own note travels to the card unchanged, under the
+    // documented request shape.
+    let patch = ShellPatch {
+        backend: Some("caelestia".into()),
+        caelestia_mode: None,
+        theme_hook: None,
+        detect_order: None,
+    };
+    let patched = patch_shell_from(&socket, &patch).expect("patch round-trip");
+    let recorded_patch = fixture.reply_for("config.patch").expect("config.patch reply");
+    assert_eq!(
+        patched.runtime_note.as_deref(),
+        recorded_patch["note"].as_str(),
+        "the card displays the daemon's note, not a UI-invented string"
+    );
+    let patch_request = fixture
+        .asked()
+        .into_iter()
+        .find(|(method, _)| method == "config.patch")
+        .expect("config.patch was asked");
+    assert_eq!(
+        patch_request.1["patch"]["backend"],
+        serde_json::json!("caelestia"),
+        "the patch reaches the daemon under the documented key"
+    );
 }
 
 #[test]

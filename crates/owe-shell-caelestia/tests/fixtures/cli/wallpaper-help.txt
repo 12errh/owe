@@ -1,0 +1,14 @@
+usage: caelestia wallpaper [-h] [-p [PATH]] [-r [DIR]] [-f FILE] [-n]
+                           [-t THRESHOLD] [-N]
+
+options:
+  -h, --help            show this help message and exit
+  -p, --print [PATH]    print the scheme for a wallpaper
+  -r, --random [DIR]    switch to a random wallpaper
+  -f, --file FILE       the path to the wallpaper to switch to
+  -n, --no-filter       do not filter by size
+  -t, --threshold THRESHOLD
+                        the minimum percentage of the largest monitor size the
+                        image must be greater than to be selected
+  -N, --no-smart        do not automatically change the scheme mode based on
+                        wallpaper colour

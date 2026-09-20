@@ -14,7 +14,9 @@
 //! | 3 | startup blocked (e.g. another instance owns the socket) |
 
 mod cli;
+mod coexist;
 mod engine;
+mod events;
 mod handler;
 mod hotplug;
 mod library;
@@ -29,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::Cli;
 use crate::engine::Engine;
+use crate::events::ShellEventBus;
 use crate::handler::{DaemonState, IpcHandler};
 use crate::hotplug::HotplugDriver;
 use crate::library::LibraryService;
@@ -236,6 +239,55 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
         tracing::warn!(%output, %reason, "restore failed");
     }
 
+    // Coexistence (TRD §4): another wallpaper daemon on the same background layer
+    // is the most common "why did nothing happen" in a wallpaper tool, so it is
+    // checked once at startup and reported through `shell.status` as well as the
+    // log. The process scan is a few hundred `/proc` reads, once.
+    let coexistence = coexist::resolve(
+        &coexist::live_table(),
+        &config.shell.hyprland,
+        &coexist::KillCommand,
+    );
+    for notice in &coexistence.notices {
+        tracing::warn!(%notice, "coexistence");
+    }
+    for (pid, reason) in &coexistence.failures {
+        tracing::warn!(pid, %reason, "coexistence: could not stop a competing tool");
+    }
+    tracing::debug!(
+        summary = %coexistence.summary(),
+        quiet = coexistence.is_quiet(),
+        "coexistence scan finished"
+    );
+
+    // The shell event bus (FR-SHELL-2). The listener subscribes to Hyprland's
+    // socket2 and publishes typed events; P6's governor consumes them, and today
+    // the counters are what `shell.status` reports. Started before the IPC server
+    // so a client that connects immediately sees a live pipe.
+    let bus = ShellEventBus::shared();
+    let event_shutdown = Shutdown::new();
+    let event_listener = if config.shell.hyprland.event_socket {
+        // `shell.hyprland.event_socket = false` is a supported answer: a user on a
+        // compositor that is not Hyprland gets the bus built but not connected.
+        let env_lookup = |name: &str| std::env::var(name).ok();
+        match events::socket_for_session(&env_lookup) {
+            Some(path) => {
+                tracing::info!(socket = %path.display(), "subscribing to shell events");
+                Some(bus.spawn_listener(path, event_shutdown.clone()))
+            }
+            None => {
+                tracing::debug!(
+                    reason = %events::socket_hint(&env_lookup),
+                    "no shell event socket; the bus stays empty"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::info!("shell.hyprland.event_socket = false; not subscribing");
+        None
+    };
+
     // Hotplug: the presenter's output events drive re-apply and teardown
     // (FR-LIB-4). The listener blocks on the channel, so it costs nothing until
     // a monitor is actually plugged or unplugged.
@@ -245,13 +297,16 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
 
     // One shutdown signal shared by the IPC handler and the accept loop.
     let shutdown = Shutdown::new();
-    let state = Arc::new(DaemonState::new(
-        config,
-        socket_path.clone(),
-        shutdown.clone(),
-        Arc::clone(&engine),
-        Arc::clone(&library),
-    ));
+    let state = Arc::new(
+        DaemonState::new(
+            config,
+            socket_path.clone(),
+            shutdown.clone(),
+            Arc::clone(&engine),
+            Arc::clone(&library),
+        )
+        .with_shell_events(Arc::clone(&bus), coexistence.clone()),
+    );
     let server = Server::bind_with_shutdown(
         &socket_path,
         Arc::new(IpcHandler::new(Arc::clone(&state))),
@@ -288,9 +343,13 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
     })?;
 
     // Shutdown order: the presenter first (this is what releases the hotplug
-    // listener's blocking recv), then the listener, then the leftovers.
+    // listener's blocking recv), then the listeners, then the leftovers.
     engine.stop_presenter();
     drop(hotplug);
+    event_shutdown.request();
+    if let Some(listener) = event_listener {
+        let _ = listener.join();
+    }
 
     let stats = library.thumbnail_stats();
     tracing::info!(

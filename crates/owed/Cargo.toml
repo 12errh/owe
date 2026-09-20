@@ -16,6 +16,7 @@ owe-core = { workspace = true }
 owe-ipc = { workspace = true }
 owe-media = { workspace = true }
 owe-render = { workspace = true }
+owe-shell-caelestia = { workspace = true }
 owe-shell-generic = { path = "../owe-shell-generic" }
 owe-shell-hyprland = { workspace = true }
 clap = { workspace = true }

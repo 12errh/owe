@@ -21,6 +21,8 @@
 //! these values only for pre-flight decisions. Guessing here would be the fastest
 //! way to ship a wallpaper that is subtly the wrong size on a HiDPI display.
 
+pub mod socket2;
+
 use std::process::Command;
 
 use owe_core::output::OutputInfo;

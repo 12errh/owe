@@ -25,7 +25,9 @@ use owe_ipc::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::engine::{Engine, EngineError};
+use crate::coexist::CoexistenceReport;
+use crate::engine::{Engine, EngineError, ShellPatch};
+use crate::events::ShellEventBus;
 use crate::library::{LibraryService, parse_kind};
 
 /// Protocol methods actually implemented by this build, in advertised order.
@@ -44,6 +46,8 @@ pub const IMPLEMENTED_METHODS: &[&str] = &[
     method::LIBRARY_SCAN,
     method::LIBRARY_LIST,
     method::LIBRARY_THUMB,
+    method::SHELL_STATUS,
+    method::CONFIG_PATCH,
 ];
 
 /// Media decode backends this build actually has.
@@ -56,10 +60,10 @@ const IMPLEMENTED_MEDIA_BACKENDS: &[&str] = &["image"];
 /// deleted (not reworded) and the feature appears in its real list. This is the
 /// maintainer-visible half of the P0 §0.2.4 fix.
 const KNOWN_BUT_NOT_YET: &[(&str, &str)] = &[
-    (
-        "caelestia",
-        "shell backend planned for P3 (P1 renders natively on Hyprland)",
-    ),
+    // `caelestia` was removed from this list in P3, when the backend shipped —
+    // deleted rather than reworded, and it now appears in `shell_backends` (which
+    // is the registry's own answer). The list exists so a client can say "planned"
+    // instead of staying silent, not so it can stay populated.
     (
         "animated-image",
         "content kind planned for P4 (decode + frame pacing)",
@@ -147,6 +151,14 @@ struct ClearParams {
     output: Option<String>,
 }
 
+/// Parameters of `config.patch` (BACKEND-DESIGN §3: `{patch}`).
+#[derive(Debug, Deserialize)]
+struct PatchParams {
+    /// The `[shell]` change to apply.
+    #[serde(default)]
+    patch: ShellPatch,
+}
+
 /// Parameters of `governor.override` (BACKEND-DESIGN §3: `{output, policy}`).
 #[derive(Debug, Deserialize)]
 struct OverrideParams {
@@ -207,6 +219,11 @@ pub struct DaemonState {
     /// engine when an output appears.
     engine: Arc<Engine>,
     library: Arc<LibraryService>,
+    /// The shell event bus (FR-SHELL-2). `None` until [`DaemonState::with_shell_events`]
+    /// runs, which is also what a test that does not care about events gets.
+    shell_events: Option<Arc<ShellEventBus>>,
+    /// What the startup coexistence scan found (TRD §4).
+    coexistence: CoexistenceReport,
 }
 
 #[allow(
@@ -232,7 +249,35 @@ impl DaemonState {
             shutdown,
             engine,
             library,
+            shell_events: None,
+            coexistence: CoexistenceReport::default(),
         }
+    }
+
+    /// Attach the shell event bus and the startup coexistence report.
+    ///
+    /// A builder rather than two more `new` parameters: `shell.status` is the only
+    /// reader, and the tests that do not exercise it should not have to construct
+    /// either.
+    #[must_use]
+    pub fn with_shell_events(
+        mut self,
+        shell_events: Arc<ShellEventBus>,
+        coexistence: CoexistenceReport,
+    ) -> Self {
+        self.shell_events = Some(shell_events);
+        self.coexistence = coexistence;
+        self
+    }
+
+    /// The shell event bus, if one is running.
+    pub fn shell_events(&self) -> Option<&Arc<ShellEventBus>> {
+        self.shell_events.as_ref()
+    }
+
+    /// What the coexistence scan decided at startup.
+    pub fn coexistence(&self) -> &CoexistenceReport {
+        &self.coexistence
     }
 
     /// The library index and thumbnail cache.
@@ -351,6 +396,72 @@ impl IpcHandler {
         }))
     }
 
+    /// `shell.status`: which backend is in use, why, and whether events flow.
+    ///
+    /// Everything here is a live answer rather than a cached one: a shell can be
+    /// started after the daemon, and a status card that showed a stale "not running"
+    /// is worse than no status card. All of it is process-and-env inspection — no
+    /// subprocess — so a UI can call it on every page load.
+    fn shell_status(&self, _request: &RequestFrame) -> Result<Value, ErrorBody> {
+        let status = self.state.engine.shell_status();
+        let events = self.state.shell_events().map(|bus| bus.stats());
+        let coexistence = self.state.coexistence();
+
+        Ok(json!({
+            "shell": status,
+            "events": events,
+            "competing_tools": {
+                "notices": coexistence.notices,
+                "stopped": coexistence.stopped,
+                "failures": coexistence
+                    .failures
+                    .iter()
+                    .map(|(pid, reason)| json!({ "pid": pid, "reason": reason }))
+                    .collect::<Vec<_>>(),
+            },
+        }))
+    }
+
+    /// `config.patch`: hot-apply a `[shell]` change (BACKEND-DESIGN §3).
+    ///
+    /// The patch is validated before it is stored, and the reply says in words that it
+    /// is runtime-only — because a user who switches the backend in the GUI and then
+    /// restarts the daemon deserves to see the old value come back *explained*, not as
+    /// a mystery. Writing the user's config file is deliberately not something a
+    /// `patch` does; that is what editing the file is for.
+    fn config_patch(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
+        let params: PatchParams = request.params_as()?;
+        if params.patch.is_empty() {
+            return Err(ErrorBody::bad_request(
+                "`patch` has no recognised keys; this build patches `shell` only: backend, \
+                 detect_order, caelestia_mode, theme_hook, wallpapers_dir, event_socket, \
+                 hyprpaper",
+            ));
+        }
+
+        let status = self
+            .state
+            .engine
+            .patch_shell(&params.patch)
+            .map_err(|error| engine_error(&error))?;
+
+        tracing::info!(
+            backend = ?status.backend,
+            mode = %status.mode,
+            "shell configuration patched at runtime"
+        );
+
+        Ok(json!({
+            "config": {
+                "shell": status,
+                "patched": true,
+            },
+            "runtime_only": true,
+            "note": "applied to the running daemon; the config file is unchanged, so a \
+                     restart restores the file's values",
+        }))
+    }
+
     fn daemon_kill(&self, _request: &RequestFrame) -> Result<Value, ErrorBody> {
         self.state.request_shutdown();
         tracing::info!("shutdown requested over ipc");
@@ -394,6 +505,8 @@ impl IpcHandler {
         tracing::info!(
             spec = %applied.reference,
             outputs = %applied.outputs.join(", "),
+            routed = applied.routed,
+            theme_runs = applied.theme.total(),
             "wallpaper applied"
         );
 
@@ -734,6 +847,8 @@ impl Handler for IpcHandler {
             // `library.thumb` is the other half of `library.list`: the list says
             // which cells have a cached thumbnail, this materialises the rest.
             method::LIBRARY_THUMB => self.library_thumb(request),
+            method::SHELL_STATUS => self.shell_status(request),
+            method::CONFIG_PATCH => self.config_patch(request),
             other => Err(ErrorBody::unsupported(format!(
                 "`{other}` is not implemented in this build yet; see docs/IMPLEMENTATION-PLAN.md \
                  for the phase that lands it"
@@ -741,14 +856,6 @@ impl Handler for IpcHandler {
         }
     }
 }
-
-/// Backends this build knows by name but does not implement yet. Used by the
-/// capability tests to prove we never advertise them.
-///
-/// `generic-layer-shell` was on this list through P0 and left it in P1, when the
-/// backend became real — the list shrinking is the evidence that a phase landed.
-#[cfg(test)]
-const NOT_YET_IMPLEMENTED_BACKENDS: &[&str] = &["caelestia"];
 
 #[cfg(test)]
 mod tests {
@@ -850,10 +957,11 @@ mod tests {
                 "`{advertised}` is advertised but not implemented"
             );
         }
+        // `config.patch` left this list in P3, when it started validating and
+        // hot-applying the `[shell]` subtree.
         for unimplemented in [
             method::PLAYBACK_CMD,
             method::STATS_GET,
-            method::CONFIG_PATCH,
             method::GOVERNOR_POLICY,
         ] {
             assert!(
@@ -864,20 +972,152 @@ mod tests {
     }
 
     #[test]
+    fn shell_status_reports_every_backend_and_why_one_was_chosen() {
+        let handler = handler();
+        let value = handler
+            .handle(&RequestFrame::new("c1", method::SHELL_STATUS, json!({})))
+            .expect("shell.status answers without a compositor");
+
+        let backends = value["shell"]["backends"].as_array().unwrap();
+        assert_eq!(backends.len(), 3, "{value}");
+        for row in backends {
+            assert!(
+                matches!(row["confidence"].as_str(), Some("strong" | "weak" | "none")),
+                "every backend answers with a confidence level: {row}"
+            );
+            assert!(
+                !row["reason"].as_str().unwrap_or_default().is_empty(),
+                "a confidence with no reason is not actionable: {row}"
+            );
+            assert!(
+                matches!(row["mode"].as_str(), Some("daemon-drawn" | "shell-routed")),
+                "{row}"
+            );
+        }
+
+        assert_eq!(
+            value["shell"]["detect_order"],
+            json!(["caelestia", "hyprland", "generic-layer-shell"]),
+            "the chain is reported in the order it is probed"
+        );
+        assert_eq!(value["shell"]["patched"], json!(false));
+        // A test daemon has no event bus attached, which must be an honest `null`
+        // rather than a fabricated zero.
+        assert!(value["events"].is_null(), "{value}");
+        assert_eq!(value["competing_tools"]["notices"], json!([]));
+    }
+
+    #[test]
+    fn config_patch_switches_the_backend_and_says_it_is_runtime_only() {
+        let (handler, _dir) = handler_in_tree(Config::default());
+        assert_eq!(
+            handler.capabilities().shell_backends.len(),
+            3,
+            "the registry is the same before and after"
+        );
+
+        let value = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::CONFIG_PATCH,
+                json!({"patch": {"backend": "generic-layer-shell", "caelestia_mode": "daemon-drawn"}}),
+            ))
+            .expect("the patch applies");
+
+        assert_eq!(
+            value["config"]["shell"]["backend"],
+            json!("generic-layer-shell")
+        );
+        assert_eq!(value["config"]["shell"]["mode"], json!("daemon-drawn"));
+        assert_eq!(
+            value["config"]["shell"]["patched"],
+            json!(true),
+            "the status says the running config is an override: {value}"
+        );
+        assert_eq!(value["runtime_only"], json!(true));
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("restart"),
+            "the reply must say what a restart does: {value}"
+        );
+
+        // The next status call describes the patched state, not the file's.
+        let status = handler
+            .handle(&RequestFrame::new("c1", method::SHELL_STATUS, json!({})))
+            .expect("status after the patch");
+        assert_eq!(status["shell"]["backend"], json!("generic-layer-shell"));
+        assert_eq!(status["shell"]["patched"], json!(true));
+        assert_eq!(status["shell"]["mode"], json!("daemon-drawn"));
+    }
+
+    #[test]
+    fn config_patch_refuses_a_nonsense_patch_without_changing_anything() {
+        let (handler, _dir) = handler_in_tree(Config::default());
+        let before = handler
+            .handle(&RequestFrame::new("c1", method::SHELL_STATUS, json!({})))
+            .expect("status");
+
+        let unknown = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::CONFIG_PATCH,
+                json!({"patch": {"backend": "kde"}}),
+            ))
+            .expect_err("`kde` is not a backend");
+        assert_eq!(unknown.code, ErrorCode::ConfigInvalid, "{unknown:?}");
+        assert!(unknown.msg.contains("kde"), "{unknown:?}");
+        assert!(
+            unknown.msg.contains("caelestia"),
+            "the message lists what does exist: {unknown:?}"
+        );
+
+        let bad_mode = handler
+            .handle(&RequestFrame::new(
+                "c1",
+                method::CONFIG_PATCH,
+                json!({"patch": {"caelestia_mode": "sometimes"}}),
+            ))
+            .expect_err("not a draw mode");
+        assert!(bad_mode.msg.contains("daemon-drawn"), "{bad_mode:?}");
+
+        let empty = handler
+            .handle(&RequestFrame::new("c1", method::CONFIG_PATCH, json!({})))
+            .expect_err("a patch with no keys is a client mistake");
+        assert_eq!(empty.code, ErrorCode::BadRequest, "{empty:?}");
+        assert!(empty.msg.contains("shell"), "{empty:?}");
+
+        // None of the failures may have moved the live backend.
+        let after = handler
+            .handle(&RequestFrame::new("c1", method::SHELL_STATUS, json!({})))
+            .expect("status");
+        assert_eq!(after["shell"]["backend"], before["shell"]["backend"]);
+        assert_eq!(after["shell"]["patched"], json!(false));
+    }
+
+    #[test]
     fn shell_backends_are_the_registry_and_not_a_wish_list() {
         // Closes P0 §0.2.4: the old build advertised caelestia and
-        // generic-layer-shell, neither of which could render anything. Today
-        // generic-layer-shell really is registered (P1 added it) and caelestia is
-        // not — and the difference between those two is exactly what this asserts.
+        // generic-layer-shell, neither of which could render anything. P1 added
+        // generic-layer-shell and P3 added caelestia, so the list has grown — and
+        // what still matters is that every entry is really registered, and that a
+        // backend named as "not yet" never appears here. The P3 update is that the
+        // third entry is now true rather than aspirational.
         let capabilities = handler().capabilities();
         assert_eq!(
             capabilities.shell_backends,
-            vec!["hyprland".to_string(), "generic-layer-shell".to_string()]
+            vec![
+                "caelestia".to_string(),
+                "hyprland".to_string(),
+                "generic-layer-shell".to_string(),
+            ],
+            "capabilities must be the registry, in auto-chain order"
         );
-        for phantom in NOT_YET_IMPLEMENTED_BACKENDS {
+        for (feature, _) in KNOWN_BUT_NOT_YET {
             assert!(
-                !capabilities.shell_backends.iter().any(|id| id == phantom),
-                "`{phantom}` is advertised as working but is not implemented"
+                !capabilities.shell_backends.iter().any(|id| id == feature),
+                "`{feature}` is reported as unavailable and advertised at once"
             );
         }
     }
@@ -908,7 +1148,12 @@ mod tests {
         }
 
         // And nothing that *does* work may be listed as unavailable.
-        for working in ["hyprland", "generic-layer-shell", "static-image"] {
+        for working in [
+            "caelestia",
+            "hyprland",
+            "generic-layer-shell",
+            "static-image",
+        ] {
             assert!(
                 !capabilities
                     .unavailable
@@ -928,13 +1173,25 @@ mod tests {
 
     #[test]
     fn known_backend_ids_do_not_drift_from_the_config_schema() {
-        // The config accepts these ids; only some are implemented. If the config
-        // schema grows a new id, this test is the reminder to implement it (or to
-        // keep not advertising it).
-        let known = owe_core::config::KNOWN_SHELL_BACKENDS;
-        assert!(known.contains(&"hyprland"), "{known:?}");
-        for id in NOT_YET_IMPLEMENTED_BACKENDS {
-            assert!(known.contains(id), "`{id}` should still be a known id");
+        // Through P2 this had a "not implemented yet" list on the side, and its job
+        // was to prove those ids were never advertised. P3 implemented the last one
+        // (`caelestia`), so the invariant is now the other direction and stronger:
+        // every id `shell.backend` accepts is a backend this build actually has. A
+        // config that validates and then fails at first use is the drift this
+        // catches.
+        let handler = handler();
+        for id in owe_core::config::KNOWN_SHELL_BACKENDS {
+            if *id == "auto" {
+                continue;
+            }
+            assert!(
+                handler
+                    .capabilities()
+                    .shell_backends
+                    .iter()
+                    .any(|have| have == id),
+                "`shell.backend = \"{id}\"` is config-valid but nothing implements it"
+            );
         }
     }
 

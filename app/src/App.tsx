@@ -9,12 +9,16 @@ import {
   libraryScan,
   libraryThumbnail,
   listOutputs,
+  patchShell,
+  shellStatus,
   type ApplyOutcome,
   type DaemonStatus,
   type IpcFailure,
   type LibraryItem,
   type LibraryPage,
   type OutputsView,
+  type ShellStatus,
+  type ShellPatch,
   type TransitionRequest,
 } from "./ipc";
 import { t, tList } from "./i18n";
@@ -42,6 +46,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const [outputs, setOutputs] = useState<OutputsView | null>(null);
+  const [shell, setShell] = useState<ShellStatus | null>(null);
 
   const [page, setPage] = useState<LibraryPage | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
@@ -97,9 +102,11 @@ export default function App() {
       setStatus(next);
       if (next.connected) {
         setOutputs(await listOutputs().catch(() => null));
+        setShell(await shellStatus().catch(() => null));
         await loadLibrary({ page: 1, scan: true });
       } else {
         setOutputs(null);
+        setShell(null);
         setPage(null);
       }
     } finally {
@@ -210,6 +217,16 @@ export default function App() {
     [run, loadLibrary],
   );
 
+  const applyShellPatch = useCallback(
+    (patch: ShellPatch) =>
+      run(async () => {
+        const next = await patchShell(patch);
+        setShell(next);
+        return next.runtime_note ?? t("shellApplied");
+      }),
+    [run],
+  );
+
   const canAssign = selected !== null && !busy;
 
   return (
@@ -314,6 +331,12 @@ export default function App() {
               <p className="panel__note">{t("governorPaused")}</p>
             )}
           </section>
+
+          <ShellCard
+            shell={shell}
+            busy={busy}
+            onPatch={(patch) => void applyShellPatch(patch)}
+          />
 
           <section className="panel">
             <h2 className="panel__title">{t("libraryTitle")}</h2>
@@ -539,6 +562,179 @@ export default function App() {
 
       <p className="placeholder__note">{t("disposableNote")}</p>
     </main>
+  );
+}
+
+/// The shell card (Phase 3, FR-SHELL-3): which backend is live, why, and the
+/// runtime switches. Every value shown comes from `shell.status`; the only string
+/// the UI invents is the placeholder for an unreachable daemon.
+function ShellCard({
+  shell,
+  busy,
+  onPatch,
+}: {
+  shell: ShellStatus | null;
+  busy: boolean;
+  onPatch: (patch: ShellPatch) => void;
+}) {
+  const [backendOverride, setBackendOverride] = useState("");
+  const [modeChoice, setModeChoice] = useState("");
+  const [themeHook, setThemeHook] = useState("");
+  const [orderInput, setOrderInput] = useState("");
+
+  if (shell === null) {
+    return (
+      <section className="panel">
+        <h2 className="panel__title">{t("shellTitle")}</h2>
+        <p className="panel__empty">{t("shellCardUnreachable")}</p>
+      </section>
+    );
+  }
+
+  if (!shell.connected) {
+    return (
+      <section className="panel">
+        <h2 className="panel__title">{t("shellTitle")}</h2>
+        <p className="panel__empty">{shell.error ?? t("shellCardUnreachable")}</p>
+      </section>
+    );
+  }
+
+  const patch: ShellPatch = {};
+  if (backendOverride !== "") patch.backend = backendOverride;
+  if (modeChoice !== "") patch.caelestia_mode = modeChoice;
+  if (themeHook === "on") patch.theme_hook = true;
+  if (themeHook === "off") patch.theme_hook = false;
+  const order = orderInput
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  if (order.length > 0) patch.detect_order = order;
+  const patchEmpty = Object.keys(patch).length === 0;
+
+  const modeText =
+    shell.mode === "shell-routed" ? t("shellModeShellRouted") : t("shellModeDaemonDrawn");
+
+  return (
+    <section className="panel">
+      <h2 className="panel__title">{t("shellTitle")}</h2>
+
+      <div className="details details--tight">
+        <Detail
+          label={t("shellBackendLabel")}
+          value={shell.backend ?? t("shellNoneSelected")}
+        />
+        <Detail label={t("shellModeLabel")} value={modeText} />
+        {shell.patched && <Detail label=" " value={t("shellPatched")} />}
+        {shell.detect_order.length > 0 && (
+          <Detail label={t("shellDetectOrder")} value={shell.detect_order.join(" → ")} mono />
+        )}
+        {shell.events && (
+          <Detail
+            label={t("shellEventsLabel")}
+            value={`${
+              shell.events.listening ? t("shellEventsListening") : t("shellEventsIdle")
+            } — ${shell.events.published} ${t("shellEventsSeen")}, ${
+              shell.events.dropped
+            } ${t("shellEventsDropped")}, ${shell.events.reconnects} ${t(
+              "shellEventsReconnects",
+            )}`}
+          />
+        )}
+      </div>
+
+      <ul className="list list--plain" title={t("shellRowHint")}>
+        {shell.backends.map((row) => (
+          <li key={row.id} className="list__sub">
+            <span aria-hidden="true">{row.selected ? "●" : "○"} </span>
+            <code>{row.id}</code> · {row.confidence} · {row.mode} — {row.reason}
+          </li>
+        ))}
+      </ul>
+
+      {shell.competing_tools.length > 0 && (
+        <div className="panel__note">
+          <strong>{t("shellCompetingTitle")}</strong> {t("shellCompetingHint")}
+          <ul className="list list--plain">
+            {shell.competing_tools.map((notice) => (
+              <li key={notice} className="list__sub">
+                {notice}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <form
+        className="panel__actions"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!patchEmpty) onPatch(patch);
+        }}
+      >
+        <label className="field">
+          <span className="field__label">{t("shellBackendOverride")}</span>
+          <select
+            className="field__control"
+            value={backendOverride}
+            onChange={(event) => setBackendOverride(event.target.value)}
+          >
+            <option value="">{t("shellBackendAuto")}</option>
+            {shell.detect_order.map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="field">
+          <span className="field__label">{t("shellModeLabel2")}</span>
+          <select
+            className="field__control"
+            value={modeChoice}
+            onChange={(event) => setModeChoice(event.target.value)}
+          >
+            <option value="">{modeText}</option>
+            <option value="daemon-drawn">{t("shellModeDaemonDrawnChoice")}</option>
+            <option value="shell-routed">{t("shellModeShellRoutedChoice")}</option>
+          </select>
+        </label>
+
+        <label className="field">
+          <span className="field__label">{t("shellThemeHookLabel")}</span>
+          <select
+            className="field__control"
+            value={themeHook}
+            onChange={(event) => setThemeHook(event.target.value)}
+          >
+            <option value="">—</option>
+            <option value="on">{t("shellThemeHookOn")}</option>
+            <option value="off">{t("shellThemeHookOff")}</option>
+          </select>
+        </label>
+
+        <label className="field field--wide">
+          <span className="field__label">{t("shellDetectOrder")}</span>
+          <input
+            className="field__control"
+            type="text"
+            value={orderInput}
+            placeholder={shell.detect_order.join(", ") || t("shellDetectOrderHint")}
+            onChange={(event) => setOrderInput(event.target.value)}
+          />
+        </label>
+
+        <button
+          type="submit"
+          className="button button--primary"
+          disabled={busy || patchEmpty}
+          title={patchEmpty ? t("shellPatchNone") : undefined}
+        >
+          {busy ? t("shellApplying") : t("shellApply")}
+        </button>
+      </form>
+    </section>
   );
 }
 

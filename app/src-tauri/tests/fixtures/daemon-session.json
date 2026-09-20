@@ -20,9 +20,12 @@
           "governor.override",
           "library.scan",
           "library.list",
-          "library.thumb"
+          "library.thumb",
+          "shell.status",
+          "config.patch"
         ],
         "shell_backends": [
+          "caelestia",
           "hyprland",
           "generic-layer-shell"
         ],
@@ -36,7 +39,6 @@
           "outer"
         ],
         "unavailable": [
-          "caelestia: shell backend planned for P3 (P1 renders natively on Hyprland)",
           "animated-image: content kind planned for P4 (decode + frame pacing)",
           "video: content kind planned for P4 (GStreamer path)",
           "shader: content kind planned for P5 (WGSL packs, previews)",
@@ -51,44 +53,44 @@
     },
     "library.scan": {
       "added": 0,
-      "duration_ms": 0.8805529999999999,
+      "duration_ms": 0.863132,
       "files_seen": 2,
       "finished": true,
       "missing_roots": [],
       "removed": 0,
       "roots": [
-        "/tmp/tmp.mhHlCDsywt/walls"
+        "/tmp/tmp.rRaIvGU7EZ/walls"
       ],
       "rows_touched": 0,
       "scan_id": 1,
       "skipped_unsupported": 0,
-      "summary": "scanned 1 root(s): 2 file(s) seen, +0 ~0 -0 (2 unchanged, 0 skipped), 0 unreadable, 0 missing, 880.553\u00b5s",
+      "summary": "scanned 1 root(s): 2 file(s) seen, +0 ~0 -0 (2 unchanged, 0 skipped), 0 unreadable, 0 missing, 863.132\u00b5s",
       "unchanged": 2,
       "unreadable_dirs": [],
       "updated": 0,
-      "wall_clock_ms": 1.10866
+      "wall_clock_ms": 1.266938
     },
     "library.list": {
       "items": [
         {
-          "dir": "/tmp/tmp.mhHlCDsywt/walls",
-          "id": 2,
+          "dir": "/tmp/tmp.rRaIvGU7EZ/walls",
+          "id": 1,
           "kind": "static-image",
-          "mtime_secs": 1789888871,
+          "mtime_secs": 1789910859,
           "name": "aurora.png",
-          "path": "/tmp/tmp.mhHlCDsywt/walls/aurora.png",
-          "reference": "library:2",
+          "path": "/tmp/tmp.rRaIvGU7EZ/walls/aurora.png",
+          "reference": "library:1",
           "size_bytes": 19766,
           "thumb": null
         },
         {
-          "dir": "/tmp/tmp.mhHlCDsywt/walls",
-          "id": 1,
+          "dir": "/tmp/tmp.rRaIvGU7EZ/walls",
+          "id": 2,
           "kind": "static-image",
-          "mtime_secs": 1789888871,
+          "mtime_secs": 1789910859,
           "name": "forest.png",
-          "path": "/tmp/tmp.mhHlCDsywt/walls/forest.png",
-          "reference": "library:1",
+          "path": "/tmp/tmp.rRaIvGU7EZ/walls/forest.png",
+          "reference": "library:2",
           "size_bytes": 42913,
           "thumb": null
         }
@@ -97,21 +99,113 @@
       "pages": 1,
       "per_page": 50,
       "roots": [
-        "/tmp/tmp.mhHlCDsywt/walls"
+        "/tmp/tmp.rRaIvGU7EZ/walls"
       ],
       "thumbnail_size": 256,
       "total": 2
     },
     "library.thumb": {
       "cached": false,
-      "id": 2,
+      "id": 1,
       "path": "$FIXTURE_DIR/thumb.png",
       "size": 256,
-      "source": "/tmp/tmp.mhHlCDsywt/walls/aurora.png"
+      "source": "/tmp/tmp.rRaIvGU7EZ/walls/aurora.png"
     },
     "outputs.list": {
       "outputs": [],
       "paused": false
+    },
+    "shell.status": {
+      "competing_tools": {
+        "failures": [],
+        "notices": [],
+        "stopped": []
+      },
+      "events": {
+        "dropped": 0,
+        "last_event": null,
+        "listening": false,
+        "published": 0,
+        "reconnects": 0,
+        "subscribers": 0
+      },
+      "shell": {
+        "backend": "caelestia",
+        "backends": [
+          {
+            "confidence": "strong",
+            "id": "caelestia",
+            "mode": "shell-routed",
+            "reason": "the Caelestia shell is running (/usr/local/bin/qs -c caelestia -n)",
+            "selected": true
+          },
+          {
+            "confidence": "strong",
+            "id": "hyprland",
+            "mode": "daemon-drawn",
+            "reason": "hyprland is present in this session",
+            "selected": false
+          },
+          {
+            "confidence": "strong",
+            "id": "generic-layer-shell",
+            "mode": "daemon-drawn",
+            "reason": "generic-layer-shell is present in this session",
+            "selected": false
+          }
+        ],
+        "detect_order": [
+          "caelestia",
+          "hyprland",
+          "generic-layer-shell"
+        ],
+        "mode": "shell-routed",
+        "patched": false,
+        "reason": "the Caelestia shell is running (/usr/local/bin/qs -c caelestia -n)",
+        "routed": true
+      }
+    },
+    "config.patch": {
+      "config": {
+        "patched": true,
+        "shell": {
+          "backend": "caelestia",
+          "backends": [
+            {
+              "confidence": "strong",
+              "id": "caelestia",
+              "mode": "shell-routed",
+              "reason": "the Caelestia shell is running (/usr/local/bin/qs -c caelestia -n)",
+              "selected": true
+            },
+            {
+              "confidence": "strong",
+              "id": "hyprland",
+              "mode": "daemon-drawn",
+              "reason": "hyprland is present in this session",
+              "selected": false
+            },
+            {
+              "confidence": "strong",
+              "id": "generic-layer-shell",
+              "mode": "daemon-drawn",
+              "reason": "generic-layer-shell is present in this session",
+              "selected": false
+            }
+          ],
+          "detect_order": [
+            "caelestia",
+            "hyprland",
+            "generic-layer-shell"
+          ],
+          "mode": "shell-routed",
+          "patched": true,
+          "reason": "selected by config: the Caelestia shell is running (/usr/local/bin/qs -c caelestia -n)",
+          "routed": true
+        }
+      },
+      "note": "applied to the running daemon; the config file is unchanged, so a restart restores the file's values",
+      "runtime_only": true
     }
   }
 }

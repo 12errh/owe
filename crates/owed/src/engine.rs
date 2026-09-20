@@ -11,9 +11,9 @@
 //! `config.get` and `daemon.kill` are useful there.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use owe_core::config::{FPS_RANGE, MAX_TRANSITION_MS, Transition};
@@ -21,7 +21,7 @@ use owe_core::model::{ContentKind, WallpaperRef, WallpaperSource};
 use owe_core::output::{OutputInfo, OutputTarget};
 use owe_core::outputs as output_config;
 use owe_core::path::XdgPaths;
-use owe_core::shell::{Registry, SelectError, ShellBackend, ShellError};
+use owe_core::shell::{ApplyOutcome, DrawMode, Registry, SelectError, ShellBackend, ShellError};
 use owe_core::state::{SessionState, StateError};
 use owe_core::supervisor::{HotplugEvent, Supervisor, SupervisorAction};
 use owe_core::{Config, OutputWorker, WorkerAction, WorkerEvent};
@@ -41,6 +41,12 @@ use thiserror::Error;
 pub trait LibraryResolver: Send + Sync {
     /// Absolute path of a library item, or the reason it cannot be resolved.
     fn resolve(&self, id: &str) -> Result<PathBuf, String>;
+
+    /// The indexed content kind of a library item, or the reason it cannot be
+    /// resolved. A `library:` reference names a row, not a file, so there is no
+    /// extension to inspect: the kind can only come from what the scanner
+    /// recorded.
+    fn kind_of(&self, id: &str) -> Result<ContentKind, String>;
 }
 
 /// Background colour behind a `contain`-scaled wallpaper (opaque black, so the
@@ -161,6 +167,124 @@ pub struct Applied {
     /// Whether the change came from the session file rather than a live request.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub restored: bool,
+    /// The shell's own theming pipeline was asked to run, and how many times OWE
+    /// ran a theme refresh of its own.
+    ///
+    /// `runs` is always 0 or 1: OWE never runs a theme pipeline in either mode (a
+    /// double theme is a bug class, TRD §4), and the shell either does (routed with
+    /// `theme_hook`) or does not. Reported so "the theme updated once" is a
+    /// measurable statement in a test and in `owectl`'s output, not a claim about a
+    /// side effect the user has to eyeball.
+    #[serde(skip_serializing_if = "ThemeRuns::is_zero")]
+    pub theme: ThemeRuns,
+    /// Whether this apply was carried out by the shell rather than drawn by OWE.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub routed: bool,
+}
+
+/// One backend's answer to "do you belong in this session?", for `shell.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackendStatus {
+    /// Backend id.
+    pub id: String,
+    /// `strong`, `weak` or `none`.
+    pub confidence: String,
+    /// Why, in the backend's own words.
+    pub reason: String,
+    /// Whether this is the backend the daemon is using.
+    pub selected: bool,
+    /// The draw mode this backend would use with the live config.
+    pub mode: String,
+}
+
+/// The shell situation, as `shell.status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShellStatus {
+    /// Selected backend id, or `None` when none is usable here.
+    pub backend: Option<String>,
+    /// Why that backend was selected (or why none was).
+    pub reason: Option<String>,
+    /// Draw mode in effect: `daemon-drawn` or `shell-routed`.
+    pub mode: String,
+    /// Whether the selected backend routes wallpapers to a shell instead of drawing
+    /// them, which is what decides whether a transition is possible at all.
+    pub routed: bool,
+    /// The `auto` chain, in the order it is probed.
+    pub detect_order: Vec<String>,
+    /// Every registered backend and what it says about this session.
+    pub backends: Vec<BackendStatus>,
+    /// Whether the live shell's own configuration was overridden at runtime
+    /// (`config.patch`) rather than read from the file.
+    pub patched: bool,
+}
+
+/// A runtime-only change to `[shell]` (BACKEND-DESIGN §3, `config.patch`).
+///
+/// Every field is optional: a patch names what changes and leaves the rest alone.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellPatch {
+    /// `auto` or a registered backend id.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// `daemon-drawn` or `shell-routed`.
+    #[serde(default)]
+    pub caelestia_mode: Option<String>,
+    /// Let the shell's theming pipeline run after a routed change.
+    #[serde(default)]
+    pub theme_hook: Option<bool>,
+    /// Where the shell's wallpapers live (relative references resolve here).
+    #[serde(default)]
+    pub wallpapers_dir: Option<String>,
+    /// `auto` chain, in order.
+    #[serde(default)]
+    pub detect_order: Option<Vec<String>>,
+    /// Subscribe to the Hyprland event socket.
+    #[serde(default)]
+    pub event_socket: Option<bool>,
+    /// `warn`, `stop` or `ignore`.
+    #[serde(default)]
+    pub hyprpaper: Option<String>,
+}
+
+impl ShellPatch {
+    /// Whether the patch asks for anything at all.
+    ///
+    /// A patch with no recognised keys is a client mistake, not a no-op: answering
+    /// `ok` to a request that changed nothing is how a user concludes the feature is
+    /// broken.
+    pub fn is_empty(&self) -> bool {
+        self.backend.is_none()
+            && self.caelestia_mode.is_none()
+            && self.theme_hook.is_none()
+            && self.wallpapers_dir.is_none()
+            && self.detect_order.is_none()
+            && self.event_socket.is_none()
+            && self.hyprpaper.is_none()
+    }
+}
+
+/// Theme work done for one apply (see [`Applied::theme`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThemeRuns {
+    /// Times OWE invoked a theme pipeline itself. Structurally zero: there is no
+    /// such pipeline in this codebase, and this field exists so that a test can
+    /// assert that rather than take it on faith.
+    pub by_owe: u32,
+    /// Whether the shell's pipeline ran because OWE asked it to switch wallpaper.
+    pub by_shell: bool,
+}
+
+impl ThemeRuns {
+    /// Nothing ran; the field is omitted from replies.
+    fn is_zero(&self) -> bool {
+        self.by_owe == 0 && !self.by_shell
+    }
+
+    /// Total theme refreshes caused by this apply.
+    pub fn total(&self) -> u32 {
+        self.by_owe + u32::from(self.by_shell)
+    }
 }
 
 /// A wallpaper reference this run has presented on an output.
@@ -378,7 +502,14 @@ impl StartupReport {
 pub struct Engine {
     config: Config,
     paths: XdgPaths,
-    registry: Registry,
+    /// Behind a lock rather than a plain field so a backend can be registered
+    /// while the daemon runs: the routing tests replace `caelestia` with a
+    /// recording stub, and a `config.patch` that changes `shell.backend` will do
+    /// the same for real.
+    registry: RwLock<Registry>,
+    /// A runtime `[shell]` patch, when one has been applied (`config.patch`).
+    /// `None` means the file's value is in force.
+    shell_override: RwLock<Option<owe_core::config::ShellConfig>>,
     generation: AtomicU64,
     /// What each output is actually showing, as of this process's lifetime.
     /// The session file is intent; this is fact.
@@ -428,10 +559,14 @@ impl Engine {
     /// disk was assigned over it.
     pub fn new(config: Config, paths: XdgPaths) -> Self {
         let mut registry = Registry::new();
-        registry.register(Box::new(owe_shell_hyprland::HyprlandBackend::new()));
+        // Caelestia first in registration so the default `auto` chain
+        // (caelestia → hyprland → generic-layer-shell) is a property of the
+        // registry rather than of a config file.
+        registry.register(Arc::new(owe_shell_caelestia::CaelestiaBackend::new()));
+        registry.register(Arc::new(owe_shell_hyprland::HyprlandBackend::new()));
         // The floor: any compositor that speaks plain Wayland. Last in the detect
         // order because it knows the least (no focus, no workspace events).
-        registry.register(Box::new(owe_shell_generic::GenericBackend::new()));
+        registry.register(Arc::new(owe_shell_generic::GenericBackend::new()));
 
         // A damaged session file is a warning, never a failure: a daemon that
         // refuses to start because its cache is corrupt is useless exactly when it
@@ -441,7 +576,8 @@ impl Engine {
         Self {
             config,
             paths,
-            registry,
+            registry: RwLock::new(registry),
+            shell_override: RwLock::new(None),
             generation: AtomicU64::new(1),
             started: Mutex::new(None),
             outputs: Mutex::new(Vec::new()),
@@ -457,6 +593,229 @@ impl Engine {
             supervisor: Mutex::new(Supervisor::default()),
             library: Mutex::new(None),
         }
+    }
+
+    /// Register (or replace) a shell backend at runtime.
+    ///
+    /// Public because it is the seam that makes backend selection testable without
+    /// a compositor: a test registers a backend whose `id()` is the one its config
+    /// names, and the whole apply path — routing decisions, session recording,
+    /// theme accounting — runs for real.
+    #[allow(
+        dead_code,
+        reason = "the seam the routing tests register through; the first non-test caller is \
+                  the future backend-override path"
+    )]
+    pub fn register_backend(&self, backend: Arc<dyn ShellBackend>) {
+        let mut registry = self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.register(backend);
+    }
+
+    /// A registered backend by id.
+    fn backend(&self, id: &str) -> Option<Arc<dyn ShellBackend>> {
+        self.registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+    }
+
+    /// The `[shell]` configuration in force: a runtime patch if one was applied,
+    /// otherwise the file's value.
+    ///
+    /// One function rather than a field read at each call site, because "which
+    /// config is live" must have exactly one answer for the daemon and for the IPC
+    /// layer that reports it.
+    pub fn shell_config(&self) -> owe_core::config::ShellConfig {
+        self.shell_override
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.config.shell.clone())
+    }
+
+    /// The shell situation, for `shell.status` and the GUI's status card.
+    ///
+    /// Runs each backend's detection, which is process/env only (no subprocess): a
+    /// status call must be cheap enough for a UI to call on every page load.
+    pub fn shell_status(&self) -> ShellStatus {
+        let shell = self.shell_config();
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let selected = registry.select_with_reason(&shell, &env_lookup);
+        let (backend, reason) = match &selected {
+            Ok((backend, detection)) => (
+                Some(backend.id().to_string()),
+                Some(detection.reason.clone()),
+            ),
+            Err(error) => (None, Some(error.to_string())),
+        };
+
+        let mut backends: Vec<BackendStatus> = registry
+            .detections(&shell, &env_lookup)
+            .into_iter()
+            .map(|(backend, detection)| BackendStatus {
+                id: backend.id().to_string(),
+                confidence: detection.confidence.as_str().to_string(),
+                reason: detection.reason,
+                selected: false,
+                mode: backend.draw_mode(&shell).as_str().to_string(),
+            })
+            .collect();
+        if let Some(id) = &backend {
+            for row in &mut backends {
+                row.selected = &row.id == id;
+            }
+        }
+
+        let mode = selected
+            .as_ref()
+            .map(|(backend, _)| backend.draw_mode(&shell).as_str().to_string())
+            .unwrap_or_else(|_| DrawMode::DaemonDrawn.as_str().to_string());
+
+        ShellStatus {
+            routed: mode == DrawMode::ShellRouted.as_str(),
+            backend,
+            reason,
+            mode,
+            detect_order: registry.detect_order(&shell),
+            backends,
+            patched: self
+                .shell_override
+                .read()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false),
+        }
+    }
+
+    /// Apply a runtime patch to `[shell]`, and re-select the backend.
+    ///
+    /// Deliberately narrow: `shell.backend`, the Caelestia mode/theme switch, the
+    /// wallpapers directory, the `auto` chain and the two Hyprland switches. That is
+    /// what the GUI needs to let a user try a different backend without editing a
+    /// file, and nothing more — a patch that could change `render.allow_transitions`
+    /// or `library.paths` would be a config editor wearing an IPC method's name.
+    ///
+    /// The override lives in memory. OWE does not rewrite the user's config file as a
+    /// side effect of a click: `config.patch` says so in its reply, and the file the
+    /// user edits stays authoritative across restarts.
+    ///
+    /// A validation or selection failure leaves the previous override in place, so a
+    /// typo cannot leave the daemon without a working backend.
+    pub fn patch_shell(&self, patch: &ShellPatch) -> Result<ShellStatus, EngineError> {
+        let mut shell = self.shell_config();
+
+        if let Some(backend) = &patch.backend {
+            let trimmed = backend.trim();
+            if trimmed != "auto" && !self.backend_ids().iter().any(|id| id == trimmed) {
+                return Err(EngineError::ShellSelection(SelectError::UnknownBackend {
+                    requested: trimmed.to_string(),
+                    available: self.backend_ids().join(", "),
+                }));
+            }
+            shell.backend = trimmed.to_string();
+        }
+        if let Some(mode) = &patch.caelestia_mode {
+            if DrawMode::parse(mode).is_none() {
+                return Err(EngineError::Shell(ShellError::Backend {
+                    backend: owe_shell_caelestia::ID.to_string(),
+                    detail: format!(
+                        "`{mode}` is not a draw mode; expected `daemon-drawn` or `shell-routed`"
+                    ),
+                }));
+            }
+            shell.caelestia.mode = mode.trim().to_string();
+        }
+        if let Some(theme_hook) = patch.theme_hook {
+            shell.caelestia.theme_hook = theme_hook;
+        }
+        if let Some(dir) = &patch.wallpapers_dir {
+            shell.caelestia.wallpapers_dir = Some(dir.clone());
+        }
+        if let Some(order) = &patch.detect_order {
+            for id in order {
+                if !self.backend_ids().iter().any(|known| known == id) {
+                    return Err(EngineError::ShellSelection(SelectError::UnknownBackend {
+                        requested: id.clone(),
+                        available: self.backend_ids().join(", "),
+                    }));
+                }
+            }
+            shell.detect_order = order.clone();
+        }
+        if let Some(event_socket) = patch.event_socket {
+            shell.hyprland.event_socket = event_socket;
+        }
+        if let Some(policy) = &patch.hyprpaper {
+            if owe_core::shell::CoexistencePolicy::parse(policy).is_none() {
+                return Err(EngineError::Shell(ShellError::Backend {
+                    backend: "hyprland".to_string(),
+                    detail: format!(
+                        "`{policy}` is not a coexistence policy; expected `warn`, `stop` or \
+                         `ignore`"
+                    ),
+                }));
+            }
+            shell.hyprland.hyprpaper = policy.trim().to_string();
+        }
+
+        if let Ok(mut slot) = self.shell_override.write() {
+            *slot = Some(shell);
+        }
+
+        // Re-select and re-list immediately: a `shell.status` right after the patch
+        // must describe the new state, not the old one.
+        self.repick_backend()?;
+        Ok(self.shell_status())
+    }
+
+    /// Re-run selection and the output list without restarting the presenter or the
+    /// GPU.
+    ///
+    /// This is the half of `start()` that a backend change actually affects. A full
+    /// restart would try to open a second layer surface on the same outputs, so the
+    /// presenter is deliberately left alone: switching who owns the wallpaper must
+    /// not cost the surfaces that are already up.
+    fn repick_backend(&self) -> Result<(), EngineError> {
+        let shell = self.shell_config();
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let selected = registry.select(&shell, &env_lookup);
+        drop(registry);
+
+        let outputs = match &selected {
+            Ok(backend) => backend.list_outputs().unwrap_or_else(|error| {
+                tracing::warn!(%error, "cannot list outputs after a shell config change");
+                self.outputs
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default()
+            }),
+            Err(error) => return Err(EngineError::ShellSelection(error.clone())),
+        };
+
+        if let Ok(mut slot) = self.outputs.lock() {
+            *slot = outputs.clone();
+        }
+        if let Ok(mut guard) = self.started.lock()
+            && let Some(report) = guard.as_mut()
+        {
+            report.backend = selected
+                .as_ref()
+                .ok()
+                .map(|backend| backend.id().to_string());
+            report.backend_error = selected.as_ref().err().map(ToString::to_string);
+            report.selection_error = selected.as_ref().err().cloned();
+            report.outputs = outputs;
+        }
+        Ok(())
     }
 
     /// Inject the library resolver. Called once, after the library service opens.
@@ -511,28 +870,36 @@ impl Engine {
             .map(|guard| guard.clone())
             .unwrap_or_default();
 
-        let (backend, backend_error, selection_error) =
-            match self.registry.select(&self.config.shell, &env_lookup) {
-                Ok(backend) => (Some(backend.id().to_string()), None, None),
-                Err(error) => {
-                    warnings.push(format!("no shell backend is usable: {error}"));
-                    (None, Some(error.to_string()), Some(error))
-                }
-            };
-
-        let outputs = match self
+        // The registry is read once and the selected backend used directly: looking
+        // it up a second time by id would be a second chance to disagree with
+        // itself if a backend were replaced in between.
+        let shell_config = self.shell_config();
+        let registry = self
             .registry
-            .get(backend.as_deref().unwrap_or_default())
-            .map(ShellBackend::list_outputs)
-        {
-            Some(Ok(outputs)) => outputs,
-            Some(Err(error)) => {
-                // A missing `hyprctl` must not stop the daemon either.
-                warnings.push(format!("cannot list outputs: {error}"));
-                Vec::new()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let selected = registry.select(&shell_config, &env_lookup);
+
+        let (backend, backend_error, selection_error) = match &selected {
+            Ok(backend) => (Some(backend.id().to_string()), None, None),
+            Err(error) => {
+                warnings.push(format!("no shell backend is usable: {error}"));
+                (None, Some(error.to_string()), Some(error.clone()))
             }
-            None => Vec::new(),
         };
+
+        let outputs = match &selected {
+            Ok(backend) => match backend.list_outputs() {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    // A missing `hyprctl` must not stop the daemon either.
+                    warnings.push(format!("cannot list outputs: {error}"));
+                    Vec::new()
+                }
+            },
+            Err(_) => Vec::new(),
+        };
+        drop(registry);
 
         // Session entries for outputs that are not connected right now are kept on
         // purpose. PRD-F-08 requires that a monitor unplugged and replugged gets
@@ -710,7 +1077,29 @@ impl Engine {
         // on a compositor happening to be attached — the first CI runs failed two
         // tests on exactly that, because they only passed on a desktop.
         let reference = WallpaperRef::parse(spec)?;
-        let kind = reference.resolved_kind()?;
+        // Resolve the source before validating the kind. A `library:` reference
+        // has no extension to inspect — its kind lives in the library row — so
+        // demanding a resolved kind first made every library reference
+        // unreachable, answered with the error that *describes the fix* instead
+        // of performing it. (Found live in P3 on the reference session.)
+        let (kind, path) = match reference.source() {
+            WallpaperSource::Path(path) => (reference.resolved_kind()?, path.clone()),
+            WallpaperSource::LibraryItem(id) => {
+                let kind = self.resolve_library_kind(id)?;
+                let path = self.resolve_library_reference(id)?;
+                (kind, path)
+            }
+            WallpaperSource::ShaderPack(name) => {
+                // Shader packs arrive in P5. This is an honest "not yet" answer
+                // that names both the pack and the phase, not a decode error that
+                // sends the user looking for a broken file.
+                return Err(EngineError::Unsupported(format!(
+                    "shader pack `{name}` cannot be rendered yet: WGSL packs land in P5 \
+                     (docs/IMPLEMENTATION-PLAN.md)"
+                )));
+            }
+        };
+
         // P1 renders still images. Named, explicit failure for everything else
         // rather than a confusing decode error.
         owe_media::ensure_supported(kind)?;
@@ -728,20 +1117,6 @@ impl Engine {
         let report = self.start();
         report.backend_failure()?;
 
-        let path = match reference.source() {
-            WallpaperSource::Path(path) => path.clone(),
-            WallpaperSource::LibraryItem(id) => self.resolve_library_reference(id)?,
-            WallpaperSource::ShaderPack(name) => {
-                // Shader packs arrive in P5. This is an honest "not yet" answer
-                // that names both the pack and the phase, not a decode error that
-                // sends the user looking for a broken file.
-                return Err(EngineError::Unsupported(format!(
-                    "shader pack `{name}` cannot be rendered yet: WGSL packs land in P5 \
-                     (docs/IMPLEMENTATION-PLAN.md)"
-                )));
-            }
-        };
-
         // Resolve the target *before* decoding. Two reasons: a typo'd monitor
         // name should not cost a 4K decode, and "which output" is the mistake a
         // user can actually fix on the spot. (Found by a test that expected the
@@ -752,6 +1127,14 @@ impl Engine {
             .map(|guard| guard.clone())
             .unwrap_or_default();
         let selected = owe_core::output::resolve(&outputs, target)?;
+
+        // Shell-routed mode: a shell that owns the pixels is asked to switch, and
+        // OWE decodes and presents nothing (FR-SHELL-3, TRD §4).
+        if let Some(routed) =
+            self.route_to_shell(spec, kind, &path, &selected, requested, restored)?
+        {
+            return Ok(routed);
+        }
 
         // Decode once, render per output: the common case is `-o all`.
         let decoded = owe_media::decode_file(&path)?;
@@ -773,6 +1156,8 @@ impl Engine {
             frames: Vec::new(),
             notes: Vec::new(),
             restored,
+            theme: ThemeRuns::default(),
+            routed: false,
         };
 
         for output in selected {
@@ -820,8 +1205,33 @@ impl Engine {
             )));
         }
 
-        // Record what this run has on screen (fact), then persist it (intent for
-        // the next run, which restore reads at startup).
+        // Persist only what actually reached the screen.
+        self.record_applied(&applied)?;
+
+        Ok(applied)
+    }
+
+    /// Whether a resolved selection covers every drawable output.
+    ///
+    /// A shell that sets one wallpaper for the whole session answers exactly the
+    /// same question as `-o all` when every output is selected, so the two are one
+    /// request. A strict subset is not: it asks for per-output ownership, which is
+    /// a different question and (for Caelestia) not an expressible one.
+    fn selects_every_output(&self, selected: &[&OutputInfo]) -> bool {
+        let active = self
+            .outputs
+            .lock()
+            .map(|guard| guard.iter().filter(|output| output.active).count())
+            .unwrap_or(0);
+        active > 0 && selected.len() == active
+    }
+
+    /// Record what this run has on screen (fact), then persist it (intent for the
+    /// next run, which restore reads at startup).
+    ///
+    /// Shared by the drawn and shell-routed paths on purpose: "which wallpapers
+    /// come back after a restart" must not depend on which mode produced them.
+    fn record_applied(&self, applied: &Applied) -> Result<(), EngineError> {
         if let Ok(mut shown) = self.applied.lock() {
             for name in &applied.outputs {
                 shown.insert(
@@ -834,21 +1244,110 @@ impl Engine {
             }
         }
 
-        // Persist only what actually reached the screen.
-        {
-            let mut session = self.session.lock().map_err(|_| {
-                EngineError::State(StateError::Write {
-                    path: self.paths.state_dir.join("session.json"),
-                    source: std::io::Error::other("session state lock poisoned"),
-                })
-            })?;
-            for name in &applied.outputs {
-                session.set(name.clone(), applied.reference.clone(), &applied.kind);
-            }
-            session.save(&self.paths.state_dir.join("session.json"))?;
+        let mut session = self.session.lock().map_err(|_| {
+            EngineError::State(StateError::Write {
+                path: self.paths.state_dir.join("session.json"),
+                source: std::io::Error::other("session state lock poisoned"),
+            })
+        })?;
+        for name in &applied.outputs {
+            session.set(name.clone(), applied.reference.clone(), &applied.kind);
+        }
+        session.save(&self.paths.state_dir.join("session.json"))?;
+        Ok(())
+    }
+
+    /// Route a change to a shell that owns the pixels (FR-SHELL-3, TRD §4).
+    ///
+    /// Returns `Ok(None)` when the selected backend draws its own surfaces — every
+    /// backend except Caelestia in `shell-routed` mode, and Caelestia itself in
+    /// `daemon-drawn` — so the caller carries on with the layer-shell path.
+    ///
+    /// A refusal from the shell is returned as an error and never downgraded into
+    /// "draw it myself": the two modes exist because the user chose one, and
+    /// quietly painting over a shell that declined would hide the failure behind a
+    /// wallpaper that appears anyway.
+    fn route_to_shell(
+        &self,
+        reference: &str,
+        kind: ContentKind,
+        path: &Path,
+        selected: &[&OutputInfo],
+        requested: Option<&Transition>,
+        restored: bool,
+    ) -> Result<Option<Applied>, EngineError> {
+        let report = self.start();
+        let Some(backend_id) = report.backend else {
+            return Ok(None);
+        };
+        let Some(backend) = self.backend(&backend_id) else {
+            return Ok(None);
+        };
+        if backend.draw_mode(&self.shell_config()) != DrawMode::ShellRouted {
+            return Ok(None);
         }
 
-        Ok(applied)
+        // `None` = the whole session, which is what every output being selected
+        // means. Anything narrower is a per-output request the shell must answer
+        // for itself.
+        let shell_output = if self.selects_every_output(selected) {
+            None
+        } else {
+            selected.first().map(|output| output.name.as_str())
+        };
+
+        let outcome = backend.apply_wallpaper(
+            &self.shell_config(),
+            shell_output,
+            &path.display().to_string(),
+        )?;
+        let ApplyOutcome::Routed {
+            detail,
+            theme_refreshed,
+        } = outcome
+        else {
+            // The backend says the pixels are not its business after all.
+            return Ok(None);
+        };
+
+        let mut applied = Applied {
+            reference: reference.trim().to_string(),
+            kind: kind.as_str().to_string(),
+            outputs: selected.iter().map(|output| output.name.clone()).collect(),
+            // Nothing was decoded or presented here, so there is no surface size
+            // and no frame count to report. Empty is the truthful answer.
+            sizes: Vec::new(),
+            transitions: Vec::new(),
+            frames: Vec::new(),
+            notes: vec![format!("the shell was asked to switch: {detail}")],
+            restored,
+            theme: ThemeRuns {
+                by_owe: 0,
+                by_shell: theme_refreshed,
+            },
+            routed: true,
+        };
+
+        // The double-theme guard, stated where it can be read (TRD §4): the shell
+        // either runs its pipeline or does not, and OWE runs none either way.
+        applied.notes.push(if theme_refreshed {
+            "the shell ran its own theming pipeline (one theme update); OWE ran none".to_string()
+        } else {
+            "shell.caelestia.theme_hook = false: the change carried --no-smart, so the \
+             shell's colour scheme is untouched"
+                .to_string()
+        });
+
+        if let Some(transition) = requested {
+            applied.notes.push(format!(
+                "transition `{}` was not used: in shell-routed mode the shell performs the \
+                 change itself",
+                transition.name
+            ));
+        }
+
+        self.record_applied(&applied)?;
+        Ok(Some(applied))
     }
 
     /// Validate a transition request against the catalogue and the config.
@@ -916,6 +1415,24 @@ impl Engine {
             kind,
             schedule: Schedule::new(chosen.duration_ms, chosen.fps),
         })
+    }
+
+    /// Indexed content kind of a `library:<id>` reference.
+    ///
+    /// The sibling of [`Self::resolve_library_reference`]: the kind cannot be
+    /// derived from the reference itself, so it comes from the same row.
+    fn resolve_library_kind(&self, id: &str) -> Result<ContentKind, EngineError> {
+        let resolver = self
+            .library
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(|| {
+                EngineError::Library(format!(
+                    "`library:{id}` cannot be resolved: this daemon has no library index open"
+                ))
+            })?;
+        resolver.kind_of(id).map_err(EngineError::Library)
     }
 
     /// Resolve a `library:<id>` reference through the injected resolver.
@@ -1567,12 +2084,8 @@ impl Engine {
     pub fn refresh_outputs(&self) -> Result<(Vec<OutputInfo>, ReconcileReport), EngineError> {
         let report = self.start();
         report.backend_failure()?;
-        let listed = match report
-            .backend
-            .as_deref()
-            .and_then(|id| self.registry.get(id))
-            .map(ShellBackend::list_outputs)
-        {
+        let backend = report.backend.as_deref().and_then(|id| self.backend(id));
+        let listed = match backend.as_ref().map(|backend| backend.list_outputs()) {
             Some(Ok(outputs)) => outputs,
             Some(Err(error)) => {
                 tracing::warn!(%error, "cannot list outputs; keeping the previous list");
@@ -1668,6 +2181,8 @@ impl Engine {
     /// Backend ids this build can actually use (registered, not merely known).
     pub fn backend_ids(&self) -> Vec<String> {
         self.registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .ids()
             .iter()
             .map(|id| (*id).to_string())
@@ -2124,18 +2639,28 @@ mod tests {
     #[test]
     fn capabilities_report_only_what_this_build_implements() {
         let engine = engine();
-        assert_eq!(
-            engine.backend_ids(),
-            vec!["hyprland".to_string(), "generic-layer-shell".to_string()],
-            "capabilities must list exactly the registered backends"
-        );
         assert_eq!(engine.content_kinds(), vec![ContentKind::StaticImage]);
 
-        // `caelestia` is planned (P3) and must appear nowhere as if it worked.
-        assert!(
-            !engine.backend_ids().iter().any(|id| id == "caelestia"),
-            "an unimplemented backend must not be advertised as registered"
-        );
+        // The durable invariant, rather than a hardcoded list that goes stale every
+        // phase: everything advertised over IPC must be selectable in a config file,
+        // and nothing else. A backend that exists in the registry but not in
+        // `KNOWN_SHELL_BACKENDS` would be unusable (`shell.backend` would reject
+        // it), so advertising it would be a lie.
+        for id in engine.backend_ids() {
+            assert!(
+                owe_core::config::KNOWN_SHELL_BACKENDS.contains(&id.as_str()),
+                "`{id}` is advertised but `shell.backend` would refuse it"
+            );
+        }
+        for known in owe_core::config::KNOWN_SHELL_BACKENDS {
+            if *known == "auto" {
+                continue;
+            }
+            assert!(
+                engine.backend_ids().iter().any(|id| id == known),
+                "`{known}` is a config-valid backend but nothing implements it"
+            );
+        }
     }
 
     #[test]
@@ -2169,10 +2694,11 @@ mod tests {
     fn an_unknown_backend_is_a_config_error_not_an_internal_fault() {
         // Regression: this used to surface as `INTERNAL: auto is not available:
         // unknown shell backend `caelestia``, which blames the wrong thing and
-        // gives the user no way to act on it.
+        // gives the user no way to act on it. `caelestia` itself became a real
+        // backend in P3, so the example is now an id no build will ever have.
         let config = Config {
             shell: owe_core::config::ShellConfig {
-                backend: "caelestia".to_string(),
+                backend: "kwin".to_string(),
                 ..owe_core::config::ShellConfig::default()
             },
             ..Config::default()
@@ -2182,16 +2708,18 @@ mod tests {
 
         let error = engine
             .apply("/tmp/whatever.png", &OutputTarget::All)
-            .expect_err("caelestia is not implemented in this build");
+            .expect_err("kwin is not implemented in this build");
         let text = error.to_string();
         assert!(
-            text.contains("unknown shell backend `caelestia`"),
+            text.contains("unknown shell backend `kwin`"),
             "the error must name the backend the user asked for: {text}"
         );
-        assert!(
-            text.contains("this build has: hyprland, generic-layer-shell"),
-            "the error must list what does exist: {text}"
-        );
+        for id in engine.backend_ids() {
+            assert!(
+                text.contains(&id),
+                "the error must list what does exist ({id} missing): {text}"
+            );
+        }
         assert!(
             !text.contains("auto"),
             "`auto` is not what the user asked for and must not be blamed: {text}"
@@ -2299,6 +2827,73 @@ mod tests {
         );
     }
 
+    /// P3's live-session find: `resolved_kind()` ran before the library was
+    /// consulted, so a `library:` reference was always refused with the very
+    /// error that described the fix — "its content kind is resolved from the
+    /// library database". Both orders are wrong for every mode, so both paths
+    /// get a test: this one proves the reference *routes* to a shell-routed
+    /// backend with the resolved file; the next proves the drawn path decodes it.
+    #[test]
+    fn a_library_reference_routes_to_a_shell_routed_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.shell.backend = "caelestia".to_string();
+        let engine = engine_in(dir.path(), config);
+        engine.set_library(Arc::new(FakeLibrary(dir.path().to_path_buf())));
+
+        let shell =
+            RoutingShell::shell(DrawMode::ShellRouted, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell.clone());
+
+        let applied = engine
+            .apply("library:2", &OutputTarget::All)
+            .expect("a library reference resolves through the row, not the reference syntax");
+        assert!(applied.routed, "shell-routed mode must route, not draw");
+        assert_eq!(applied.reference, "library:2");
+        assert_eq!(
+            shell.calls(),
+            vec![None],
+            "a whole-session reference reaches the shell as a whole-session request"
+        );
+    }
+
+    /// The same bug, daemon-drawn half: the resolver is consulted for the path
+    /// and the row's kind is what decides renderability — before any GPU or
+    /// session work, so this fails on CI exactly as it does here.
+    #[test]
+    fn a_library_reference_resolves_before_kind_validation_in_drawn_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.shell.backend = "caelestia".to_string();
+        let engine = engine_in(dir.path(), config);
+        engine.set_library(Arc::new(FakeLibrary(dir.path().to_path_buf())));
+
+        let shell = RoutingShell::shell(DrawMode::DaemonDrawn, false, vec![]);
+        engine.register_backend(shell);
+
+        let error = engine
+            .apply("library:2", &OutputTarget::All)
+            .expect_err("the resolver answered, so the kind question is settled; what fails next\n             depends on the environment (outputs, GPU), which other tests cover");
+        let text = error.to_string();
+        assert!(
+            !text.contains("content kind is resolved"),
+            "the kind must come from the row, not block the apply: {text}"
+        );
+    }
+
+    #[test]
+    fn a_library_reference_without_an_open_index_names_the_missing_dependency() {
+        let engine = engine();
+        let error = engine
+            .apply("library:7", &OutputTarget::All)
+            .expect_err("no resolver was injected");
+        let text = error.to_string();
+        assert!(
+            text.contains("no library index open"),
+            "the error must name the missing resolver, not the kind: {text}"
+        );
+    }
+
     #[test]
     fn selecting_an_unknown_output_is_a_clear_error() {
         let engine = engine();
@@ -2323,6 +2918,348 @@ mod tests {
         assert!(
             !text.contains("No such file"),
             "target validation must come before decoding: {text}"
+        );
+    }
+
+    // --- the shell registry (FR-SHELL-1, FR-SHELL-4) -------------------------
+
+    #[test]
+    fn every_known_backend_is_registered_in_auto_chain_order() {
+        // The registry, not a config file, is what makes the `auto` chain true, and
+        // the order of registration is the order `auto` walks when the config does
+        // not override it. Asserting equality means a backend added in the wrong
+        // place (or forgotten) shows up here rather than as a surprise pick.
+        let engine = engine();
+        assert_eq!(
+            engine.backend_ids(),
+            owe_core::shell::default_detect_order(),
+            "the registered backends must be exactly the auto chain"
+        );
+    }
+
+    #[test]
+    fn a_backend_registered_at_runtime_is_selectable_by_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.shell.backend = "owe-test-shell".to_string();
+        let engine = engine_in(dir.path(), config);
+
+        let shell = Arc::new(RoutingShell {
+            id: "owe-test-shell",
+            outputs: vec![output("eDP-1", "Panel")],
+            mode: DrawMode::ShellRouted,
+            theme_refreshed: true,
+            refuse_specific_output: false,
+            calls: Mutex::new(Vec::new()),
+        });
+        engine.register_backend(shell.clone());
+
+        let applied = engine
+            .apply("/tmp/wall.png", &OutputTarget::All)
+            .expect("the registered backend is selected by id and routes the apply");
+        assert!(applied.routed);
+        assert_eq!(shell.calls().len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_backend_is_a_precise_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.shell.backend = "kde".to_string();
+        let engine = engine_in(dir.path(), config);
+
+        let error = engine
+            .apply("/tmp/wall.png", &OutputTarget::All)
+            .expect_err("`kde` is not a backend this build has");
+        match &error {
+            EngineError::ShellSelection(SelectError::UnknownBackend {
+                requested,
+                available,
+            }) => {
+                assert_eq!(requested, "kde");
+                // The list is the registry's own ids, so it cannot go stale.
+                for id in engine.backend_ids() {
+                    assert!(available.contains(&id), "{available} lacks {id}");
+                }
+            }
+            other => panic!("expected an unknown-backend error, got {other:?}"),
+        }
+    }
+
+    // --- shell-routed mode (FR-SHELL-3, TRD §4) -----------------------------
+
+    /// A backend that owns the pixels and records what it was asked to do.
+    ///
+    /// Stands in for Caelestia: the daemon's job is to decide *that* the shell owns
+    /// them and to hand over a wallpaper, and the shell's job is to run its CLI. The
+    /// CLI half is proven in `owe-shell-caelestia`'s stub tests; this proves the
+    /// daemon's half without spawning anything.
+    #[derive(Debug, Default)]
+    struct RoutingShell {
+        id: &'static str,
+        outputs: Vec<OutputInfo>,
+        mode: DrawMode,
+        theme_refreshed: bool,
+        /// Caelestia refuses a named output because its CLI has no per-monitor
+        /// target (OQ-2). Configurable so a future shell that *can* address one
+        /// monitor is expressible here too.
+        refuse_specific_output: bool,
+        calls: Mutex<Vec<Option<String>>>,
+    }
+
+    impl RoutingShell {
+        fn shell(mode: DrawMode, theme_refreshed: bool, outputs: Vec<OutputInfo>) -> Arc<Self> {
+            Arc::new(Self {
+                id: "caelestia",
+                outputs,
+                mode,
+                theme_refreshed,
+                refuse_specific_output: true,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<Option<String>> {
+            self.calls
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    /// A library resolver backed by real files on disk, so a `library:` apply
+    /// exercises the row → kind → path → routed-apply chain without SQLite.
+    struct FakeLibrary(PathBuf);
+
+    impl LibraryResolver for FakeLibrary {
+        fn resolve(&self, id: &str) -> Result<PathBuf, String> {
+            let id: u32 = id
+                .trim()
+                .parse()
+                .map_err(|_| format!("`{id}` is not a library id"))?;
+            match id {
+                1 => Ok(self.0.join("one.png")),
+                2 => Ok(self.0.join("two.png")),
+                other => Err(format!("library item {other} is not in the index")),
+            }
+        }
+
+        fn kind_of(&self, id: &str) -> Result<ContentKind, String> {
+            let _ = self.resolve(id)?;
+            Ok(ContentKind::StaticImage)
+        }
+    }
+
+    impl ShellBackend for RoutingShell {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn detect(&self, _env: owe_core::shell::EnvLookup<'_>) -> bool {
+            true
+        }
+
+        fn list_outputs(&self) -> Result<Vec<OutputInfo>, ShellError> {
+            Ok(self.outputs.clone())
+        }
+
+        fn draw_mode(&self, _config: &owe_core::config::ShellConfig) -> DrawMode {
+            self.mode
+        }
+
+        fn apply_wallpaper(
+            &self,
+            _config: &owe_core::config::ShellConfig,
+            output: Option<&str>,
+            wallpaper: &str,
+        ) -> Result<ApplyOutcome, ShellError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(output.map(str::to_string));
+            }
+            if let Some(name) = output
+                && self.refuse_specific_output
+            {
+                return Err(ShellError::Backend {
+                    backend: self.id.to_string(),
+                    detail: format!("cannot set `{name}` alone"),
+                });
+            }
+            Ok(ApplyOutcome::Routed {
+                detail: format!("{wallpaper} via the shell"),
+                theme_refreshed: self.theme_refreshed,
+            })
+        }
+    }
+
+    fn routed_config(mode: &str) -> Config {
+        let mut config = Config::default();
+        config.shell.backend = "caelestia".to_string();
+        config.shell.caelestia.mode = mode.to_string();
+        config
+    }
+
+    #[test]
+    fn a_routed_apply_asks_the_shell_once_for_the_whole_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell = RoutingShell::shell(
+            DrawMode::ShellRouted,
+            true,
+            vec![output("eDP-1", "Panel"), output("HDMI-A-1", "Dell")],
+        );
+        engine.register_backend(shell.clone());
+
+        let applied = engine
+            .apply("/walls/a.png", &OutputTarget::All)
+            .expect("the shell takes a whole-session change");
+
+        assert!(applied.routed, "the reply says the shell did it");
+        assert_eq!(
+            applied.outputs,
+            vec!["eDP-1".to_string(), "HDMI-A-1".to_string()],
+            "a session-wide change is on every output it covers"
+        );
+        assert!(
+            applied.sizes.is_empty() && applied.frames.is_empty(),
+            "OWE presented nothing, so it reports no size and no frames"
+        );
+        assert_eq!(
+            shell.calls(),
+            vec![None],
+            "one call, with no output: the shell sets the session"
+        );
+    }
+
+    #[test]
+    fn the_theme_runs_exactly_once_in_routed_mode() {
+        // The double-theme guard (TRD §4). "Exactly once" is two claims: the shell
+        // runs its pipeline, and OWE runs none of its own.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell =
+            RoutingShell::shell(DrawMode::ShellRouted, true, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell);
+
+        let applied = engine
+            .apply("/walls/a.png", &OutputTarget::All)
+            .expect("routed");
+        assert_eq!(applied.theme.total(), 1, "one theme refresh per apply");
+        assert_eq!(
+            applied.theme.by_owe, 0,
+            "OWE has no theming pipeline to run"
+        );
+        assert!(applied.theme.by_shell, "the shell ran its own");
+        assert!(
+            applied
+                .notes
+                .iter()
+                .any(|note| note.contains("OWE ran none")),
+            "the reply says so where a user can read it: {:?}",
+            applied.notes
+        );
+    }
+
+    #[test]
+    fn theme_hook_off_means_no_theme_run_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell =
+            RoutingShell::shell(DrawMode::ShellRouted, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell);
+
+        let applied = engine
+            .apply("/walls/a.png", &OutputTarget::All)
+            .expect("routed");
+        assert_eq!(
+            applied.theme.total(),
+            0,
+            "with theme_hook = false nothing themes, so nothing can theme twice"
+        );
+        assert!(
+            applied.notes.iter().any(|note| note.contains("no-smart")),
+            "{:?}",
+            applied.notes
+        );
+    }
+
+    #[test]
+    fn a_routed_apply_is_recorded_for_restore() {
+        // Restore reads the session file, so a routed apply that did not record
+        // itself would come back as nothing after a restart — the same class of bug
+        // the P2 exit gate found in `reconcile_outputs`.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell =
+            RoutingShell::shell(DrawMode::ShellRouted, true, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell);
+
+        engine
+            .apply("/walls/a.png", &OutputTarget::All)
+            .expect("routed");
+
+        let saved = SessionState::load(&dir.path().join("state").join("session.json"));
+        assert!(saved.warnings.is_empty(), "{:?}", saved.warnings);
+        let entry = saved
+            .state
+            .get("eDP-1")
+            .expect("the output is in the session file");
+        assert_eq!(entry.reference, "/walls/a.png");
+        assert_eq!(entry.kind, "static-image");
+    }
+
+    #[test]
+    fn a_per_output_request_is_passed_to_the_shell_and_its_refusal_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell = RoutingShell::shell(
+            DrawMode::ShellRouted,
+            true,
+            vec![output("eDP-1", "Panel"), output("HDMI-A-1", "Dell")],
+        );
+        engine.register_backend(shell.clone());
+
+        let error = engine
+            .apply("/walls/a.png", &OutputTarget::Named("eDP-1".to_string()))
+            .expect_err("Caelestia has no per-monitor target (OQ-2)");
+
+        assert_eq!(
+            shell.calls(),
+            vec![Some("eDP-1".to_string())],
+            "the request is passed on, not quietly widened to every output"
+        );
+        assert!(
+            matches!(error, EngineError::Shell(_)),
+            "the shell's refusal is the answer, not a fallback draw: {error:?}"
+        );
+        assert!(error.to_string().contains("eDP-1"), "{error}");
+
+        // And nothing was recorded: the wall is unchanged, so the session must not
+        // claim otherwise.
+        let saved = SessionState::load(&dir.path().join("state").join("session.json"));
+        assert!(saved.state.get("eDP-1").is_none());
+    }
+
+    #[test]
+    fn daemon_drawn_mode_leaves_the_shell_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("daemon-drawn"));
+        let shell =
+            RoutingShell::shell(DrawMode::DaemonDrawn, true, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell.clone());
+
+        // The draw path runs and fails on the file, not on routing: in this mode the
+        // shell is not consulted at all, which is what the user asked for by
+        // choosing `daemon-drawn`.
+        let error = engine
+            .apply("/walls/does-not-exist.png", &OutputTarget::All)
+            .expect_err("there is no such file");
+        assert!(
+            matches!(error, EngineError::Media(_)),
+            "the draw path answered: {error:?}"
+        );
+        assert!(
+            shell.calls().is_empty(),
+            "a daemon-drawn shell is never asked to route"
         );
     }
 }
