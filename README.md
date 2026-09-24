@@ -15,13 +15,17 @@ A low-resource live-wallpaper engine and manager for Wayland Linux, targeting **
 > daemon auto-detects it, routes wallpaper changes through the shell in `shell-routed`
 > mode (the shell keeps its theming pipeline; OWE runs none — no double-theme), streams
 > Hyprland socket2 events into a typed event bus, and warns about `hyprpaper`/`swww`
-> coexistence. **Animated images, video, shader wallpapers, and the resource governor are
-> not implemented** (Phases 4–6) — the daemon reports them as `not in this build` instead
-> of pretending. Performance targets stay `UNVERIFIED` until the Phase 6 benchmark
-> publishes measurements.
+> coexistence. **Animated images and video decode but do not play yet:** Phase 4's decode
+> layer landed (GIF/APNG/WebP frames with container timing, a bounded compressed frame
+> cache, video through GStreamer with an FFmpeg fallback, and `render.fit`), while the
+> frame-pacing and playback half of that phase is still open, so the daemon reports both
+> as `not in this build` rather than advertising a wallpaper that would never move.
+> **Shader wallpapers and the resource governor are not implemented** (Phases 5–6).
+> Performance targets stay `UNVERIFIED` until the Phase 6 benchmark publishes measurements.
 >
 > Evidence tables (commands + observed results) are in
-> [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) §0.1, §1.1, §2.1, and §3.1.
+> [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) §0.1, §1.1, §2.1, §3.1,
+> and §4.1.
 
 ## Documentation
 

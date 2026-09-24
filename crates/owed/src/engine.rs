@@ -1100,9 +1100,25 @@ impl Engine {
             }
         };
 
-        // P1 renders still images. Named, explicit failure for everything else
-        // rather than a confusing decode error.
-        owe_media::ensure_supported(kind)?;
+        // What this build can *present* is the gate, not what the decode layer can
+        // turn into frames: P4 taught `owe-media` to decode animated images and
+        // video, but no playback loop paces or draws those frames yet, so accepting
+        // one here would book a wallpaper that never moves. Reading the same list
+        // `capabilities` publishes is also what makes it impossible for
+        // `wallpaper.set` and `capabilities.content_kinds` to disagree.
+        let presentable = self.content_kinds();
+        if !presentable.contains(&kind) {
+            let rendered = presentable
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(EngineError::Unsupported(format!(
+                "`{}` wallpapers are not supported by this build yet: it renders {rendered}, \
+                 and the rest waits on the frame-pacing half of P4 (docs/IMPLEMENTATION-PLAN.md)",
+                kind.as_str()
+            )));
+        }
 
         // The transition *request* is validated on the same rule, and it has to
         // happen before `start()` for that rule to hold: asking for a transition
@@ -1209,6 +1225,16 @@ impl Engine {
         self.record_applied(&applied)?;
 
         Ok(applied)
+    }
+
+    /// How the configured fit mode maps onto the renderer's scaling modes
+    /// (TRD FR-LIVE-4).
+    ///
+    /// The config validator already rejects an unknown value, so the fallback here
+    /// is only reachable for a config built in code; it keeps the renderer's own
+    /// default rather than inventing one.
+    fn fit(&self) -> Scaling {
+        Scaling::parse(&self.config.render.fit).unwrap_or_default()
     }
 
     /// Whether a resolved selection covers every drawable output.
@@ -1651,7 +1677,7 @@ impl Engine {
                 current_size,
                 decoded.size(),
                 decoded.pixels(),
-                Scaling::Cover,
+                self.fit(),
                 PixelFormat::Bgra8,
                 BACKGROUND,
             )?;
@@ -1850,7 +1876,7 @@ impl Engine {
             (from.pixels(), from.size()),
             (to.pixels(), to.size()),
             kind,
-            Scaling::Cover,
+            self.fit(),
             PixelFormat::Bgra8,
         )?;
         Ok((
@@ -2101,6 +2127,13 @@ impl Engine {
     }
 
     /// Content kinds this build can actually render.
+    ///
+    /// Still images only, and P4 is why the wording matters: `owe-media` can now
+    /// decode animated images and video, but presenting either needs a pacing loop
+    /// this daemon does not have yet, and `wallpaper.set` would accept a kind it can
+    /// only draw one frozen frame of. The machine's *decode* capability is reported
+    /// separately (`owe_media::media_backends()`, surfaced by `capabilities`), so
+    /// the two lists answer two questions instead of one list being quietly wrong.
     pub fn content_kinds(&self) -> Vec<ContentKind> {
         vec![ContentKind::StaticImage]
     }
@@ -2640,6 +2673,13 @@ mod tests {
     fn capabilities_report_only_what_this_build_implements() {
         let engine = engine();
         assert_eq!(engine.content_kinds(), vec![ContentKind::StaticImage]);
+        // The gap is deliberate and pinned: P4's decode layer knows more kinds than
+        // the presenter can pace, and a future pass that wires playback up has to
+        // edit this assertion rather than discovering the mismatch in a GUI.
+        assert!(
+            owe_media::content_kinds().len() > engine.content_kinds().len(),
+            "aside from the decode/present split: decoding stays ahead of presenting"
+        );
 
         // The durable invariant, rather than a hardcoded list that goes stale every
         // phase: everything advertised over IPC must be selectable in a config file,
@@ -2794,10 +2834,42 @@ mod tests {
     }
 
     #[test]
+    fn the_configured_fit_mode_is_the_transform_the_renderer_is_given() {
+        // FR-LIVE-4 is a *config* item, so the value has to survive the journey from
+        // `render.fit` to the transform `present_direct` hands the renderer — a
+        // setting that silently degrades to `fill` is the failure this pins. The
+        // other half (the four ending up as four different pictures) is pixel-level
+        // and lives in `owe-render/tests/animated_frames.rs`, where a GPU is needed.
+        let dir = tempfile::tempdir().unwrap();
+        let mut modes = Vec::new();
+        for value in owe_core::config::KNOWN_FIT_MODES {
+            let mut config = Config::default();
+            config.render.fit = (*value).to_string();
+            let engine = engine_in(dir.path(), config);
+            modes.push((*value, engine.fit()));
+        }
+
+        assert_eq!(modes.len(), 4, "the TRD names four modes (FR-LIVE-4)");
+        for (value, scaling) in &modes {
+            assert_eq!(
+                scaling.as_str(),
+                *value,
+                "`{value}` must arrive at the renderer as itself, not as {} ",
+                Scaling::default().as_str()
+            );
+        }
+
+        // And a config built in code — the validator never sees it — still cannot
+        // smuggle in a fifth mode: parsing is the last gate before the transform.
+        assert_eq!(Scaling::parse("diagonal"), None);
+    }
+
+    #[test]
     fn applying_an_unsupported_kind_says_so_rather_than_decoding() {
         let engine = engine();
-        // A video is a valid reference but not renderable in P1. The error must
-        // name the kind, not pretend the file is broken.
+        // A video is a valid reference and, since P4, decodable — but still not
+        // *renderable*: no playback loop paces the frames yet, so `wallpaper.set`
+        // must refuse it by name rather than pretend the file is broken.
         let error = engine
             .apply("/tmp/movie.mp4", &OutputTarget::All)
             .expect_err("videos are not supported yet");

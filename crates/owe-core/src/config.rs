@@ -41,6 +41,14 @@ pub const KNOWN_MEDIA_BACKENDS: &[&str] = &["auto", "gstreamer", "ffmpeg"];
 /// Built-in transition names. The gl-transitions catalogue joins this list in P2.
 pub const KNOWN_TRANSITIONS: &[&str] = &["none", "fade", "wipe", "slide", "grow", "wave", "outer"];
 
+/// Fit modes the render path implements (TRD FR-LIVE-4 / NFR-UX-2).
+///
+/// The names are the TRD's words, and every one of them is implemented rather
+/// than aliased: `fill` crops to cover, `fit` letterboxes, `center` draws at the
+/// source's own size in the middle, `stretch` distorts. A list of spellings that
+/// all meant `cover` would be a config surface lying about its own behaviour.
+pub const KNOWN_FIT_MODES: &[&str] = &["fill", "fit", "center", "stretch"];
+
 /// Caelestia integration modes (P3).
 pub const KNOWN_CAELESTIA_MODES: &[&str] = &["shell-routed", "daemon-drawn"];
 
@@ -269,6 +277,8 @@ pub struct RenderConfig {
     pub default_transition: Transition,
     /// Transition ids a user is allowed to select.
     pub allow_transitions: Vec<String>,
+    /// How content is fitted onto an output; see [`KNOWN_FIT_MODES`].
+    pub fit: String,
     /// Buffer-pool limits.
     pub buffering: BufferingConfig,
 }
@@ -278,6 +288,7 @@ impl Default for RenderConfig {
         Self {
             default_transition: Transition::default(),
             allow_transitions: KNOWN_TRANSITIONS.iter().map(|s| (*s).to_string()).collect(),
+            fit: "fill".to_string(),
             buffering: BufferingConfig::default(),
         }
     }
@@ -285,6 +296,7 @@ impl Default for RenderConfig {
 
 impl RenderConfig {
     fn validate(&self, problems: &mut Vec<String>) {
+        one_of(problems, "render.fit", &self.fit, KNOWN_FIT_MODES);
         if self.allow_transitions.is_empty() {
             problems.push("render.allow_transitions: must allow at least `none`".to_string());
         }
@@ -998,6 +1010,27 @@ mod tests {
         let problems = errors("[render.buffering]\nmax_in_flight = 99\n");
         assert_has(&problems, "max_in_flight");
         assert_has(&problems, "1..=8");
+    }
+
+    #[test]
+    fn the_fit_mode_defaults_to_fill_and_rejects_a_typo() {
+        // FR-LIVE-4 gives the render path four fit modes; the config key has to
+        // accept exactly those and nothing else, or a typo would silently pick
+        // whichever mode the renderer happened to default to.
+        assert_eq!(Config::default().render.fit, "fill");
+        assert_eq!(KNOWN_FIT_MODES, &["fill", "fit", "center", "stretch"]);
+
+        let typo = errors("[render]\nfit = \"squish\"\n");
+        assert_has(&typo, "render.fit");
+        assert_has(&typo, "squish");
+
+        for mode in KNOWN_FIT_MODES {
+            let found = problems(&format!("[render]\nfit = \"{mode}\"\n"));
+            assert!(
+                found.is_empty(),
+                "`{mode}` is documented and must validate: {found:?}"
+            );
+        }
     }
 
     #[test]

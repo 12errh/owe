@@ -1,0 +1,19 @@
+Analyzing file:///home/rehan/Projects/FP/wallpaper/crates/owe-media/tests/fixtures/video-5frame.mp4
+Done discovering file:///home/rehan/Projects/FP/wallpaper/crates/owe-media/tests/fixtures/video-5frame.mp4
+
+Properties:
+  Duration: 0:00:00.500000000
+  Seekable: yes
+  Live: no
+  container #0: Quicktime
+    video #1: H.264 (High Profile)
+      Stream ID: 3624823473c89b5c1842cddeb4048f27c27412f82273dc4994aabee510608b03/001
+      Width: 64
+      Height: 48
+      Depth: 24
+      Frame rate: 10/1
+      Pixel aspect ratio: 1/1
+      Interlaced: false
+      Bitrate: 94768
+      Max bitrate: 94768
+

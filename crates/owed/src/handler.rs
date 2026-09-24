@@ -50,9 +50,6 @@ pub const IMPLEMENTED_METHODS: &[&str] = &[
     method::CONFIG_PATCH,
 ];
 
-/// Media decode backends this build actually has.
-const IMPLEMENTED_MEDIA_BACKENDS: &[&str] = &["image"];
-
 /// Features the project plans and this build does not have, reported through
 /// `capabilities.unavailable` so a client can say so instead of staying silent.
 ///
@@ -64,11 +61,25 @@ const KNOWN_BUT_NOT_YET: &[(&str, &str)] = &[
     // deleted rather than reworded, and it now appears in `shell_backends` (which
     // is the registry's own answer). The list exists so a client can say "planned"
     // instead of staying silent, not so it can stay populated.
+    //
+    // The two media entries were reworded in P4 rather than deleted, because P4
+    // split their work in half: `owe-media` now decodes GIF/APNG/WebP and video,
+    // and this build can prove it with frames (see `crates/owe-media/tests/`), but
+    // nothing paces or presents those frames yet — so `wallpaper.set` still
+    // refuses them. Saying "decode landed, playback not wired" is the honest
+    // sentence; saying "planned for P4" now would be the drift.
     (
         "animated-image",
-        "content kind planned for P4 (decode + frame pacing)",
+        "P4 landed the decode (frames, container timing, bounded cache) in owe-media, but no playback \
+         loop paces or presents it, so `wallpaper.set` refuses GIF/APNG/WebP; by decision this list \
+         names what cannot be rendered, not what cannot be decoded",
     ),
-    ("video", "content kind planned for P4 (GStreamer path)"),
+    (
+        "video",
+        "P4 landed the decode behind GStreamer/FFmpeg when either is installed, but there is no \
+         playback (pacing, play/pause) wired into the daemon; by decision a content kind is \
+         advertised only once it can actually play",
+    ),
     (
         "shader",
         "content kind planned for P5 (WGSL packs, previews)",
@@ -345,7 +356,14 @@ impl IpcHandler {
                 .iter()
                 .map(|kind| kind.as_str().to_string())
                 .collect(),
-            media_backends: IMPLEMENTED_MEDIA_BACKENDS
+            // Decode backends the *machine* can drive, probed rather than promised:
+            // `image` is always there, `gstreamer`/`ffmpeg` appear only when their
+            // binaries are on PATH. Note this list is intentionally wider than
+            // `content_kinds` above — decoding video and presenting it are different
+            // capabilities, and `protocol.rs` documents both that way. A client must
+            // not read "ffmpeg" as "video wallpapers play"; the `unavailable` entry
+            // below says which half is missing.
+            media_backends: owe_media::media_backends()
                 .iter()
                 .map(|id| (*id).to_string())
                 .collect(),
@@ -1165,10 +1183,53 @@ mod tests {
     }
 
     #[test]
-    fn content_kinds_are_limited_to_what_decodes() {
+    fn content_kinds_are_limited_to_what_the_daemon_can_really_present() {
+        // `content_kinds` is what `wallpaper.set` accepts, so it lags the decode
+        // layer on purpose: P4 taught `owe-media` to produce GIF and video frames,
+        // but until pacing and playback are wired in, advertising those kinds here
+        // would promise a wallpaper that never moves.
         let capabilities = handler().capabilities();
         assert_eq!(capabilities.content_kinds, vec!["static-image".to_string()]);
-        assert_eq!(capabilities.media_backends, vec!["image".to_string()]);
+
+        // `media_backends` answers the other question — which decoders this build
+        // can drive — and it is the probe's list, never a hand-written wish list.
+        let probed: Vec<String> = owe_media::media_backends()
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        assert_eq!(capabilities.media_backends, probed);
+        assert!(capabilities.media_backends.contains(&"image".to_string()));
+    }
+
+    #[test]
+    fn nothing_offered_as_a_decode_backend_is_merely_hoped_for() {
+        let capabilities = handler().capabilities();
+        for runtime in owe_media::video_runtimes() {
+            let advertised = capabilities
+                .media_backends
+                .iter()
+                .any(|id| id == runtime.runtime.as_str());
+            assert_eq!(
+                advertised,
+                runtime.available,
+                "`{}` must be advertised exactly when its own probe says it works: {}",
+                runtime.runtime.as_str(),
+                runtime.detail
+            );
+        }
+
+        // And every kind the daemon cannot present is named, never silently absent:
+        // "this build does not do video" is an answer, "no entry" is not.
+        for kind in ["animated-image", "video"] {
+            assert!(!capabilities.content_kinds.contains(&kind.to_string()));
+            assert!(
+                capabilities
+                    .unavailable
+                    .iter()
+                    .any(|entry| entry.starts_with(&format!("{kind}:"))),
+                "`{kind}` is neither renderable nor explained"
+            );
+        }
     }
 
     #[test]

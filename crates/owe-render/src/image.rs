@@ -40,32 +40,46 @@ impl PixelFormat {
 }
 
 /// How an image is fitted onto an output.
+///
+/// The four modes are the ones TRD FR-LIVE-4 names, and each is a distinct
+/// calculation rather than a spelling of `Cover`: `center` in particular draws the
+/// source at its own size, which is the only mode that can show a small image
+/// without enlarging it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Scaling {
-    /// Fill the output, cropping the overflow. The default.
+    /// Fill the output, cropping the overflow. The default (`fill` in config).
     #[default]
     Cover,
-    /// Show the whole image, leaving background bars.
+    /// Show the whole image, leaving background bars (`fit` in config).
     Contain,
-    /// Distort to fill the output exactly.
+    /// Draw the source at its own size, centred; crop the overflow when it is
+    /// larger than the output (`center` in config).
+    Center,
+    /// Distort to fill the output exactly (`stretch` in config).
     Stretch,
 }
 
 impl Scaling {
-    /// Stable id used in config and session state.
+    /// Stable id used in config and stats — the TRD's own spelling.
     pub fn as_str(self) -> &'static str {
         match self {
-            Scaling::Cover => "cover",
-            Scaling::Contain => "contain",
+            Scaling::Cover => "fill",
+            Scaling::Contain => "fit",
+            Scaling::Center => "center",
             Scaling::Stretch => "stretch",
         }
     }
 
     /// Parse a config value.
+    ///
+    /// Both spellings of the first two modes are accepted: `fill`/`cover` and
+    /// `fit`/`contain` are the same calculation, and the config validator offers
+    /// the TRD's names ([`owe_core::config::KNOWN_FIT_MODES`]).
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "cover" | "fill" => Some(Scaling::Cover),
             "contain" | "fit" => Some(Scaling::Contain),
+            "center" => Some(Scaling::Center),
             "stretch" => Some(Scaling::Stretch),
             _ => None,
         }
@@ -156,6 +170,26 @@ pub fn plan(source: (u32, u32), target: (u32, u32), mode: Scaling) -> QuadPlan {
                 clip_offset: [0.0, 0.0],
                 uv_scale: [1.0, 1.0],
                 uv_offset: [0.0, 0.0],
+            }
+        }
+        Scaling::Center => {
+            // No scaling at all: one source pixel is one output pixel. The quad is
+            // therefore the source's size relative to the output — smaller than
+            // the screen for a small image (bars all round), and exactly the screen
+            // for a larger one, where the texture window is cropped instead so the
+            // middle of the picture survives.
+            let quad_u = (f64::from(source_w) / f64::from(target_w)).min(1.0);
+            let quad_v = (f64::from(source_h) / f64::from(target_h)).min(1.0);
+            let visible_u = (f64::from(target_w) / f64::from(source_w)).min(1.0);
+            let visible_v = (f64::from(target_h) / f64::from(source_h)).min(1.0);
+            QuadPlan {
+                clip_scale: [quad_u as f32, quad_v as f32],
+                clip_offset: [0.0, 0.0],
+                uv_scale: [visible_u as f32, visible_v as f32],
+                uv_offset: [
+                    ((1.0 - visible_u) / 2.0) as f32,
+                    ((1.0 - visible_v) / 2.0) as f32,
+                ],
             }
         }
     }
@@ -441,6 +475,60 @@ mod tests {
     }
 
     #[test]
+    fn center_draws_a_small_image_at_its_own_size() {
+        // A 100×100 picture on a 400×200 output: a quarter of the width and half
+        // the height, the whole texture, centred — and explicitly *not* enlarged,
+        // which is what distinguishes `center` from `cover` and `fit`.
+        let plan = plan((100, 100), (400, 200), Scaling::Center);
+        assert!((plan.clip_scale[0] - 0.25).abs() < 1e-6, "{plan:?}");
+        assert!((plan.clip_scale[1] - 0.5).abs() < 1e-6, "{plan:?}");
+        assert_eq!(plan.clip_offset, [0.0, 0.0], "centred, not anchored");
+        assert_eq!(plan.uv_scale, [1.0, 1.0], "the whole texture is sampled");
+        assert_eq!(plan.uv_offset, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn center_crops_a_large_image_to_its_middle() {
+        // The same mode with the sizes swapped: the quad fills the output and the
+        // middle quarter of the texture is shown, exactly like `cover` at 1:1.
+        let plan = plan((400, 200), (100, 50), Scaling::Center);
+        assert_eq!(plan.clip_scale, [1.0, 1.0]);
+        assert!((plan.uv_scale[0] - 0.25).abs() < 1e-6, "{plan:?}");
+        assert!((plan.uv_scale[1] - 0.25).abs() < 1e-6, "{plan:?}");
+        assert!((plan.uv_offset[0] - 0.375).abs() < 1e-6, "{plan:?}");
+        assert!((plan.uv_offset[1] - 0.375).abs() < 1e-6, "{plan:?}");
+    }
+
+    #[test]
+    fn center_is_a_distinct_calculation_from_the_other_three() {
+        // The config offers four named modes (TRD FR-LIVE-4); if any two produced
+        // the same plan for every size, one of them would be a spelling rather than
+        // a behaviour.
+        //
+        // The size pair is deliberate: a source that is *wider and shorter* than the
+        // output is the case that separates all four. A source larger in both axes
+        // makes `center` and `fill` agree by construction — both then crop the middle
+        // at native size, which is what `center_crops_a_large_image_to_its_middle`
+        // asserts on purpose — so demanding four distinct plans from *that* size
+        // would be asserting a falsehood rather than pinning a behaviour.
+        let modes = [
+            Scaling::Cover,
+            Scaling::Contain,
+            Scaling::Center,
+            Scaling::Stretch,
+        ];
+        let plans: Vec<QuadPlan> = modes
+            .iter()
+            .map(|mode| plan((100, 300), (200, 200), *mode))
+            .collect();
+        for (index, left) in plans.iter().enumerate() {
+            for right in plans.iter().skip(index + 1) {
+                assert_ne!(left, right, "two fit modes produce the same plan");
+            }
+        }
+    }
+
+    #[test]
     fn degenerate_sizes_produce_an_identity_instead_of_nan() {
         for (source, target) in [((0, 10), (10, 10)), ((10, 10), (0, 0)), ((0, 0), (0, 0))] {
             let plan = plan(source, target, Scaling::Cover);
@@ -452,7 +540,12 @@ mod tests {
 
     #[test]
     fn scaling_ids_round_trip() {
-        for mode in [Scaling::Cover, Scaling::Contain, Scaling::Stretch] {
+        for mode in [
+            Scaling::Cover,
+            Scaling::Contain,
+            Scaling::Center,
+            Scaling::Stretch,
+        ] {
             assert_eq!(Scaling::parse(mode.as_str()), Some(mode));
         }
         assert_eq!(Scaling::parse(" COVER "), Some(Scaling::Cover));

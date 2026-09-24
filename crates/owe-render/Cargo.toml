@@ -28,6 +28,11 @@ calloop-wayland-source = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the render path's contract with the media layer is "RGBA8 buffers of
+# a known size", and `tests/animated_frames.rs` proves it against real decoded
+# frames rather than hand-built ones. Nothing in this crate depends on decoding at
+# runtime (BACKEND-DESIGN §1).
+owe-media = { workspace = true }
 
 # NOTE: `unsafe_code` stays at the workspace default (warn). This crate is where
 # reviewed unsafe will appear for dma-buf importing from P4; every use needs a

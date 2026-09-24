@@ -30,6 +30,10 @@ wallpapers_dir = "$CAELESTIA_WALLPAPERS_DIR"
 theme_hook = true
 
 [render]
+# How a wallpaper is fitted to an output (TRD FR-LIVE-4): "fill" (cover, may
+# crop) | "fit" (contain, letterboxed) | "center" (own size, centred, never
+# scaled) | "stretch" (ignore the aspect ratio).
+fit = "fill"
 allow_transitions = ["none", "fade", "wipe", "slide", "grow", "wave", "outer"]
 
 [render.default_transition]
