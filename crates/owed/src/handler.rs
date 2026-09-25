@@ -1095,9 +1095,33 @@ impl Handler for IpcHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use owe_core::config::ShellConfig;
+    use owe_core::output::OutputInfo;
     use owe_core::path::XdgPaths;
+    use owe_core::shell::{DrawMode, ShellBackend};
     use owe_ipc::ReplyFrame;
     use owe_ipc::protocol::SchemaVersion;
+
+    #[derive(Debug)]
+    struct HeadlessGeneric;
+
+    impl ShellBackend for HeadlessGeneric {
+        fn id(&self) -> &'static str {
+            "generic-layer-shell"
+        }
+
+        fn detect(&self, _env: owe_core::shell::EnvLookup<'_>) -> bool {
+            true
+        }
+
+        fn list_outputs(&self) -> Result<Vec<OutputInfo>, owe_core::shell::ShellError> {
+            Ok(Vec::new())
+        }
+
+        fn draw_mode(&self, _config: &ShellConfig) -> DrawMode {
+            DrawMode::DaemonDrawn
+        }
+    }
 
     /// A handler over a throwaway XDG tree.
     ///
@@ -1249,6 +1273,9 @@ mod tests {
     #[test]
     fn config_patch_switches_the_backend_and_says_it_is_runtime_only() {
         let (handler, _dir) = handler_in_tree(Config::default());
+        state_of(&handler)
+            .engine()
+            .register_backend(Arc::new(HeadlessGeneric));
         assert_eq!(
             handler.capabilities().shell_backends.len(),
             3,
@@ -1410,14 +1437,13 @@ mod tests {
         // images always (the decoders are compiled in), video only when a runtime is
         // installed, shaders never before P5.
         let capabilities = handler().capabilities();
+        let mut expected = vec!["static-image".to_string(), "animated-image".to_string()];
+        if owe_media::any_video_runtime() {
+            expected.push("video".to_string());
+        }
         assert_eq!(
-            capabilities.content_kinds,
-            vec![
-                "static-image".to_string(),
-                "animated-image".to_string(),
-                "video".to_string()
-            ],
-            "this reference machine has both video runtimes installed"
+            capabilities.content_kinds, expected,
+            "video is advertised exactly when this machine has a runtime"
         );
         assert!(!capabilities.content_kinds.contains(&"shader".to_string()));
 
