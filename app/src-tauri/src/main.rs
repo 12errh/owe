@@ -21,6 +21,7 @@
 // Keeps a console window from appearing next to the GUI on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -81,11 +82,23 @@ impl IpcError {
 /// so the GUI can be pointed at a second daemon, and so the command layer below
 /// can be integration-tested against a stub server on a temporary socket — which
 /// is why it is not read from deep inside the request path.
-fn daemon_socket() -> Result<PathBuf, IpcError> {
-    if let Some(path) = std::env::var_os("OWE_SOCKET").filter(|value| !value.is_empty()) {
+fn socket_from_values(
+    override_socket: Option<&OsStr>,
+    runtime_dir: Option<&OsStr>,
+) -> Result<PathBuf, IpcError> {
+    if let Some(path) = override_socket.filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
-    owe_ipc::default_socket_path().map_err(|error| IpcError::unreachable(error.to_string()))
+    owe_ipc::socket_path_in(runtime_dir).ok_or_else(|| {
+        IpcError::unreachable("XDG_RUNTIME_DIR is not set, so the daemon socket cannot be located")
+    })
+}
+
+fn daemon_socket() -> Result<PathBuf, IpcError> {
+    socket_from_values(
+        std::env::var_os("OWE_SOCKET").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    )
 }
 
 /// Connect, handshake, run one request, disconnect — against a given socket.
@@ -413,13 +426,70 @@ fn clear_wallpaper_on(socket: &Path, output: Option<&str>) -> Result<Vec<String>
     Ok(string_list(&reply, "cleared"))
 }
 
+fn stats_from(socket: &Path, output: Option<&str>) -> Result<StatsView, IpcError> {
+    let mut params = serde_json::Map::new();
+    if let Some(output) = output {
+        params.insert("output".to_string(), serde_json::json!(output));
+    }
+    let reply = with_daemon(socket, |client| {
+        client.call(
+            owe_ipc::protocol::method::STATS_GET,
+            serde_json::Value::Object(params),
+        )
+    })?;
+    let stats = reply["stats"]
+        .as_array()
+        .map(|rows| rows.iter().map(stats_row_from).collect())
+        .unwrap_or_default();
+    Ok(StatsView {
+        stats,
+        rss_bytes: reply["rss_bytes"].as_u64(),
+        paused: reply["paused"].as_bool().unwrap_or(false),
+    })
+}
+
+fn playback_command_from(
+    socket: &Path,
+    output: Option<&str>,
+    command: &serde_json::Value,
+) -> Result<PlaybackResult, IpcError> {
+    let mut params = serde_json::Map::new();
+    if let Some(output) = output {
+        params.insert("output".to_string(), serde_json::json!(output));
+    }
+    params.insert("cmd".to_string(), command.clone());
+    let reply = with_daemon(socket, |client| {
+        client.call(
+            owe_ipc::protocol::method::PLAYBACK_CMD,
+            serde_json::Value::Object(params),
+        )
+    })?;
+    let states = reply["states"]
+        .as_array()
+        .map(|states| states.iter().map(playback_state_from).collect())
+        .or_else(|| {
+            reply
+                .get("state")
+                .filter(|value| value.is_object())
+                .map(|state| vec![playback_state_from(state)])
+        })
+        .unwrap_or_default();
+    Ok(PlaybackResult {
+        ok: reply["ok"].as_bool().unwrap_or(true),
+        states,
+    })
+}
+
 /// `shell.status` → what the backend card shows.
 ///
 /// A failure is not an error dialog: "cannot reach the daemon" is a state the card
 /// displays, the same way the status bar does.
 fn shell_status_from(socket: &Path) -> ShellStatus {
     let reply = match with_daemon(socket, |client| {
-        client.call(owe_ipc::protocol::method::SHELL_STATUS, serde_json::json!({}))
+        client.call(
+            owe_ipc::protocol::method::SHELL_STATUS,
+            serde_json::json!({}),
+        )
     }) {
         Ok(reply) => reply,
         Err(error) => return ShellStatus::unreachable(error.message),
@@ -450,7 +520,10 @@ fn shell_status_from(socket: &Path) -> ShellStatus {
         patched: shell["patched"].as_bool().unwrap_or(false),
         detect_order: string_list(shell, "detect_order"),
         backends,
-        events: reply.get("events").filter(|value| !value.is_null()).cloned(),
+        events: reply
+            .get("events")
+            .filter(|value| !value.is_null())
+            .cloned(),
         competing_tools: reply["competing_tools"]["notices"]
             .as_array()
             .map(|notes| {
@@ -645,6 +718,53 @@ struct ShellPatch {
     detect_order: Option<Vec<String>>,
 }
 
+fn playback_state_from(value: &serde_json::Value) -> PlaybackState {
+    PlaybackState {
+        output: field_str(value, "output"),
+        kind: field_str(value, "kind"),
+        playing: value["playing"].as_bool().unwrap_or(false),
+        held: value["held"].as_bool().unwrap_or(false),
+        position_ms: value["position_ms"].as_u64().unwrap_or(0),
+        fps: value["fps"].as_f64().unwrap_or(0.0),
+        fps_cap: value["fps_cap"].as_u64().map(|value| value as u32),
+        decode: field_str(value, "decode"),
+        decoder: field_str(value, "decoder"),
+        mode: field_str(value, "mode"),
+        buffers: value["buffers"].as_u64().unwrap_or(0) as usize,
+        buffer_bytes: value["buffer_bytes"].as_u64().unwrap_or(0) as usize,
+        buffer_cap_bytes: value["buffer_cap_bytes"].as_u64().unwrap_or(0) as usize,
+        total_frames: value["total_frames"].as_u64(),
+        failed: value["failed"].as_str().map(str::to_string),
+    }
+}
+
+fn stats_row_from(value: &serde_json::Value) -> StatsRow {
+    StatsRow {
+        output: field_str(value, "output"),
+        kind: field_str(value, "kind"),
+        playing: value["playing"].as_bool().unwrap_or(false),
+        held: value["held"].as_bool().unwrap_or(false),
+        position_ms: value["position_ms"].as_u64().unwrap_or(0),
+        fps: value["fps"].as_f64().unwrap_or(0.0),
+        fps_cap: value["fps_cap"].as_u64().map(|value| value as u32),
+        decode: field_str(value, "decode"),
+        decoder: field_str(value, "decoder"),
+        mode: field_str(value, "mode"),
+        buffers: value["buffers"].as_u64().unwrap_or(0) as usize,
+        buffer_bytes: value["buffer_bytes"].as_u64().unwrap_or(0) as usize,
+        buffer_cap_bytes: value["buffer_cap_bytes"].as_u64().unwrap_or(0) as usize,
+        total_frames: value["total_frames"].as_u64(),
+        failed: value["failed"].as_str().map(str::to_string),
+        wallpaper: value["wallpaper"].as_str().map(str::to_string),
+        width: value["width"].as_u64().unwrap_or(0) as u32,
+        height: value["height"].as_u64().unwrap_or(0) as u32,
+        position: value["position"].as_u64(),
+        frames_presented: value["frames_presented"].as_u64().unwrap_or(0),
+        loop_start_ms: value["loop_start_ms"].as_u64(),
+        loop_end_ms: value["loop_end_ms"].as_u64(),
+    }
+}
+
 /// One output as the daemon describes it.
 #[derive(Debug, Serialize)]
 struct OutputView {
@@ -669,6 +789,64 @@ struct OutputsView {
     paused: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct PlaybackState {
+    output: String,
+    kind: String,
+    playing: bool,
+    held: bool,
+    position_ms: u64,
+    fps: f64,
+    fps_cap: Option<u32>,
+    decode: String,
+    decoder: String,
+    mode: String,
+    buffers: usize,
+    buffer_bytes: usize,
+    buffer_cap_bytes: usize,
+    total_frames: Option<u64>,
+    failed: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlaybackResult {
+    ok: bool,
+    states: Vec<PlaybackState>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsRow {
+    output: String,
+    kind: String,
+    playing: bool,
+    held: bool,
+    position_ms: u64,
+    fps: f64,
+    fps_cap: Option<u32>,
+    decode: String,
+    decoder: String,
+    mode: String,
+    buffers: usize,
+    buffer_bytes: usize,
+    buffer_cap_bytes: usize,
+    total_frames: Option<u64>,
+    failed: Option<String>,
+    wallpaper: Option<String>,
+    width: u32,
+    height: u32,
+    position: Option<u64>,
+    frames_presented: u64,
+    loop_start_ms: Option<u64>,
+    loop_end_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsView {
+    stats: Vec<StatsRow>,
+    rss_bytes: Option<u64>,
+    paused: bool,
+}
+
 /// What an apply did (or why it did not).
 #[derive(Debug, Serialize)]
 struct ApplyOutcome {
@@ -690,6 +868,7 @@ struct DaemonStatus {
     shell_backends: Vec<String>,
     content_kinds: Vec<String>,
     media_backends: Vec<String>,
+    events: Vec<String>,
     /// Transition ids the picker may offer: whatever this build renders **and**
     /// `render.allow_transitions` currently permits.
     transitions: Vec<String>,
@@ -709,6 +888,7 @@ impl DaemonStatus {
             shell_backends: Vec::new(),
             content_kinds: Vec::new(),
             media_backends: Vec::new(),
+            events: Vec::new(),
             transitions: Vec::new(),
             unavailable: Vec::new(),
             error: Some(error),
@@ -718,9 +898,19 @@ impl DaemonStatus {
 
 /// Blocking IPC work — always called off the UI thread.
 fn probe_daemon() -> DaemonStatus {
-    let socket = match owe_ipc::default_socket_path() {
+    probe_resolved_socket(
+        std::env::var_os("OWE_SOCKET").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    )
+}
+
+fn probe_resolved_socket(
+    override_socket: Option<&OsStr>,
+    runtime_dir: Option<&OsStr>,
+) -> DaemonStatus {
+    let socket = match socket_from_values(override_socket, runtime_dir) {
         Ok(path) => path,
-        Err(error) => return DaemonStatus::unreachable(String::new(), error.to_string()),
+        Err(error) => return DaemonStatus::unreachable(String::new(), error.message),
     };
     probe_socket(&socket)
 }
@@ -747,6 +937,7 @@ fn probe_socket(socket: &Path) -> DaemonStatus {
             shell_backends: reply.capabilities.shell_backends,
             content_kinds: reply.capabilities.content_kinds,
             media_backends: reply.capabilities.media_backends,
+            events: reply.capabilities.events,
             transitions: reply.capabilities.transitions,
             unavailable: reply.capabilities.unavailable,
             error: None,
@@ -794,6 +985,21 @@ async fn library_thumbnail(id: i64) -> Result<Thumbnail, IpcError> {
 async fn list_outputs() -> Result<OutputsView, IpcError> {
     let socket = daemon_socket()?;
     run_blocking(move || list_outputs_from(&socket)).await
+}
+
+#[tauri::command]
+async fn stats(output: Option<String>) -> Result<StatsView, IpcError> {
+    let socket = daemon_socket()?;
+    run_blocking(move || stats_from(&socket, output.as_deref())).await
+}
+
+#[tauri::command]
+async fn playback_command(
+    output: Option<String>,
+    command: serde_json::Value,
+) -> Result<PlaybackResult, IpcError> {
+    let socket = daemon_socket()?;
+    run_blocking(move || playback_command_from(&socket, output.as_deref(), &command)).await
 }
 
 /// Apply a wallpaper to a set of outputs (empty means all of them), optionally
@@ -872,6 +1078,8 @@ fn main() {
             library_scan,
             library_thumbnail,
             list_outputs,
+            stats,
+            playback_command,
             assign_wallpaper,
             clear_wallpaper,
             shell_status,
@@ -950,8 +1158,9 @@ mod tests {
                             "methods": [method::HELLO],
                             "shell_backends": ["hyprland"],
                             "content_kinds": ["static-image"],
-                            "media_backends": ["image"],
-                            "transitions": ["none", "fade", "wipe"],
+                             "media_backends": ["image"],
+                             "events": [],
+                             "transitions": ["none", "fade", "wipe"],
                             "unavailable": ["caelestia: planned for P3"],
                         },
                     }))
@@ -1032,6 +1241,54 @@ mod tests {
                     "notes": ["transition requests are not applied yet"],
                 })),
                 "wallpaper.clear" => Ok(json!({ "cleared": ["eDP-1"] })),
+                method::STATS_GET => Ok(json!({
+                    "stats": [{
+                        "output": "eDP-1",
+                        "kind": "animated-image",
+                        "wallpaper": "/tmp/walls/a.gif",
+                        "playing": true,
+                        "held": false,
+                        "fps": 9.5,
+                        "fps_cap": 60,
+                        "decode": "software",
+                        "decoder": "gif",
+                        "mode": "cached",
+                        "buffers": 3,
+                        "buffer_bytes": 4096,
+                        "buffer_cap_bytes": 8192,
+                        "width": 1366,
+                        "height": 768,
+                        "position": 2,
+                        "position_ms": 200,
+                        "total_frames": 3,
+                        "frames_presented": 12,
+                        "loop_start_ms": null,
+                        "loop_end_ms": null,
+                        "failed": null
+                    }],
+                    "rss_bytes": 123456,
+                    "paused": false
+                })),
+                method::PLAYBACK_CMD => Ok(json!({
+                    "ok": true,
+                    "state": {
+                        "output": request.params["output"].clone(),
+                        "kind": "animated-image",
+                        "playing": false,
+                        "held": false,
+                        "position_ms": 200,
+                        "fps": 9.5,
+                        "fps_cap": 60,
+                        "decode": "software",
+                        "decoder": "gif",
+                        "mode": "cached",
+                        "buffers": 3,
+                        "buffer_bytes": 4096,
+                        "buffer_cap_bytes": 8192,
+                        "total_frames": 3,
+                        "failed": null
+                    }
+                })),
                 other => Err(ErrorBody::unsupported(format!("`{other}` is not stubbed"))),
             }
         }
@@ -1334,12 +1591,22 @@ mod tests {
     }
 
     #[test]
+    fn the_status_probe_honours_the_socket_override() {
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+        let status = probe_resolved_socket(Some(socket.as_os_str()), None);
+        assert!(status.connected);
+        assert_eq!(status.socket_path, socket.display().to_string());
+    }
+
+    #[test]
     fn the_status_view_carries_the_transitions_the_picker_may_offer() {
         let daemon = Arc::new(StubDaemon::new());
         let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
 
         let status = probe_socket(&socket);
         assert!(status.connected);
+        assert!(status.events.is_empty());
         assert_eq!(
             status.transitions,
             vec!["none".to_string(), "fade".to_string(), "wipe".to_string()],
@@ -1370,6 +1637,36 @@ mod tests {
     }
 
     #[test]
+    fn stats_and_playback_round_trip_through_the_command_layer() {
+        let daemon = Arc::new(StubDaemon::new());
+        let (socket, _dir, _running) = start_stub(Arc::clone(&daemon));
+
+        let stats = stats_from(&socket, Some("eDP-1")).expect("stats");
+        assert_eq!(stats.stats.len(), 1);
+        assert_eq!(stats.stats[0].decode, "software");
+        assert_eq!(stats.rss_bytes, Some(123456));
+
+        let playback =
+            playback_command_from(&socket, Some("eDP-1"), &serde_json::json!({ "seek": 0.2 }))
+                .expect("playback");
+        assert!(playback.ok);
+        assert_eq!(playback.states.len(), 1);
+        assert!(!playback.states[0].playing);
+
+        let asks = daemon.asks.lock().unwrap();
+        let stats_request = asks
+            .iter()
+            .find(|(method, _)| method == method::STATS_GET)
+            .expect("stats request");
+        assert_eq!(stats_request.1["output"], json!("eDP-1"));
+        let playback_request = asks
+            .iter()
+            .find(|(method, _)| method == method::PLAYBACK_CMD)
+            .expect("playback request");
+        assert_eq!(playback_request.1["cmd"]["seek"], json!(0.2));
+    }
+
+    #[test]
     fn a_daemon_refusal_keeps_its_protocol_code() {
         // The UI shows `code` next to the message; losing it would turn "the file
         // is missing" and "the daemon exploded" into the same dialogue.
@@ -1391,6 +1688,9 @@ mod tests {
             library_index_from(&missing, &LibraryQuery::default()).expect_err("no daemon"),
             library_scan_from(&missing, None).expect_err("no daemon"),
             library_thumb_from(&missing, 1).expect_err("no daemon"),
+            stats_from(&missing, None).expect_err("no daemon"),
+            playback_command_from(&missing, None, &serde_json::json!("pause"))
+                .expect_err("no daemon"),
             assign_wallpaper_to(&missing, "/tmp/a.png", &[], None).expect_err("no daemon"),
             clear_wallpaper_on(&missing, None).expect_err("no daemon"),
         ] {

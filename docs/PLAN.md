@@ -349,12 +349,12 @@ trait ContentRenderer {
 - [ ] **Exit criteria:** wallpaper set via Caelestia's own flow updates theme; daemon-drawn mode coexists.
 
 ### Phase 4 — Animated content: video + GIF/APNG
-- [ ] VideoRenderer: GStreamer pipeline (uridecodebin → GL sink / dma-buf export) → wgpu-imported frame; VA-API hw decode required, software fallback with warning.
-- [ ] AnimatedImage renderer: decoded frame cache (lz4/zstd-compressed, bounded), swww-style.
-- [ ] Playback controls over IPC: play/pause/seek/loop section; GUI preview sync.
-- [ ] Governor integration: video pauses on fullscreen/battery automatically.
-- [ ] FFmpeg backend module as fallback (same trait) if GStreamer gaps appear.
-- [ ] **Exit criteria:** 1080p/4K video wallpaper with hw decode; CPU ≤ ~5% of one core at 30 FPS on reference HW (benchmark, don't promise).
+- [x] VideoRenderer: bounded GStreamer subprocess pipeline with FFmpeg fallback, software/hardware decode reporting, CPU RGBA frames, and wgpu/Wayland presentation. dma-buf zero-copy import remains a follow-up.
+- [x] AnimatedImage renderer: decoded frame cache (bounded, optionally compressed), timing-aware playback, and frame-callback presentation.
+- [x] Playback controls over IPC: play/pause/seek/loop, stats, CLI/Tauri/GUI surfaces, and session-safe replacement/clear.
+- [ ] Governor integration: the playback clock exposes a hold hook, but fullscreen/battery policy belongs to Phase 6 and is not implemented yet.
+- [x] FFmpeg backend module as fallback behind the shared media interface.
+- [ ] **Exit criteria:** live GIF/video playback is verified; long-duration 1080p/4K RSS, multi-cap stability, hardware-reference performance, and zero-copy benchmarks remain open.
 
 ### Phase 5 — Shaders & procedural wallpapers
 - [ ] WGSL shader-pack format: `shader.toml` (name, params, fps hint) + `shader.wgsl`; hot-reload on save.

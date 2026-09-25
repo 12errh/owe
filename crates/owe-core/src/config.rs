@@ -13,7 +13,7 @@
 //! - Backend/transition/action ids are validated against fixed lists here; P3
 //!   replaces the shell-backend check with the live registry (docs ADR note).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::de::Error as _;
@@ -176,22 +176,36 @@ impl Default for ShellConfig {
 }
 
 impl ShellConfig {
+    pub(crate) fn effective_detect_order(&self) -> Vec<String> {
+        if self.detect_order.is_empty() {
+            KNOWN_DETECT_IDS
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect()
+        } else {
+            self.detect_order
+                .iter()
+                .map(|id| id.trim().to_string())
+                .collect()
+        }
+    }
+
     fn validate(&self, problems: &mut Vec<String>) {
         one_of(
             problems,
             "shell.backend",
-            &self.backend,
+            self.backend.trim(),
             KNOWN_SHELL_BACKENDS,
         );
 
         if self.detect_order.is_empty() {
             problems.push("shell.detect_order: must list at least one backend id".to_string());
         }
-        for id in &self.detect_order {
+        let mut seen = BTreeSet::new();
+        for raw_id in &self.detect_order {
+            let id = raw_id.trim();
             one_of(problems, "shell.detect_order[]", id, KNOWN_DETECT_IDS);
-        }
-        for (i, id) in self.detect_order.iter().enumerate() {
-            if self.detect_order[i + 1..].contains(id) {
+            if !seen.insert(id) {
                 problems.push(format!("shell.detect_order: `{id}` is listed twice"));
             }
         }
@@ -225,7 +239,7 @@ impl HyprlandConfig {
         one_of(
             problems,
             "shell.hyprland.hyprpaper",
-            &self.hyprpaper,
+            self.hyprpaper.trim(),
             KNOWN_HYPRPAPER_POLICIES,
         );
     }
@@ -258,7 +272,7 @@ impl CaelestiaConfig {
         one_of(
             problems,
             "shell.caelestia.mode",
-            &self.mode,
+            self.mode.trim(),
             KNOWN_CAELESTIA_MODES,
         );
         if let Some(dir) = &self.wallpapers_dir
@@ -327,6 +341,12 @@ impl RenderConfig {
                 MAX_IN_FLIGHT.start(),
                 MAX_IN_FLIGHT.end()
             ));
+        }
+        if !self.buffering.shm_fallback {
+            problems.push(
+                "render.buffering.shm_fallback: false is not supported until dma-buf presentation is implemented"
+                    .to_string(),
+            );
         }
     }
 }
@@ -955,6 +975,18 @@ mod tests {
     }
 
     #[test]
+    fn shell_detection_order_uses_the_configured_sequence_after_trimming() {
+        let config = Config::from_toml_str(
+            "[shell]\nbackend = \" auto \"\ndetect_order = [\" hyprland \", \"caelestia\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.shell.effective_detect_order(),
+            vec!["hyprland".to_string(), "caelestia".to_string()]
+        );
+    }
+
+    #[test]
     fn empty_detect_order_is_rejected() {
         let problems = errors("[shell]\ndetect_order = []\n");
         assert_has(&problems, "shell.detect_order");
@@ -1010,6 +1042,13 @@ mod tests {
         let problems = errors("[render.buffering]\nmax_in_flight = 99\n");
         assert_has(&problems, "max_in_flight");
         assert_has(&problems, "1..=8");
+    }
+
+    #[test]
+    fn disabling_the_only_implemented_presentation_path_is_rejected() {
+        let problems = errors("[render.buffering]\nshm_fallback = false\n");
+        assert_has(&problems, "shm_fallback");
+        assert_has(&problems, "dma-buf");
     }
 
     #[test]

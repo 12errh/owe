@@ -375,10 +375,15 @@ fn the_shell_card_replays_the_daemons_own_decision() {
     // the card, so the test asserts row-for-row against the recorded reply.
     let status = shell_status_from(&socket);
     assert!(status.connected, "the recorded shell.status must parse");
-    let recorded = fixture.reply_for("shell.status").expect("shell.status reply");
+    let recorded = fixture
+        .reply_for("shell.status")
+        .expect("shell.status reply");
     let shell = &recorded["shell"];
     assert_eq!(status.backend.as_deref(), shell["backend"].as_str());
-    assert_eq!(status.mode, shell["mode"].as_str().unwrap_or("daemon-drawn"));
+    assert_eq!(
+        status.mode,
+        shell["mode"].as_str().unwrap_or("daemon-drawn")
+    );
     assert_eq!(status.reason.as_deref(), shell["reason"].as_str());
     assert_eq!(status.routed, shell["routed"].as_bool().unwrap_or(false));
     assert_eq!(
@@ -396,7 +401,10 @@ fn the_shell_card_replays_the_daemons_own_decision() {
     assert_eq!(status.backends.len(), rows.len());
     for (row, parsed) in rows.iter().zip(&status.backends) {
         assert_eq!(parsed.id, row["id"].as_str().unwrap_or_default());
-        assert_eq!(parsed.confidence, row["confidence"].as_str().unwrap_or_default());
+        assert_eq!(
+            parsed.confidence,
+            row["confidence"].as_str().unwrap_or_default()
+        );
         assert_eq!(parsed.reason, row["reason"].as_str().unwrap_or_default());
         assert_eq!(parsed.selected, row["selected"].as_bool().unwrap_or(false));
         assert_eq!(parsed.mode, row["mode"].as_str().unwrap_or_default());
@@ -411,7 +419,9 @@ fn the_shell_card_replays_the_daemons_own_decision() {
         detect_order: None,
     };
     let patched = patch_shell_from(&socket, &patch).expect("patch round-trip");
-    let recorded_patch = fixture.reply_for("config.patch").expect("config.patch reply");
+    let recorded_patch = fixture
+        .reply_for("config.patch")
+        .expect("config.patch reply");
     assert_eq!(
         patched.runtime_note.as_deref(),
         recorded_patch["note"].as_str(),

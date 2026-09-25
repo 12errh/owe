@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use owe_core::config::{FPS_RANGE, MAX_TRANSITION_MS, Transition};
@@ -28,10 +28,76 @@ use owe_core::{Config, OutputWorker, WorkerAction, WorkerEvent};
 use owe_media::{DecodedImage, MediaError};
 use owe_render::gpu::{HeadlessGpu, RenderError};
 use owe_render::image::{self, PixelFormat, Scaling};
-use owe_render::surface::{Frame, PresentError, PresentOutcome, Presenter};
+use owe_render::surface::{Frame, PresentError, PresentOutcome, Presenter, PresenterEvent};
 use owe_render::transition::{Schedule, TransitionKind, TransitionRenderer};
 use serde::Serialize;
 use thiserror::Error;
+
+use crate::playback::{FrameSink, PlaybackCmd, PlaybackError, PlaybackRegistry, PlaybackSnapshot};
+
+/// The playback clock's draw target: the [`Engine`] the clocks belong to.
+///
+/// `FrameSink` is implemented on this cloneable handle, which holds a
+/// `Weak<Engine>`, rather than on the engine itself for one reason: the registry
+/// (and so the clocks) is built in [`Engine::new`], before anything can hand out
+/// an `Arc<Engine>`. [`Engine::attach_playback`] fills the handle in once, and a
+/// frame then takes the engine's own path — same GPU, same presenter, same fit
+/// mode as a still.
+///
+/// A `Weak` rather than an `Arc` also keeps the clocks from being the last owners
+/// of the engine: the daemon decides when it stops, not a wallpaper.
+#[derive(Clone)]
+struct EngineSink {
+    /// The engine the clocks draw through, once it has attached.
+    engine: Arc<Mutex<Weak<Engine>>>,
+}
+
+impl EngineSink {
+    /// A sink that is not attached to an engine yet.
+    fn new() -> Self {
+        Self {
+            engine: Arc::new(Mutex::new(Weak::new())),
+        }
+    }
+
+    /// Point the sink at the running engine.
+    fn attach(&self, engine: &Arc<Engine>) {
+        match self.engine.lock() {
+            Ok(mut slot) => *slot = Arc::downgrade(engine),
+            Err(poisoned) => *poisoned.into_inner() = Arc::downgrade(engine),
+        }
+    }
+
+    /// The engine, or the reason a frame cannot be drawn.
+    fn engine(&self) -> Result<Arc<Engine>, String> {
+        self.engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
+            .ok_or_else(|| "the playback clock is not attached to a running engine".to_string())
+    }
+}
+
+impl FrameSink for EngineSink {
+    fn show(&self, output: &str, frame: &owe_media::DecodedFrame) -> Result<(u32, u32), String> {
+        let engine = self.engine()?;
+        let result = engine.show_frame(output, frame);
+        if result.is_err() {
+            engine
+                .playback_sizes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(output);
+        }
+        result.map_err(|error| error.to_string())
+    }
+
+    fn cancel(&self, output: &str) {
+        if let Ok(engine) = self.engine() {
+            engine.cancel_playback_frame(output);
+        }
+    }
+}
 
 /// Resolves `library:<id>` references to files, so the engine can apply (and
 /// restore) library items without owning a database.
@@ -68,6 +134,10 @@ pub enum EngineError {
     /// The wallpaper reference itself is invalid.
     #[error("{0}")]
     Model(#[from] owe_core::ModelError),
+
+    /// The effective configuration is invalid.
+    #[error("{0}")]
+    Config(String),
 
     /// The target output could not be resolved.
     #[error("{0}")]
@@ -110,6 +180,10 @@ pub enum EngineError {
     /// reached the screen.
     #[error("{0}")]
     Superseded(String),
+
+    /// The frame clock could not start or a playback command failed.
+    #[error("{0}")]
+    Playback(#[from] PlaybackError),
 }
 
 /// One output as the GUI and CLI see it.
@@ -502,6 +576,16 @@ impl StartupReport {
 pub struct Engine {
     config: Config,
     paths: XdgPaths,
+    /// The frame clock that makes animated-image and video content move (P4).
+    /// One per engine, one clock thread per playing output.
+    playback: PlaybackRegistry,
+    /// The clock's draw target. [`Engine::attach_playback`] fills it in; a build
+    /// that never attaches it answers with that reason rather than a wrong one.
+    playback_sink: EngineSink,
+    /// The surface size each output's clock last had accepted, seeded from the
+    /// output's own pixel size when a clock starts. Kept so a clock frame does not
+    /// have to rediscover the size the compositor already answered with.
+    playback_sizes: Mutex<HashMap<String, (u32, u32)>>,
     /// Behind a lock rather than a plain field so a backend can be registered
     /// while the daemon runs: the routing tests replace `caelestia` with a
     /// recording stub, and a `config.patch` that changes `shell.backend` will do
@@ -510,6 +594,7 @@ pub struct Engine {
     /// A runtime `[shell]` patch, when one has been applied (`config.patch`).
     /// `None` means the file's value is in force.
     shell_override: RwLock<Option<owe_core::config::ShellConfig>>,
+    shell_patch: Mutex<()>,
     generation: AtomicU64,
     /// What each output is actually showing, as of this process's lifetime.
     /// The session file is intent; this is fact.
@@ -573,11 +658,17 @@ impl Engine {
         // is needed.
         let loaded = SessionState::load(&paths.state_dir.join("session.json"));
 
+        let playback_sink = EngineSink::new();
+        let registry_sink = playback_sink.clone();
         Self {
             config,
             paths,
+            playback: PlaybackRegistry::new(registry_sink),
+            playback_sink,
+            playback_sizes: Mutex::new(HashMap::new()),
             registry: RwLock::new(registry),
             shell_override: RwLock::new(None),
+            shell_patch: Mutex::new(()),
             generation: AtomicU64::new(1),
             started: Mutex::new(None),
             outputs: Mutex::new(Vec::new()),
@@ -636,6 +727,12 @@ impl Engine {
             .unwrap_or_else(|| self.config.shell.clone())
     }
 
+    pub fn effective_config(&self) -> Config {
+        let mut config = self.config.clone();
+        config.shell = self.shell_config();
+        config
+    }
+
     /// The shell situation, for `shell.status` and the GUI's status card.
     ///
     /// Runs each backend's detection, which is process/env only (no subprocess): a
@@ -688,8 +785,8 @@ impl Engine {
             patched: self
                 .shell_override
                 .read()
-                .map(|guard| guard.is_some())
-                .unwrap_or(false),
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some(),
         }
     }
 
@@ -708,6 +805,10 @@ impl Engine {
     /// A validation or selection failure leaves the previous override in place, so a
     /// typo cannot leave the daemon without a working backend.
     pub fn patch_shell(&self, patch: &ShellPatch) -> Result<ShellStatus, EngineError> {
+        let _patch = self
+            .shell_patch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut shell = self.shell_config();
 
         if let Some(backend) = &patch.backend {
@@ -738,6 +839,12 @@ impl Engine {
             shell.caelestia.wallpapers_dir = Some(dir.clone());
         }
         if let Some(order) = &patch.detect_order {
+            if order.is_empty() {
+                return Err(EngineError::Config(
+                    "shell.detect_order: must list at least one backend id".to_string(),
+                ));
+            }
+            let mut seen = Vec::new();
             for id in order {
                 if !self.backend_ids().iter().any(|known| known == id) {
                     return Err(EngineError::ShellSelection(SelectError::UnknownBackend {
@@ -745,6 +852,12 @@ impl Engine {
                         available: self.backend_ids().join(", "),
                     }));
                 }
+                if seen.contains(id) {
+                    return Err(EngineError::Config(format!(
+                        "shell.detect_order: `{id}` is listed twice"
+                    )));
+                }
+                seen.push(id.clone());
             }
             shell.detect_order = order.clone();
         }
@@ -764,58 +877,66 @@ impl Engine {
             shell.hyprland.hyprpaper = policy.trim().to_string();
         }
 
-        if let Ok(mut slot) = self.shell_override.write() {
-            *slot = Some(shell);
+        let mut candidate = self.config.clone();
+        candidate.shell = shell.clone();
+        let validation_backend = candidate.shell.backend.clone();
+        let validation_order = candidate.shell.detect_order.clone();
+        candidate.shell.backend = "auto".to_string();
+        candidate.shell.detect_order = vec!["hyprland".to_string()];
+        candidate
+            .validate()
+            .map_err(|error| EngineError::Config(error.to_string()))?;
+        if validation_backend.trim().is_empty() {
+            return Err(EngineError::Config(
+                "shell.backend: must not be empty".to_string(),
+            ));
+        }
+        if validation_order.is_empty() {
+            return Err(EngineError::Config(
+                "shell.detect_order: must list at least one backend id".to_string(),
+            ));
         }
 
-        // Re-select and re-list immediately: a `shell.status` right after the patch
-        // must describe the new state, not the old one.
-        self.repick_backend()?;
+        let selected = self.select_backend(&shell)?;
+        let outputs = self.effective_backend_outputs(&selected)?;
+        *self
+            .shell_override
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(shell);
+        self.publish_backend_selection(&selected, outputs.clone());
+        self.reconcile_outputs(outputs);
         Ok(self.shell_status())
     }
 
-    /// Re-run selection and the output list without restarting the presenter or the
-    /// GPU.
-    ///
-    /// This is the half of `start()` that a backend change actually affects. A full
-    /// restart would try to open a second layer surface on the same outputs, so the
-    /// presenter is deliberately left alone: switching who owns the wallpaper must
-    /// not cost the surfaces that are already up.
-    fn repick_backend(&self) -> Result<(), EngineError> {
-        let shell = self.shell_config();
-        let registry = self
-            .registry
+    fn select_backend(
+        &self,
+        shell: &owe_core::config::ShellConfig,
+    ) -> Result<Arc<dyn ShellBackend>, EngineError> {
+        self.registry
             .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .select(shell, &env_lookup)
+            .map_err(EngineError::ShellSelection)
+    }
+
+    fn effective_backend_outputs(
+        &self,
+        backend: &Arc<dyn ShellBackend>,
+    ) -> Result<Vec<OutputInfo>, EngineError> {
+        Ok(effective_outputs(backend.list_outputs()?))
+    }
+
+    fn publish_backend_selection(&self, backend: &Arc<dyn ShellBackend>, outputs: Vec<OutputInfo>) {
+        let mut started = self
+            .started
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let selected = registry.select(&shell, &env_lookup);
-        drop(registry);
-
-        let outputs = match &selected {
-            Ok(backend) => backend.list_outputs().unwrap_or_else(|error| {
-                tracing::warn!(%error, "cannot list outputs after a shell config change");
-                self.outputs
-                    .lock()
-                    .map(|guard| guard.clone())
-                    .unwrap_or_default()
-            }),
-            Err(error) => return Err(EngineError::ShellSelection(error.clone())),
-        };
-
-        if let Ok(mut slot) = self.outputs.lock() {
-            *slot = outputs.clone();
-        }
-        if let Ok(mut guard) = self.started.lock()
-            && let Some(report) = guard.as_mut()
-        {
-            report.backend = selected
-                .as_ref()
-                .ok()
-                .map(|backend| backend.id().to_string());
-            report.backend_error = selected.as_ref().err().map(ToString::to_string);
-            report.selection_error = selected.as_ref().err().cloned();
+        if let Some(report) = started.as_mut() {
+            report.backend = Some(backend.id().to_string());
+            report.backend_error = None;
+            report.selection_error = None;
             report.outputs = outputs;
         }
-        Ok(())
     }
 
     /// Inject the library resolver. Called once, after the library service opens.
@@ -823,9 +944,10 @@ impl Engine {
     /// Safe to call before or after [`Engine::start`]: resolution only happens
     /// inside an apply or a restore.
     pub fn set_library(&self, resolver: Arc<dyn LibraryResolver>) {
-        if let Ok(mut slot) = self.library.lock() {
-            *slot = Some(resolver);
-        }
+        *self
+            .library
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(resolver);
     }
 
     /// Whether the engine has been started.
@@ -839,27 +961,39 @@ impl Engine {
     pub fn is_started(&self) -> bool {
         self.started
             .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
     }
 
     /// Whether a manual pause is in effect.
     pub fn is_paused(&self) -> bool {
-        self.paused.lock().map(|guard| *guard).unwrap_or(false)
+        *self
+            .paused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Set or clear the manual pause override.
     pub fn set_paused(&self, paused: bool) {
-        if let Ok(mut guard) = self.paused.lock() {
-            *guard = paused;
-        }
+        *self
+            .paused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = paused;
+        // P4 makes the override real for moving content: a held clock presents
+        // nothing (static wallpapers were always motionless).
+        self.playback.set_held(paused);
     }
 
     /// Start the engine: load session state, select the backend, list outputs,
     /// and bring up the presenter. Idempotent, and never fatal (see
     /// [`StartupReport`]).
     pub fn start(&self) -> StartupReport {
-        if let Some(report) = self.started.lock().ok().and_then(|guard| guard.clone()) {
+        if let Some(report) = self
+            .started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
             return report;
         }
 
@@ -867,8 +1001,8 @@ impl Engine {
         let mut warnings = self
             .session_warnings
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
 
         // The registry is read once and the selected backend used directly: looking
         // it up a second time by id would be a second chance to disagree with
@@ -890,7 +1024,7 @@ impl Engine {
 
         let outputs = match &selected {
             Ok(backend) => match backend.list_outputs() {
-                Ok(outputs) => outputs,
+                Ok(outputs) => effective_outputs(outputs),
                 Err(error) => {
                     // A missing `hyprctl` must not stop the daemon either.
                     warnings.push(format!("cannot list outputs: {error}"));
@@ -908,12 +1042,16 @@ impl Engine {
         // stale entry is invisible — `output_views` only reports connected outputs
         // — and is overwritten the moment that connector appears again.
 
-        let presentable = match Presenter::start("owe") {
+        let presentable = match Presenter::start_with_buffers(
+            "owe",
+            self.config.render.buffering.max_in_flight as usize,
+        ) {
             Ok(presenter) => {
                 let names = presenter.outputs().to_vec();
-                if let Ok(mut slot) = self.presenter.lock() {
-                    *slot = Some(presenter);
-                }
+                *self
+                    .presenter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(presenter);
                 names
             }
             Err(error) => {
@@ -924,27 +1062,34 @@ impl Engine {
             }
         };
 
-        if let Ok(mut slot) = self.gpu.lock() {
-            match HeadlessGpu::new() {
-                Ok(Some(gpu)) => *slot = Some(gpu),
-                Ok(None) => {
-                    warnings.push("no GPU adapter available; nothing can be rendered".into())
-                }
-                Err(error) => warnings.push(format!("gpu initialisation failed: {error}")),
-            }
+        let mut gpu_slot = self
+            .gpu
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match HeadlessGpu::new() {
+            Ok(Some(gpu)) => *gpu_slot = Some(gpu),
+            Ok(None) => warnings.push("no GPU adapter available; nothing can be rendered".into()),
+            Err(error) => warnings.push(format!("gpu initialisation failed: {error}")),
         }
+        drop(gpu_slot);
 
         // One worker per output: the state machine is per-output by design.
-        if let Ok(mut workers) = self.workers.lock() {
-            for output in &outputs {
-                workers
-                    .entry(output.name.clone())
-                    .or_insert_with(|| OutputWorker::new(output.name.clone()));
-            }
+        let mut workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let connected: Vec<String> = outputs.iter().map(|output| output.name.clone()).collect();
+        workers.retain(|name, _| connected.contains(name));
+        for output in &outputs {
+            workers
+                .entry(output.name.clone())
+                .or_insert_with(|| OutputWorker::new(output.name.clone()));
         }
-        if let Ok(mut slot) = self.outputs.lock() {
-            *slot = outputs.clone();
-        }
+        drop(workers);
+        *self
+            .outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = outputs.clone();
 
         let report = StartupReport {
             backend,
@@ -954,14 +1099,15 @@ impl Engine {
             presenter: self
                 .presenter
                 .lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(false),
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some(),
             presentable,
             warnings,
         };
-        if let Ok(mut slot) = self.started.lock() {
-            *slot = Some(report.clone());
-        }
+        *self
+            .started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report.clone());
         report
     }
 
@@ -973,23 +1119,26 @@ impl Engine {
         let outputs = self
             .outputs
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .into_iter()
+            .filter(|output| output.active)
+            .collect::<Vec<_>>();
         let workers = self
             .workers
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let session = self
             .session
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let applied = self
             .applied
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
 
         Ok(outputs
             .into_iter()
@@ -1100,26 +1249,6 @@ impl Engine {
             }
         };
 
-        // What this build can *present* is the gate, not what the decode layer can
-        // turn into frames: P4 taught `owe-media` to decode animated images and
-        // video, but no playback loop paces or draws those frames yet, so accepting
-        // one here would book a wallpaper that never moves. Reading the same list
-        // `capabilities` publishes is also what makes it impossible for
-        // `wallpaper.set` and `capabilities.content_kinds` to disagree.
-        let presentable = self.content_kinds();
-        if !presentable.contains(&kind) {
-            let rendered = presentable
-                .iter()
-                .map(|kind| kind.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(EngineError::Unsupported(format!(
-                "`{}` wallpapers are not supported by this build yet: it renders {rendered}, \
-                 and the rest waits on the frame-pacing half of P4 (docs/IMPLEMENTATION-PLAN.md)",
-                kind.as_str()
-            )));
-        }
-
         // The transition *request* is validated on the same rule, and it has to
         // happen before `start()` for that rule to hold: asking for a transition
         // the config disallows is the client's mistake whether or not a compositor
@@ -1140,20 +1269,59 @@ impl Engine {
         let outputs = self
             .outputs
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let selected = owe_core::output::resolve(&outputs, target)?;
 
-        // Shell-routed mode: a shell that owns the pixels is asked to switch, and
-        // OWE decodes and presents nothing (FR-SHELL-3, TRD §4).
+        let moving = matches!(kind, ContentKind::AnimatedImage | ContentKind::Video);
+        let shell = self.shell_config();
+        let shell_routed = report
+            .backend
+            .as_deref()
+            .and_then(|id| self.backend(id))
+            .is_some_and(|backend| backend.draw_mode(&shell) == DrawMode::ShellRouted);
+        let decoded = if !moving && !shell_routed {
+            Some(owe_media::decode_file(&path)?)
+        } else {
+            None
+        };
+
         if let Some(routed) =
             self.route_to_shell(spec, kind, &path, &selected, requested, restored)?
         {
+            self.stop_transitions_for_outputs(&selected);
+            self.stop_playback_for_outputs(&selected);
+            self.clear_presented_outputs(&selected);
             return Ok(routed);
         }
 
-        // Decode once, render per output: the common case is `-o all`.
-        let decoded = owe_media::decode_file(&path)?;
+        let presentable = self.content_kinds();
+        if !presentable.contains(&kind) {
+            let rendered = presentable
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(EngineError::Unsupported(format!(
+                "`{}` wallpapers are not supported by this build yet: it renders {rendered} \
+                 (docs/IMPLEMENTATION-PLAN.md records what is still open)",
+                kind.as_str()
+            )));
+        }
+
+        self.stop_transitions_for_outputs(&selected);
+        if !moving {
+            self.stop_playback_for_outputs(&selected);
+        }
+
+        if moving {
+            return self.apply_playback(spec, kind, &path, &selected, restored);
+        }
+
+        let decoded = match decoded {
+            Some(decoded) => decoded,
+            None => owe_media::decode_file(&path)?,
+        };
 
         let gpu_guard = self
             .gpu
@@ -1247,9 +1415,268 @@ impl Engine {
         let active = self
             .outputs
             .lock()
-            .map(|guard| guard.iter().filter(|output| output.active).count())
-            .unwrap_or(0);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|output| output.active)
+            .count();
         active > 0 && selected.len() == active
+    }
+
+    /// Apply an animated-image or video wallpaper by starting a frame clock on
+    /// every selected output (FR-LIVE-5/6).
+    ///
+    /// `PlaybackRegistry::start` returns only after the first frame is presented,
+    /// so an apply either lands on screen or fails with the decoder's own reason —
+    /// the same "ok means shown" contract the still path keeps. There is no
+    /// transition blend for moving content: the clock's first frame replaces what
+    /// was there, and blending every subsequent tick would be a permanent
+    /// crossfade, not a transition.
+    fn apply_playback(
+        &self,
+        reference: &str,
+        kind: ContentKind,
+        path: &Path,
+        selected: &[&OutputInfo],
+        restored: bool,
+    ) -> Result<Applied, EngineError> {
+        let mut applied = Applied {
+            reference: reference.trim().to_string(),
+            kind: kind.as_str().to_string(),
+            outputs: Vec::new(),
+            sizes: Vec::new(),
+            transitions: Vec::new(),
+            frames: Vec::new(),
+            notes: Vec::new(),
+            restored,
+            theme: ThemeRuns::default(),
+            routed: false,
+        };
+
+        for output in selected {
+            let section = output_config::resolve(&self.config.outputs, output);
+            let cap = output_config::fps_cap_for(section.as_ref());
+            // The clock renders at the output's own pixel size from its first frame:
+            // the compositor's answer then governs, but starting from the size the
+            // shell reported avoids a reconfigure round-trip on every apply.
+            let previous_size = self
+                .playback_sizes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(output.name.clone(), output.pixel_size());
+            let snapshot =
+                self.playback
+                    .start(&output.name, path, kind, self.config.media.clone(), cap);
+            match snapshot {
+                Ok(snapshot) => {
+                    applied.outputs.push(output.name.clone());
+                    applied
+                        .sizes
+                        .push((output.name.clone(), snapshot.width, snapshot.height));
+                    applied
+                        .frames
+                        .push((output.name.clone(), snapshot.frames_presented as u32));
+                    let mode_note = format!(
+                        "{}: playing ({} {}, {} fps cap, decode {})",
+                        output.name,
+                        snapshot.kind,
+                        snapshot.mode,
+                        snapshot
+                            .fps_cap
+                            .map(|fps| fps.to_string())
+                            .unwrap_or_else(|| "no".to_string()),
+                        snapshot.decode,
+                    );
+                    applied.notes.push(mode_note);
+                }
+                Err(error) => {
+                    for started in &applied.outputs {
+                        self.stop_playback_output(started);
+                    }
+                    if self.playback.snapshot(&output.name).is_none() {
+                        self.stop_playback_output(&output.name);
+                    } else if let Some(previous_size) = previous_size {
+                        self.playback_sizes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(output.name.clone(), previous_size);
+                    } else {
+                        self.playback_sizes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&output.name);
+                    }
+                    return Err(EngineError::Playback(error));
+                }
+            }
+        }
+
+        if let Err(error) = self.record_applied(&applied) {
+            for output in &applied.outputs {
+                self.stop_playback_output(output);
+            }
+            return Err(error);
+        }
+        Ok(applied)
+    }
+
+    fn stop_transitions_for_outputs(&self, selected: &[&OutputInfo]) {
+        for output in selected {
+            self.stop_transition(&output.name);
+        }
+    }
+
+    fn stop_playback_for_outputs(&self, selected: &[&OutputInfo]) {
+        for output in selected {
+            self.stop_playback_output(&output.name);
+        }
+    }
+
+    fn stop_playback_output(&self, output: &str) {
+        self.playback.stop(output);
+        self.playback_sizes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(output);
+    }
+
+    fn clear_presented_outputs(&self, selected: &[&OutputInfo]) {
+        let Ok(presenter) = self.presenter.try_lock() else {
+            return;
+        };
+        let Some(presenter) = presenter.as_ref() else {
+            return;
+        };
+        for output in selected {
+            if let Err(error) = presenter.clear(&output.name) {
+                tracing::warn!(output = %output.name, %error, "could not clear the OWE surface");
+            }
+        }
+    }
+
+    fn cancel_playback_frame(&self, output: &str) {
+        let Ok(presenter) = self.presenter.try_lock() else {
+            return;
+        };
+        if let Some(presenter) = presenter.as_ref() {
+            let _ = presenter.cancel_frame(output);
+        }
+    }
+
+    /// Point the frame clocks at this engine.
+    ///
+    /// Called once, by `main`, as soon as the engine has an `Arc` of its own — the
+    /// clocks outlive the request that starts them, so they need a handle rather
+    /// than a borrow. A daemon that never calls this (every unit test) reports the
+    /// missing attachment as the reason a clock frame could not be drawn, instead
+    /// of blaming the GPU or the compositor.
+    pub fn attach_playback(self: &Arc<Self>) {
+        self.playback_sink.attach(self);
+    }
+
+    /// Present one frame of animated content on `output`.
+    ///
+    /// This is the clock's [`FrameSink`]: the engine's own GPU scales the frame
+    /// into the output's surface size with the configured fit mode (FR-LIVE-4) and
+    /// the engine's own presenter puts it on screen, so a moving wallpaper and a
+    /// still take the same path. Returns the size the compositor accepted.
+    fn show_frame(
+        &self,
+        output: &str,
+        frame: &owe_media::DecodedFrame,
+    ) -> Result<(u32, u32), EngineError> {
+        let gpu_guard = self
+            .gpu
+            .lock()
+            .map_err(|_| EngineError::NoGpu("poisoned".into()))?;
+        let gpu = gpu_guard
+            .as_ref()
+            .ok_or_else(|| EngineError::NoGpu("no adapter was found at startup".to_string()))?;
+
+        let source = (frame.width(), frame.height());
+        // The size a clock starts at is the output's own, recorded when the clock
+        // started; the compositor's answer replaces it. A frame whose size nobody
+        // recorded falls back to the frame's own pixels, and the first reply from
+        // the compositor corrects it — the same two-attempt shape `present_direct`
+        // uses for stills, for the same reason.
+        let mut size = self
+            .playback_sizes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(output)
+            .copied()
+            .unwrap_or(source);
+
+        for attempt in 0..2 {
+            let pixels = image::render(
+                gpu,
+                size,
+                source,
+                frame.pixels(),
+                self.fit(),
+                PixelFormat::Bgra8,
+                BACKGROUND,
+            )?;
+            let presented = self.present_frame(
+                output,
+                Frame {
+                    width: size.0,
+                    height: size.1,
+                    pixels,
+                },
+            )?;
+            match presented {
+                PresentOutcome::Presented { size: shown } => {
+                    self.playback_sizes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(output.to_string(), shown);
+                    return Ok(shown);
+                }
+                PresentOutcome::ResizeRequired { size: resized } => {
+                    if attempt == 1 {
+                        break;
+                    }
+                    size = resized;
+                }
+            }
+        }
+
+        Err(EngineError::Present(PresentError::ConfigureTimeout {
+            output: output.to_string(),
+            timeout: Duration::from_secs(2),
+        }))
+    }
+
+    /// A playback command (`playback.cmd`) on one output.
+    pub fn playback_command(
+        &self,
+        output: &str,
+        cmd: PlaybackCmd,
+    ) -> Result<PlaybackSnapshot, PlaybackError> {
+        self.playback.command(output, cmd)
+    }
+
+    /// One output's playback state (`stats.get`).
+    pub fn playback_snapshot(&self, output: &str) -> Option<PlaybackSnapshot> {
+        self.playback.snapshot(output)
+    }
+
+    /// The outputs that currently have a frame clock, ordered.
+    ///
+    /// `playback.cmd` with no output named acts on these: a clock is the only
+    /// thing a playback command can act on, and inventing a state for an output
+    /// that shows a still would be reporting something nobody changed.
+    pub fn playback_outputs(&self) -> Vec<String> {
+        self.playback.outputs()
+    }
+
+    /// Stop every clock (shutdown, presenter loss).
+    pub fn stop_playback(&self) {
+        self.playback.stop_all();
+        self.playback_sizes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Record what this run has on screen (fact), then persist it (intent for the
@@ -1258,28 +1685,31 @@ impl Engine {
     /// Shared by the drawn and shell-routed paths on purpose: "which wallpapers
     /// come back after a restart" must not depend on which mode produced them.
     fn record_applied(&self, applied: &Applied) -> Result<(), EngineError> {
-        if let Ok(mut shown) = self.applied.lock() {
-            for name in &applied.outputs {
-                shown.insert(
-                    name.clone(),
-                    AppliedRef {
-                        reference: applied.reference.clone(),
-                        kind: applied.kind.clone(),
-                    },
-                );
-            }
-        }
-
-        let mut session = self.session.lock().map_err(|_| {
-            EngineError::State(StateError::Write {
-                path: self.paths.state_dir.join("session.json"),
-                source: std::io::Error::other("session state lock poisoned"),
-            })
-        })?;
+        let session_path = self.paths.state_dir.join("session.json");
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next_session = session.clone();
         for name in &applied.outputs {
-            session.set(name.clone(), applied.reference.clone(), &applied.kind);
+            next_session.set(name.clone(), applied.reference.clone(), &applied.kind);
         }
-        session.save(&self.paths.state_dir.join("session.json"))?;
+        next_session.save(&session_path)?;
+
+        let mut shown = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for name in &applied.outputs {
+            shown.insert(
+                name.clone(),
+                AppliedRef {
+                    reference: applied.reference.clone(),
+                    kind: applied.kind.clone(),
+                },
+            );
+        }
+        *session = next_session;
         Ok(())
     }
 
@@ -1307,9 +1737,14 @@ impl Engine {
             return Ok(None);
         };
         let Some(backend) = self.backend(&backend_id) else {
-            return Ok(None);
+            return Err(EngineError::Shell(ShellError::Backend {
+                backend: backend_id,
+                detail: "the selected shell backend disappeared before the request could be routed"
+                    .to_string(),
+            }));
         };
-        if backend.draw_mode(&self.shell_config()) != DrawMode::ShellRouted {
+        let shell = self.shell_config();
+        if backend.draw_mode(&shell) != DrawMode::ShellRouted {
             return Ok(None);
         }
 
@@ -1322,18 +1757,20 @@ impl Engine {
             selected.first().map(|output| output.name.as_str())
         };
 
-        let outcome = backend.apply_wallpaper(
-            &self.shell_config(),
-            shell_output,
-            &path.display().to_string(),
-        )?;
-        let ApplyOutcome::Routed {
-            detail,
-            theme_refreshed,
-        } = outcome
-        else {
-            // The backend says the pixels are not its business after all.
-            return Ok(None);
+        let outcome = backend.apply_wallpaper(&shell, shell_output, &path.display().to_string())?;
+        let (detail, theme_refreshed) = match outcome {
+            ApplyOutcome::Routed {
+                detail,
+                theme_refreshed,
+            } => (detail, theme_refreshed),
+            ApplyOutcome::NotApplicable => {
+                return Err(EngineError::Shell(ShellError::Backend {
+                    backend: backend.id().to_string(),
+                    detail: "the backend claims shell-routed ownership but declined the \
+                              wallpaper request; refusing to fall back to daemon playback"
+                        .to_string(),
+                }));
+            }
         };
 
         let mut applied = Applied {
@@ -1451,8 +1888,8 @@ impl Engine {
         let resolver = self
             .library
             .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
             .ok_or_else(|| {
                 EngineError::Library(format!(
                     "`library:{id}` cannot be resolved: this daemon has no library index open"
@@ -1466,8 +1903,8 @@ impl Engine {
         let resolver = self
             .library
             .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
             .ok_or_else(|| {
                 EngineError::Library(format!(
                     "`library:{id}` cannot be resolved: this daemon has no library index open"
@@ -1487,8 +1924,9 @@ impl Engine {
         let reference = self
             .applied
             .lock()
-            .ok()
-            .and_then(|shown| shown.get(output).map(|entry| entry.reference.clone()));
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(output)
+            .map(|entry| entry.reference.clone());
         let Some(reference) = reference else {
             return Ok(None);
         };
@@ -1523,7 +1961,7 @@ impl Engine {
             let mut workers = self
                 .workers
                 .lock()
-                .map_err(|_| EngineError::NoGpu("worker map poisoned".to_string()))?;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             workers
                 .entry(name.to_string())
                 .or_insert_with(|| OutputWorker::new(name))
@@ -1636,16 +2074,19 @@ impl Engine {
     /// Store a worker back into the map (a poisoned map is not worth failing the
     /// wallpaper change over; the state machine will simply start fresh).
     fn store_worker(&self, output: &str, worker: OutputWorker) {
-        if let Ok(mut workers) = self.workers.lock() {
-            workers.insert(output.to_string(), worker);
-        }
+        self.workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(output.to_string(), worker);
     }
 
     /// Forget the transition entry for an output *if it is still ours*.
     fn finish_transition(&self, output: &str, epoch: u64) {
-        if let Ok(mut map) = self.transitions.lock()
-            && map.get(output).is_some_and(|entry| entry.epoch == epoch)
-        {
+        let mut map = self
+            .transitions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if map.get(output).is_some_and(|entry| entry.epoch == epoch) {
             map.remove(output);
         }
     }
@@ -1727,11 +2168,24 @@ impl Engine {
         let presenter = self
             .presenter
             .lock()
-            .map_err(|_| EngineError::NoGpu("presenter lock poisoned".to_string()))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let presenter = presenter.as_ref().ok_or_else(|| {
             EngineError::NoGpu("no Wayland session: cannot present wallpapers".to_string())
         })?;
         presenter.present(output, frame).map_err(EngineError::from)
+    }
+
+    fn present_frame(&self, output: &str, frame: Frame) -> Result<PresentOutcome, EngineError> {
+        let presenter = self
+            .presenter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let presenter = presenter.as_ref().ok_or_else(|| {
+            EngineError::NoGpu("no Wayland session: cannot present wallpapers".to_string())
+        })?;
+        presenter
+            .present_frame(output, frame)
+            .map_err(EngineError::from)
     }
 
     /// Stop any animation on `output`. The caller is about to take the output over.
@@ -1744,8 +2198,8 @@ impl Engine {
         let in_flight = self
             .transitions
             .lock()
-            .ok()
-            .and_then(|mut map| map.remove(output));
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(output);
         if let Some(entry) = in_flight {
             // Held until the end of the scope on purpose: this waits for the
             // in-flight frame to finish presenting before the caller draws.
@@ -1777,10 +2231,14 @@ impl Engine {
 
         // Take over the previous animation's renderer when there is one and the
         // surface size has not changed: that is what makes interruption seamless.
-        let existing = self.transitions.lock().ok().and_then(|map| {
+        let existing = {
+            let map = self
+                .transitions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             map.get(output)
                 .map(|entry| (Arc::clone(&entry.renderer), Arc::clone(&entry.progress)))
-        });
+        };
 
         let (renderer, progress) = match existing {
             Some((renderer, progress)) => {
@@ -1802,8 +2260,10 @@ impl Engine {
             None => self.build_transition(gpu, size, from, to, kind)?,
         };
 
-        if let Ok(mut map) = self.transitions.lock() {
-            map.insert(
+        self.transitions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
                 output.to_string(),
                 InFlight {
                     epoch,
@@ -1811,7 +2271,6 @@ impl Engine {
                     progress: Arc::clone(&progress),
                 },
             );
-        }
 
         let started = Instant::now();
         let mut frames = 0_u32;
@@ -1887,46 +2346,88 @@ impl Engine {
 
     /// Remove OWE's wallpaper from the resolved outputs.
     pub fn clear(&self, target: &OutputTarget) -> Result<Vec<String>, EngineError> {
-        self.start();
-
+        let report = self.start();
+        report.backend_failure()?;
+        let shell = self.shell_config();
+        let routed = report
+            .backend
+            .as_deref()
+            .and_then(|id| self.backend(id))
+            .filter(|backend| backend.draw_mode(&shell) == DrawMode::ShellRouted);
         let outputs = self
             .outputs
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let selected = owe_core::output::resolve(&outputs, target)?;
+        let shell_output = if self.selects_every_output(&selected) {
+            None
+        } else {
+            selected.first().map(|output| output.name.as_str())
+        };
 
-        let mut cleared = Vec::new();
-        let presenter_guard = self
-            .presenter
-            .lock()
-            .map_err(|_| EngineError::NoGpu("presenter lock poisoned".to_string()))?;
-
-        for output in selected {
-            if let Some(presenter) = presenter_guard.as_ref() {
-                presenter.clear(&output.name)?;
+        if let Some(backend) = routed {
+            let outcome = backend.clear_wallpaper(&shell, shell_output)?;
+            if !matches!(outcome, ApplyOutcome::Routed { .. }) {
+                return Err(EngineError::Shell(ShellError::Backend {
+                    backend: backend.id().to_string(),
+                    detail: "the backend claims shell-routed ownership but declined the \
+                              clear request; refusing to fall back to a daemon surface"
+                        .to_string(),
+                }));
             }
-            if let Ok(mut workers) = self.workers.lock()
-                && let Some(worker) = workers.get_mut(&output.name)
-            {
-                worker.clear();
-            }
-            if let Ok(mut session) = self.session.lock() {
-                session.remove(&output.name);
-            }
-            if let Ok(mut shown) = self.applied.lock() {
-                shown.remove(&output.name);
-            }
-            cleared.push(output.name.clone());
         }
 
-        let session = self
+        self.stop_transitions_for_outputs(&selected);
+        self.stop_playback_for_outputs(&selected);
+
+        let presenter = self
+            .presenter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(presenter) = presenter.as_ref() {
+            for output in &selected {
+                presenter.clear(&output.name)?;
+            }
+        }
+        drop(presenter);
+
+        let session_path = self.paths.state_dir.join("session.json");
+        let mut session = self
             .session
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        session.save(&self.paths.state_dir.join("session.json"))?;
-        Ok(cleared)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next_session = session.clone();
+        for output in &selected {
+            next_session.remove(&output.name);
+        }
+        next_session.save(&session_path)?;
+        *session = next_session;
+        drop(session);
+
+        {
+            let mut workers = self
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for output in &selected {
+                if let Some(worker) = workers.get_mut(&output.name) {
+                    worker.clear();
+                }
+            }
+        }
+        let mut applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for output in &selected {
+            applied.remove(&output.name);
+        }
+
+        Ok(selected
+            .into_iter()
+            .map(|output| output.name.clone())
+            .collect())
     }
 
     /// What OWE intends to show on one output, and where that intent comes from.
@@ -1936,14 +2437,17 @@ impl Engine {
     /// specific. Nothing configured anywhere means `None` — and OWE leaves that
     /// output alone rather than inventing a wallpaper for it.
     pub fn planned_wallpaper(&self, output: &OutputInfo) -> Option<PlannedWallpaper> {
-        if let Ok(session) = self.session.lock()
-            && let Some(entry) = session.get(&output.name)
-        {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = session.get(&output.name) {
             return Some(PlannedWallpaper {
                 reference: entry.reference.clone(),
                 source: PlanSource::Session,
             });
         }
+        drop(session);
 
         let resolved = output_config::resolve(&self.config.outputs, output)?;
         resolved.wallpaper().map(|reference| PlannedWallpaper {
@@ -1958,11 +2462,12 @@ impl Engine {
     /// removed outputs, re-applied wallpapers, released surfaces) so the daemon can
     /// log one honest line per hotplug instead of guessing.
     pub fn reconcile_outputs(&self, current: Vec<OutputInfo>) -> ReconcileReport {
+        let current = effective_outputs(current);
         let previous = self
             .outputs
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let events: Vec<HotplugEvent> = owe_core::supervisor::diff(&previous, &current);
 
         let mut report = ReconcileReport {
@@ -1986,7 +2491,11 @@ impl Engine {
         let connected: Vec<String> = current.iter().map(|output| output.name.clone()).collect();
 
         // Workers: one per live output, none for the dead ones.
-        if let Ok(mut workers) = self.workers.lock() {
+        {
+            let mut workers = self
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             workers.retain(|name, _| connected.contains(name));
             for output in &current {
                 workers
@@ -1996,19 +2505,20 @@ impl Engine {
         }
 
         let now = Instant::now();
-        let actions = self
-            .supervisor
-            .lock()
-            .map(|mut supervisor| {
-                let actions = supervisor.observe_snapshot(&previous, &current, now);
-                report.tracked = supervisor.present();
-                actions
-            })
-            .unwrap_or_default();
+        let actions = {
+            let mut supervisor = self
+                .supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let actions = supervisor.observe_snapshot(&previous, &current, now);
+            report.tracked = supervisor.present();
+            actions
+        };
 
-        if let Ok(mut slot) = self.outputs.lock() {
-            *slot = current.clone();
-        }
+        *self
+            .outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = current.clone();
 
         for action in actions {
             let name = action.output().to_string();
@@ -2045,22 +2555,27 @@ impl Engine {
                     }
                 }
                 SupervisorAction::Teardown { .. } => {
-                    // Release the surface and forget the worker, but keep the
-                    // session entry: a replug must restore the same wallpaper
-                    // (PRD-F-08).
                     self.stop_transition(&name);
-                    if let Ok(guard) = self.presenter.lock()
-                        && let Some(presenter) = guard.as_ref()
-                        && let Err(error) = presenter.clear(&name)
+                    self.stop_playback_output(&name);
                     {
-                        report.failures.push((name.clone(), error.to_string()));
+                        let presenter = self
+                            .presenter
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(presenter) = presenter.as_ref()
+                            && let Err(error) = presenter.clear(&name)
+                        {
+                            report.failures.push((name.clone(), error.to_string()));
+                        }
                     }
-                    if let Ok(mut workers) = self.workers.lock() {
-                        workers.remove(&name);
-                    }
-                    if let Ok(mut shown) = self.applied.lock() {
-                        shown.remove(&name);
-                    }
+                    self.workers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&name);
+                    self.applied
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&name);
                     report.cleared.push(name);
                 }
                 SupervisorAction::GiveUp { reason, .. } => {
@@ -2081,9 +2596,10 @@ impl Engine {
         // instant instead of the list the caller just gave us, and the *next*
         // reconcile would diff against the wrong baseline (found by the hotplug
         // cycle test: an unplugged output went unnoticed).
-        if let Ok(mut slot) = self.outputs.lock() {
-            *slot = current;
-        }
+        *self
+            .outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = current;
 
         report
     }
@@ -2112,13 +2628,13 @@ impl Engine {
         report.backend_failure()?;
         let backend = report.backend.as_deref().and_then(|id| self.backend(id));
         let listed = match backend.as_ref().map(|backend| backend.list_outputs()) {
-            Some(Ok(outputs)) => outputs,
+            Some(Ok(outputs)) => effective_outputs(outputs),
             Some(Err(error)) => {
                 tracing::warn!(%error, "cannot list outputs; keeping the previous list");
                 self.outputs
                     .lock()
-                    .map(|guard| guard.clone())
-                    .unwrap_or_default()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
             }
             None => Vec::new(),
         };
@@ -2126,16 +2642,100 @@ impl Engine {
         Ok((listed, reconcile))
     }
 
-    /// Content kinds this build can actually render.
+    pub fn handle_presenter_event(
+        &self,
+        event: &PresenterEvent,
+    ) -> Result<ReconcileReport, EngineError> {
+        match event {
+            PresenterEvent::Configured { output, size } => {
+                if size.0 == 0 || size.1 == 0 {
+                    return Ok(ReconcileReport::default());
+                }
+                let mut listed = self
+                    .outputs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if !listed.iter().any(|candidate| candidate.name == *output) {
+                    let report = self.start();
+                    report.backend_failure()?;
+                    let backend = report
+                        .backend
+                        .as_deref()
+                        .and_then(|id| self.backend(id))
+                        .ok_or_else(|| {
+                            EngineError::Shell(ShellError::Backend {
+                                backend: "unknown".to_string(),
+                                detail: "the presenter has an output the shell backend does not"
+                                    .to_string(),
+                            })
+                        })?;
+                    listed = effective_outputs(backend.list_outputs()?);
+                }
+                let Some(current) = listed
+                    .iter_mut()
+                    .find(|candidate| candidate.name == *output)
+                else {
+                    return Ok(ReconcileReport::default());
+                };
+                current.width = size.0;
+                current.height = size.1;
+                current.active = true;
+                Ok(self.reconcile_outputs(listed))
+            }
+            PresenterEvent::Closed { output } => {
+                let has_applied = self
+                    .applied
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(output);
+                if !has_applied {
+                    return Ok(ReconcileReport::default());
+                }
+                let listed = self
+                    .outputs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let Some(current) = listed.iter().find(|candidate| candidate.name == *output)
+                else {
+                    return Ok(ReconcileReport::default());
+                };
+                let Some(planned) = self.planned_wallpaper(current) else {
+                    return Ok(ReconcileReport::default());
+                };
+                let mut report = ReconcileReport::default();
+                match self.apply_planned(&planned, current) {
+                    Ok(reference) => report.applied.push((output.clone(), reference)),
+                    Err(error) => report.failures.push((output.clone(), error.to_string())),
+                }
+                Ok(report)
+            }
+            PresenterEvent::OutputAdded { .. } | PresenterEvent::OutputRemoved { .. } => {
+                self.refresh_outputs().map(|(_, report)| report)
+            }
+        }
+    }
+
+    /// Content kinds this build can actually render on this machine.
     ///
-    /// Still images only, and P4 is why the wording matters: `owe-media` can now
-    /// decode animated images and video, but presenting either needs a pacing loop
-    /// this daemon does not have yet, and `wallpaper.set` would accept a kind it can
-    /// only draw one frozen frame of. The machine's *decode* capability is reported
-    /// separately (`owe_media::media_backends()`, surfaced by `capabilities`), so
-    /// the two lists answer two questions instead of one list being quietly wrong.
+    /// Static images go through the still path; animated images and video go through
+    /// the frame clock, which paces their real timing and presents each frame
+    /// through the same presenter a still uses (FR-LIVE-5/6). Two of the three are
+    /// conditional on the *machine*, not on the build: video is advertised only when
+    /// a video runtime is on `PATH`, because a kind advertised here is a kind
+    /// `wallpaper.set` accepts — and an accepted kind that cannot be decoded is the
+    /// promise this list exists to prevent. Shaders wait for P5.
+    ///
+    /// The machine's *decode* capability is reported separately
+    /// (`owe_media::media_backends()`), so the two lists answer two questions
+    /// instead of one list being quietly wrong.
     pub fn content_kinds(&self) -> Vec<ContentKind> {
-        vec![ContentKind::StaticImage]
+        let mut kinds = vec![ContentKind::StaticImage, ContentKind::AnimatedImage];
+        if owe_media::any_video_runtime() {
+            kinds.push(ContentKind::Video);
+        }
+        kinds
     }
 
     /// Hand the presenter's event stream to the hotplug listener (FR-LIB-4).
@@ -2147,14 +2747,39 @@ impl Engine {
     ) -> Option<std::sync::mpsc::Receiver<owe_render::surface::PresenterEvent>> {
         self.presenter
             .lock()
-            .ok()
-            .and_then(|mut slot| slot.as_mut().and_then(Presenter::take_events))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+            .and_then(Presenter::take_events)
     }
 
     /// Shut the presenter down (used at exit, and by the hotplug driver's `Drop`
     /// so its blocking listener thread is released).
     pub fn stop_presenter(&self) {
-        let presenter = self.presenter.lock().ok().and_then(|mut slot| slot.take());
+        self.stop_playback();
+        let outputs = self
+            .outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let transition_outputs = self
+            .transitions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for output in outputs
+            .into_iter()
+            .map(|output| output.name)
+            .chain(transition_outputs)
+        {
+            self.stop_transition(&output);
+        }
+        let presenter = self
+            .presenter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         drop(presenter);
     }
 
@@ -2221,6 +2846,10 @@ impl Engine {
             .map(|id| (*id).to_string())
             .collect()
     }
+}
+
+fn effective_outputs(outputs: Vec<OutputInfo>) -> Vec<OutputInfo> {
+    outputs.into_iter().filter(|output| output.active).collect()
 }
 
 /// Environment lookup for detection, matching `owe_core`'s testable pattern.
@@ -2480,10 +3109,10 @@ mod tests {
             // cycle (lazy statics, the first SQLite/state page) is not a leak, so the
             // gate compares cycle 10 with cycle 20. That is what makes the assertion
             // about repeated plug cycles rather than about process startup.
-            if round == 9 || round == 19 {
-                if let Some(bytes) = resident_bytes() {
-                    rss_at.push((round, bytes));
-                }
+            if (round == 9 || round == 19)
+                && let Some(bytes) = resident_bytes()
+            {
+                rss_at.push((round, bytes));
             }
             let mut with_dock = base.to_vec();
             with_dock.push(output("HDMI-A-1", "Dell U2720Q"));
@@ -2672,13 +3301,22 @@ mod tests {
     #[test]
     fn capabilities_report_only_what_this_build_implements() {
         let engine = engine();
-        assert_eq!(engine.content_kinds(), vec![ContentKind::StaticImage]);
-        // The gap is deliberate and pinned: P4's decode layer knows more kinds than
-        // the presenter can pace, and a future pass that wires playback up has to
-        // edit this assertion rather than discovering the mismatch in a GUI.
+        // P4's playback half put animated images and video on the same path a still
+        // takes, so all three are renderable. Video is conditional on the *machine*
+        // — a kind is advertised only while a runtime exists to decode it — so the
+        // assertion is written against the probe rather than as a fixed list that
+        // would fail on a box with neither GStreamer nor FFmpeg installed.
+        let kinds = engine.content_kinds();
+        assert_eq!(kinds.first(), Some(&ContentKind::StaticImage));
+        assert_eq!(kinds.get(1), Some(&ContentKind::AnimatedImage));
+        assert_eq!(
+            kinds.contains(&ContentKind::Video),
+            owe_media::any_video_runtime(),
+            "video is advertised exactly when this machine can decode it"
+        );
         assert!(
-            owe_media::content_kinds().len() > engine.content_kinds().len(),
-            "aside from the decode/present split: decoding stays ahead of presenting"
+            owe_media::content_kinds().len() >= kinds.len(),
+            "the decode layer never knows less than the presenter"
         );
 
         // The durable invariant, rather than a hardcoded list that goes stale every
@@ -2867,15 +3505,19 @@ mod tests {
     #[test]
     fn applying_an_unsupported_kind_says_so_rather_than_decoding() {
         let engine = engine();
-        // A video is a valid reference and, since P4, decodable — but still not
-        // *renderable*: no playback loop paces the frames yet, so `wallpaper.set`
-        // must refuse it by name rather than pretend the file is broken.
+        // A shader is a valid reference and the kind P5 still owes: until then
+        // `wallpaper.set` must refuse it *by name* rather than pretend the reference
+        // is broken. Animated images and video left this test when the frame clock
+        // landed — they are in `content_kinds` now.
         let error = engine
-            .apply("/tmp/movie.mp4", &OutputTarget::All)
-            .expect_err("videos are not supported yet");
+            .apply("shader:aurora", &OutputTarget::All)
+            .expect_err("shaders are not supported yet");
         let text = error.to_string();
-        assert!(text.contains("video"), "{text}");
-        assert!(text.contains("not supported"), "{text}");
+        assert!(text.contains("shader"), "{text}");
+        assert!(
+            text.contains("P5") && text.contains("cannot be rendered"),
+            "the refusal must name the kind and the phase that lands it: {text}"
+        );
     }
 
     #[test]
@@ -3023,6 +3665,10 @@ mod tests {
             theme_refreshed: true,
             refuse_specific_output: false,
             calls: Mutex::new(Vec::new()),
+            clear_calls: Mutex::new(Vec::new()),
+            list_error: Mutex::new(false),
+            clear_error: Mutex::new(false),
+            not_applicable: Mutex::new(false),
         });
         engine.register_backend(shell.clone());
 
@@ -3077,6 +3723,10 @@ mod tests {
         /// monitor is expressible here too.
         refuse_specific_output: bool,
         calls: Mutex<Vec<Option<String>>>,
+        clear_calls: Mutex<Vec<Option<String>>>,
+        list_error: Mutex<bool>,
+        clear_error: Mutex<bool>,
+        not_applicable: Mutex<bool>,
     }
 
     impl RoutingShell {
@@ -3088,14 +3738,46 @@ mod tests {
                 theme_refreshed,
                 refuse_specific_output: true,
                 calls: Mutex::new(Vec::new()),
+                clear_calls: Mutex::new(Vec::new()),
+                list_error: Mutex::new(false),
+                clear_error: Mutex::new(false),
+                not_applicable: Mutex::new(false),
             })
         }
 
         fn calls(&self) -> Vec<Option<String>> {
             self.calls
                 .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn clear_calls(&self) -> Vec<Option<String>> {
+            self.clear_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn set_list_error(&self, value: bool) {
+            *self
+                .list_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+        }
+
+        fn set_clear_error(&self, value: bool) {
+            *self
+                .clear_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+        }
+
+        fn set_not_applicable(&self, value: bool) {
+            *self
+                .not_applicable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
         }
     }
 
@@ -3132,6 +3814,16 @@ mod tests {
         }
 
         fn list_outputs(&self) -> Result<Vec<OutputInfo>, ShellError> {
+            if *self
+                .list_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                return Err(ShellError::Backend {
+                    backend: self.id.to_string(),
+                    detail: "test list failure".to_string(),
+                });
+            }
             Ok(self.outputs.clone())
         }
 
@@ -3145,8 +3837,16 @@ mod tests {
             output: Option<&str>,
             wallpaper: &str,
         ) -> Result<ApplyOutcome, ShellError> {
-            if let Ok(mut calls) = self.calls.lock() {
-                calls.push(output.map(str::to_string));
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(output.map(str::to_string));
+            if *self
+                .not_applicable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                return Ok(ApplyOutcome::NotApplicable);
             }
             if let Some(name) = output
                 && self.refuse_specific_output
@@ -3161,6 +3861,31 @@ mod tests {
                 theme_refreshed: self.theme_refreshed,
             })
         }
+
+        fn clear_wallpaper(
+            &self,
+            _config: &owe_core::config::ShellConfig,
+            output: Option<&str>,
+        ) -> Result<ApplyOutcome, ShellError> {
+            self.clear_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(output.map(str::to_string));
+            if *self
+                .clear_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                return Err(ShellError::Backend {
+                    backend: self.id.to_string(),
+                    detail: "test clear failure".to_string(),
+                });
+            }
+            Ok(ApplyOutcome::Routed {
+                detail: "cleared via the shell".to_string(),
+                theme_refreshed: false,
+            })
+        }
     }
 
     fn routed_config(mode: &str) -> Config {
@@ -3168,6 +3893,306 @@ mod tests {
         config.shell.backend = "caelestia".to_string();
         config.shell.caelestia.mode = mode.to_string();
         config
+    }
+
+    #[test]
+    fn a_failed_shell_patch_keeps_the_previous_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("daemon-drawn"));
+        let current =
+            RoutingShell::shell(DrawMode::DaemonDrawn, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(current);
+        let failing = Arc::new(RoutingShell {
+            id: "failing-shell",
+            outputs: vec![output("DP-1", "Dock")],
+            mode: DrawMode::DaemonDrawn,
+            theme_refreshed: false,
+            refuse_specific_output: false,
+            calls: Mutex::new(Vec::new()),
+            clear_calls: Mutex::new(Vec::new()),
+            list_error: Mutex::new(false),
+            clear_error: Mutex::new(false),
+            not_applicable: Mutex::new(false),
+        });
+        failing.set_list_error(true);
+        engine.register_backend(failing);
+        let before = engine.shell_config();
+
+        let error = engine
+            .patch_shell(&ShellPatch {
+                backend: Some("failing-shell".to_string()),
+                ..ShellPatch::default()
+            })
+            .expect_err("the candidate backend cannot be adopted");
+
+        assert!(matches!(error, EngineError::Shell(_)), "{error:?}");
+        assert_eq!(engine.shell_config(), before);
+        assert_eq!(engine.shell_status().backend.as_deref(), Some("caelestia"));
+    }
+
+    #[test]
+    fn a_shell_patch_reconciles_the_new_effective_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("daemon-drawn"));
+        let old = RoutingShell::shell(DrawMode::DaemonDrawn, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(old);
+        engine.reconcile_outputs(vec![output("eDP-1", "Panel")]);
+
+        let replacement = Arc::new(RoutingShell {
+            id: "caelestia",
+            outputs: vec![output("DP-1", "Dock")],
+            mode: DrawMode::DaemonDrawn,
+            theme_refreshed: false,
+            refuse_specific_output: false,
+            calls: Mutex::new(Vec::new()),
+            clear_calls: Mutex::new(Vec::new()),
+            list_error: Mutex::new(false),
+            clear_error: Mutex::new(false),
+            not_applicable: Mutex::new(false),
+        });
+        engine.register_backend(replacement);
+
+        engine
+            .patch_shell(&ShellPatch {
+                caelestia_mode: Some("daemon-drawn".to_string()),
+                ..ShellPatch::default()
+            })
+            .expect("the candidate backend lists successfully");
+
+        let outputs = engine
+            .outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.name.as_str())
+                .collect::<Vec<_>>(),
+            ["DP-1"]
+        );
+        let workers = engine
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(workers.contains_key("DP-1"));
+        assert!(!workers.contains_key("eDP-1"));
+    }
+
+    #[test]
+    fn inactive_outputs_are_filtered_before_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("daemon-drawn"));
+        let active = output("eDP-1", "Panel");
+        let mut inactive = output("DP-1", "Dock");
+        inactive.active = false;
+        let shell = RoutingShell::shell(
+            DrawMode::DaemonDrawn,
+            false,
+            vec![active.clone(), inactive.clone()],
+        );
+        engine.register_backend(shell);
+
+        let (listed, report) = engine.refresh_outputs().expect("effective output refresh");
+        assert_eq!(listed, vec![active.clone()]);
+        assert!(report.is_empty());
+        let outputs = engine
+            .outputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(outputs, vec![active]);
+        let workers = engine
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(workers.contains_key("eDP-1"));
+        assert!(!workers.contains_key("DP-1"));
+    }
+
+    #[test]
+    fn shell_routed_media_does_not_fall_back_when_the_shell_declines() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell =
+            RoutingShell::shell(DrawMode::ShellRouted, false, vec![output("eDP-1", "Panel")]);
+        shell.set_not_applicable(true);
+        engine.register_backend(shell);
+
+        let error = engine
+            .apply("/missing/animation.gif", &OutputTarget::All)
+            .expect_err("a shell-routed backend must not silently hand media to playback");
+        assert!(matches!(error, EngineError::Shell(_)), "{error:?}");
+        assert!(engine.playback_outputs().is_empty());
+    }
+
+    #[test]
+    fn clear_uses_shell_semantics_and_releases_local_playback_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell =
+            RoutingShell::shell(DrawMode::ShellRouted, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell.clone());
+        engine.reconcile_outputs(vec![output("eDP-1", "Panel")]);
+        engine
+            .playback_sizes
+            .lock()
+            .unwrap()
+            .insert("eDP-1".to_string(), (1920, 1080));
+
+        let cleared = engine
+            .clear(&OutputTarget::All)
+            .expect("shell clear succeeds");
+        assert_eq!(cleared, vec!["eDP-1".to_string()]);
+        assert_eq!(shell.clear_calls(), vec![None]);
+        assert!(!engine.playback_sizes.lock().unwrap().contains_key("eDP-1"));
+    }
+
+    #[test]
+    fn a_refused_shell_clear_keeps_the_recorded_wallpaper() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell =
+            RoutingShell::shell(DrawMode::ShellRouted, false, vec![output("eDP-1", "Panel")]);
+        shell.set_clear_error(true);
+        engine.register_backend(shell);
+        engine
+            .session
+            .lock()
+            .unwrap()
+            .set("eDP-1", "/walls/keep.png", "static-image");
+
+        let error = engine
+            .clear(&OutputTarget::All)
+            .expect_err("the shell refused to clear");
+        assert!(matches!(error, EngineError::Shell(_)), "{error:?}");
+        assert_eq!(
+            engine
+                .session
+                .lock()
+                .unwrap()
+                .get("eDP-1")
+                .map(|entry| entry.reference.as_str()),
+            Some("/walls/keep.png")
+        );
+    }
+
+    #[test]
+    fn shell_routed_media_is_owned_by_the_shell_in_both_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("shell-routed"));
+        let shell =
+            RoutingShell::shell(DrawMode::ShellRouted, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell.clone());
+
+        let animated = engine
+            .apply("/missing/animation.gif", &OutputTarget::All)
+            .expect("the shell owns animated media");
+        let video = engine
+            .apply("/missing/movie.mp4", &OutputTarget::All)
+            .expect("the shell owns video media");
+
+        assert!(animated.routed);
+        assert!(video.routed);
+        assert_eq!(shell.calls(), vec![None, None]);
+        assert!(engine.playback_outputs().is_empty());
+    }
+    #[test]
+    fn clear_releases_playback_state_for_the_selected_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("daemon-drawn"));
+        let shell =
+            RoutingShell::shell(DrawMode::DaemonDrawn, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell);
+        engine
+            .playback_sizes
+            .lock()
+            .unwrap()
+            .insert("eDP-1".to_string(), (1920, 1080));
+
+        let cleared = engine.clear(&OutputTarget::All).expect("clear succeeds");
+        assert_eq!(cleared, vec!["eDP-1".to_string()]);
+        assert!(!engine.playback_sizes.lock().unwrap().contains_key("eDP-1"));
+        assert!(engine.playback_outputs().is_empty());
+    }
+
+    #[test]
+    fn hotplug_teardown_releases_playback_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("daemon-drawn"));
+        let shell =
+            RoutingShell::shell(DrawMode::DaemonDrawn, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell);
+        engine.reconcile_outputs(vec![output("eDP-1", "Panel")]);
+        engine
+            .playback_sizes
+            .lock()
+            .unwrap()
+            .insert("eDP-1".to_string(), (1920, 1080));
+
+        let report = engine.reconcile_outputs(Vec::new());
+        assert!(report.cleared.contains(&"eDP-1".to_string()));
+        assert!(!engine.playback_sizes.lock().unwrap().contains_key("eDP-1"));
+    }
+
+    #[test]
+    fn a_failed_still_decode_does_not_release_existing_playback_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("daemon-drawn"));
+        let shell =
+            RoutingShell::shell(DrawMode::DaemonDrawn, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell);
+        engine.reconcile_outputs(vec![output("eDP-1", "Panel")]);
+        engine
+            .playback_sizes
+            .lock()
+            .unwrap()
+            .insert("eDP-1".to_string(), (1280, 720));
+
+        let error = engine
+            .apply("/missing/still.png", &OutputTarget::All)
+            .expect_err("the missing still cannot be decoded");
+        assert!(matches!(error, EngineError::Media(_)), "{error:?}");
+        assert_eq!(
+            engine.playback_sizes.lock().unwrap().get("eDP-1"),
+            Some(&(1280, 720))
+        );
+    }
+
+    #[test]
+    fn a_failed_playback_present_drops_its_cached_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine_in(dir.path(), Config::default()));
+        engine.attach_playback();
+        engine
+            .playback_sizes
+            .lock()
+            .unwrap()
+            .insert("eDP-1".to_string(), (1280, 720));
+        let frame = owe_media::DecodedFrame::new(0, 2, 2, Duration::from_millis(100), vec![0; 16])
+            .expect("test frame");
+
+        let error = engine
+            .playback_sink
+            .show("eDP-1", &frame)
+            .expect_err("headless presentation cannot succeed");
+        assert!(!error.is_empty());
+        assert!(!engine.playback_sizes.lock().unwrap().contains_key("eDP-1"));
+    }
+
+    #[test]
+    fn daemon_drawn_media_uses_the_playback_path_instead_of_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path(), routed_config("daemon-drawn"));
+        let shell =
+            RoutingShell::shell(DrawMode::DaemonDrawn, false, vec![output("eDP-1", "Panel")]);
+        engine.register_backend(shell.clone());
+
+        let error = engine
+            .apply("/missing/animation.gif", &OutputTarget::All)
+            .expect_err("the missing file reaches playback, not routing");
+        assert!(matches!(error, EngineError::Playback(_)), "{error:?}");
+        assert!(shell.calls().is_empty());
     }
 
     #[test]

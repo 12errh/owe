@@ -19,7 +19,7 @@ use crate::frame::FrameError;
 pub const SCHEMA_MAJOR: u32 = 1;
 
 /// Schema minor version of this build. Additive change ⇒ bump.
-pub const SCHEMA_MINOR: u32 = 1;
+pub const SCHEMA_MINOR: u32 = 2;
 
 /// A `(major, minor)` schema version pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +225,15 @@ pub mod event {
     pub const SCAN_PROGRESS: &str = "scan_progress";
     /// Non-fatal error worth showing in the GUI.
     pub const DAEMON_ERROR: &str = "error";
+
+    #[allow(missing_docs)]
+    pub const ALL: &[&str] = &[
+        OUTPUTS_CHANGED,
+        WALLPAPER_CHANGED,
+        POLICY_CHANGED,
+        SCAN_PROGRESS,
+        DAEMON_ERROR,
+    ];
 }
 
 /// Machine-readable error codes (TRD FR-CORE-6).
@@ -329,6 +338,9 @@ pub struct HelloReply {
 pub struct Capabilities {
     /// Protocol methods implemented by this build (subset of [`method::ALL`]).
     pub methods: Vec<String>,
+    #[serde(default)]
+    #[allow(missing_docs)]
+    pub events: Vec<String>,
     /// Shell backend ids **registered and usable** in this build.
     ///
     /// Registered, not "known to the project": a backend that exists only in the
@@ -505,6 +517,7 @@ mod tests {
             schema: SchemaVersion::CURRENT,
             capabilities: Capabilities {
                 methods: vec![method::HELLO.to_string()],
+                events: Vec::new(),
                 shell_backends: vec!["hyprland".into()],
                 content_kinds: vec!["static-image".into()],
                 media_backends: vec!["auto".into()],
@@ -512,18 +525,16 @@ mod tests {
                 unavailable: vec!["caelestia: planned for P3".into()],
             },
         };
-        // A P0-era client that predates `unavailable` must still parse the reply:
-        // the field is additive by design. This asserts that promise.
         let older: HelloReply = serde_json::from_value({
             let mut value = serde_json::to_value(&reply).unwrap();
-            value["capabilities"]
-                .as_object_mut()
-                .unwrap()
-                .remove("unavailable");
+            let capabilities = value["capabilities"].as_object_mut().unwrap();
+            capabilities.remove("unavailable");
+            capabilities.remove("events");
             value
         })
-        .expect("a reply without `unavailable` must still deserialize");
+        .expect("a reply without newer capability fields must still deserialize");
         assert!(older.capabilities.unavailable.is_empty());
+        assert!(older.capabilities.events.is_empty());
 
         let value = serde_json::to_value(&reply).unwrap();
         let back: HelloReply = serde_json::from_value(value).unwrap();
@@ -537,6 +548,15 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), before, "duplicate method name in method::ALL");
+    }
+
+    #[test]
+    fn event_names_are_unique() {
+        let mut names = event::ALL.to_vec();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate event name in event::ALL");
     }
 
     #[test]

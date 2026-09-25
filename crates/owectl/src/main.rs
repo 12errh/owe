@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use owe_core::path::XdgPaths;
@@ -95,6 +96,17 @@ enum Command {
         monitor: Option<String>,
     },
 
+    /// Show per-output playback and decode statistics.
+    Stats {
+        /// Output name; omit to show every output.
+        #[arg(short, long)]
+        monitor: Option<String>,
+    },
+
+    /// Control playback on an output.
+    #[command(subcommand)]
+    Playback(PlaybackCommand),
+
     /// Browse and rescan the indexed wallpaper library.
     #[command(subcommand)]
     Library(LibraryCommand),
@@ -105,6 +117,29 @@ enum Command {
 
     /// Ask the daemon to shut down.
     Kill,
+}
+
+#[derive(Debug, Subcommand)]
+enum PlaybackCommand {
+    Play {
+        #[arg(short, long)]
+        monitor: Option<String>,
+    },
+    Pause {
+        #[arg(short, long)]
+        monitor: Option<String>,
+    },
+    Seek {
+        seconds: f64,
+        #[arg(short, long)]
+        monitor: Option<String>,
+    },
+    Loop {
+        start: f64,
+        end: f64,
+        #[arg(short, long)]
+        monitor: Option<String>,
+    },
 }
 
 /// `owectl library …`: the indexed library (FR-LIB-1/2).
@@ -217,15 +252,16 @@ fn resolve_socket(cli: &Cli) -> Result<PathBuf, Failure> {
 
 fn run(cli: &Cli) -> Result<(), Failure> {
     let socket = resolve_socket(cli)?;
-    let mut client = Client::connect(&socket).map_err(|error| {
-        Failure::new(
-            EXIT_CONNECTION_ERROR,
-            format!(
-                "cannot connect to {}: {error} (is owed running?)",
-                socket.display()
-            ),
-        )
-    })?;
+    let mut client =
+        Client::connect_with_timeout(&socket, Duration::from_secs(30)).map_err(|error| {
+            Failure::new(
+                EXIT_CONNECTION_ERROR,
+                format!(
+                    "cannot connect to {}: {error} (is owed running?)",
+                    socket.display()
+                ),
+            )
+        })?;
 
     // Mandatory handshake: it also tells us the schema we are speaking.
     let hello = client
@@ -257,6 +293,14 @@ fn run(cli: &Cli) -> Result<(), Failure> {
             println!(
                 "implemented methods: {}",
                 hello.capabilities.methods.join(", ")
+            );
+            println!(
+                "ipc events: {}",
+                if hello.capabilities.events.is_empty() {
+                    "none".to_string()
+                } else {
+                    hello.capabilities.events.join(", ")
+                }
             );
             println!(
                 "shell backends: {}",
@@ -358,10 +402,102 @@ fn render(command: &Command, value: &Value) -> String {
                 format!("cleared {}", join_strings(&cleared))
             }
         }
+        Command::Stats { .. } => render_stats(value),
+        Command::Playback(command) => render_playback(command, value),
         Command::Kill => "daemon is shutting down".to_string(),
         Command::Library(command) => render_library(command, value),
         Command::Shell(command) => render_shell(command, value),
     }
+}
+
+fn render_stats(value: &Value) -> String {
+    let rows = value["stats"].as_array().cloned().unwrap_or_default();
+    let rss = value["rss_bytes"]
+        .as_u64()
+        .map(|bytes| format!("{:.1} MiB", bytes as f64 / 1_048_576.0))
+        .unwrap_or_else(|| "unavailable".to_string());
+    let mut lines = vec![
+        format!("daemon rss: {rss}"),
+        format!(
+            "governor: {}",
+            if value["paused"] == json!(true) {
+                "paused"
+            } else {
+                "running"
+            }
+        ),
+    ];
+    if rows.is_empty() {
+        lines.push("no output statistics available".to_string());
+        return lines.join("\n");
+    }
+    for row in rows {
+        let fps = row["fps"]
+            .as_f64()
+            .map(|value| format!("{value:.2} fps"))
+            .unwrap_or_else(|| "fps unavailable".to_string());
+        let position = row["position_ms"]
+            .as_u64()
+            .map(|value| format!("{:.2} s", value as f64 / 1000.0))
+            .unwrap_or_else(|| "position unavailable".to_string());
+        lines.push(format!(
+            "{}  {}  {}  {}  decode {} ({})  {}  {} buffer(s), {} bytes",
+            row["output"].as_str().unwrap_or("?"),
+            if row["playing"] == json!(true) {
+                "playing"
+            } else if row["held"] == json!(true) {
+                "held"
+            } else {
+                "stopped"
+            },
+            row["kind"].as_str().unwrap_or("?"),
+            fps,
+            row["decode"].as_str().unwrap_or("unknown"),
+            row["decoder"].as_str().unwrap_or("unknown"),
+            position,
+            row["buffers"].as_u64().unwrap_or(0),
+            row["buffer_bytes"].as_u64().unwrap_or(0),
+        ));
+        if let Some(failure) = row["failed"].as_str() {
+            lines.push(format!("  failed: {failure}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_playback(command: &PlaybackCommand, value: &Value) -> String {
+    let states = value["states"]
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            value["state"]
+                .as_object()
+                .map(|_| vec![value["state"].clone()])
+        })
+        .unwrap_or_default();
+    let action = match command {
+        PlaybackCommand::Play { .. } => "play",
+        PlaybackCommand::Pause { .. } => "pause",
+        PlaybackCommand::Seek { .. } => "seek",
+        PlaybackCommand::Loop { .. } => "loop",
+    };
+    if states.is_empty() {
+        return format!("{action}: no playback state returned");
+    }
+    states
+        .into_iter()
+        .map(|state| {
+            format!(
+                "{} {} at {:.2} s — decode {} ({})",
+                action,
+                state["output"].as_str().unwrap_or("?"),
+                state["position_ms"].as_f64().unwrap_or(0.0) / 1000.0,
+                state["decode"].as_str().unwrap_or("unknown"),
+                state["decoder"].as_str().unwrap_or("unknown"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Human-readable rendering of a `shell …` reply.
@@ -628,6 +764,10 @@ fn dispatch(client: &mut Client, command: &Command) -> Result<Value, Failure> {
                 json!({ "output": monitor.clone().unwrap_or_else(|| "all".into()) }),
             )
             .map_err(map_client_error),
+        Command::Stats { monitor } => client
+            .call(method::STATS_GET, stats_params(monitor.as_deref()))
+            .map_err(map_client_error),
+        Command::Playback(command) => dispatch_playback(client, command),
         Command::Library(command) => dispatch_library(client, command),
         Command::Shell(command) => dispatch_shell(client, command),
         Command::Kill => client
@@ -672,6 +812,39 @@ fn dispatch_shell(client: &mut Client, command: &ShellCommand) -> Result<Value, 
                 .map_err(map_client_error)
         }
     }
+}
+
+fn stats_params(monitor: Option<&str>) -> Value {
+    match monitor {
+        Some(monitor) => json!({ "output": monitor }),
+        None => json!({}),
+    }
+}
+
+fn dispatch_playback(client: &mut Client, command: &PlaybackCommand) -> Result<Value, Failure> {
+    let (monitor, cmd) = match command {
+        PlaybackCommand::Play { monitor } => (monitor.as_deref(), json!("play")),
+        PlaybackCommand::Pause { monitor } => (monitor.as_deref(), json!("pause")),
+        PlaybackCommand::Seek { seconds, monitor } => {
+            (monitor.as_deref(), json!({ "seek": seconds }))
+        }
+        PlaybackCommand::Loop {
+            start,
+            end,
+            monitor,
+        } => (
+            monitor.as_deref(),
+            json!({ "loop": { "a": start, "b": end } }),
+        ),
+    };
+    let mut params = serde_json::Map::new();
+    if let Some(monitor) = monitor {
+        params.insert("output".to_string(), json!(monitor));
+    }
+    params.insert("cmd".to_string(), cmd);
+    client
+        .call(method::PLAYBACK_CMD, Value::Object(params))
+        .map_err(map_client_error)
 }
 
 fn dispatch_library(client: &mut Client, command: &LibraryCommand) -> Result<Value, Failure> {
@@ -774,6 +947,34 @@ mod tests {
     }
 
     #[test]
+    fn playback_and_stats_parse_with_their_monitoring_options() {
+        let cli = Cli::try_parse_from(["owectl", "stats", "--monitor", "DP-1"]).unwrap();
+        assert!(matches!(cli.command, Command::Stats { monitor: Some(name) } if name == "DP-1"));
+
+        let cli =
+            Cli::try_parse_from(["owectl", "playback", "seek", "1.5", "--monitor", "HDMI-A-1"])
+                .unwrap();
+        let Command::Playback(PlaybackCommand::Seek { seconds, monitor }) = cli.command else {
+            panic!("expected seek");
+        };
+        assert_eq!(seconds, 1.5);
+        assert_eq!(monitor.as_deref(), Some("HDMI-A-1"));
+
+        let cli = Cli::try_parse_from(["owectl", "playback", "loop", "0", "2"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Playback(PlaybackCommand::Loop { start, end, .. })
+                if start == 0.0 && end == 2.0
+        ));
+    }
+
+    #[test]
+    fn stats_params_omit_an_unset_output() {
+        assert_eq!(stats_params(None), json!({}));
+        assert_eq!(stats_params(Some("DP-1")), json!({ "output": "DP-1" }));
+    }
+
+    #[test]
     fn subcommands_parse_as_documented() {
         let cli = Cli::try_parse_from(["owectl", "set", "~/wall.png", "-m", "DP-1"]).unwrap();
         match cli.command {
@@ -815,6 +1016,8 @@ mod tests {
             method::LIBRARY_SCAN,
             method::LIBRARY_LIST,
             method::LIBRARY_THUMB,
+            method::STATS_GET,
+            method::PLAYBACK_CMD,
         ] {
             assert!(protocol::method::ALL.contains(&named), "{named}");
         }

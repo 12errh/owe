@@ -20,6 +20,7 @@ mod events;
 mod handler;
 mod hotplug;
 mod library;
+mod playback;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -172,6 +173,10 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
     // Start the engine before serving: its report is the honest summary of what
     // this session can actually do, and it never fails (see Engine::start).
     let engine = Arc::new(Engine::new(config.clone(), paths.clone()));
+    // The frame clocks outlive the requests that start them, so they draw through
+    // a handle to this engine rather than a borrow of it: attached here, once the
+    // `Arc` exists, and before anything can call `wallpaper.set`.
+    engine.attach_playback();
     let report = engine.start();
 
     match (&report.backend, &report.backend_error) {
@@ -342,8 +347,11 @@ fn run(cli: &Cli) -> Result<u8, Failure> {
         )
     })?;
 
-    // Shutdown order: the presenter first (this is what releases the hotplug
-    // listener's blocking recv), then the listeners, then the leftovers.
+    // Shutdown order: the running wallpaper clocks first — their threads draw
+    // through the presenter, so stopping them before it is torn down keeps the last
+    // frame from racing the teardown — then the presenter (this is what releases the
+    // hotplug listener's blocking recv), then the listeners, then the leftovers.
+    engine.stop_playback();
     engine.stop_presenter();
     drop(hotplug);
     event_shutdown.request();

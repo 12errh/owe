@@ -53,6 +53,14 @@ for sock in "$real_runtime"/wayland-*; do
 done
 [ -d "$real_runtime/hypr" ] && ln -sfn "$real_runtime/hypr" "$XDG_RUNTIME_DIR/hypr"
 
+config="$sandbox/config.toml"
+printf '%s\n' \
+  'schema = 1' \
+  '[shell]' \
+  'backend = "hyprland"' \
+  '[shell.caelestia]' \
+  'mode = "daemon-drawn"' >"$config"
+
 # A four-quadrant image: solid, saturated colours make pixel proof unambiguous
 # (a photo would make "did our render land?" a judgement call).
 image="$sandbox/quadrants.png"
@@ -86,7 +94,7 @@ cleanup() {
 trap cleanup EXIT
 
 step "starting the daemon"
-"$DAEMON" >"$sandbox/daemon.log" 2>&1 &
+"$DAEMON" --config "$config" >"$sandbox/daemon.log" 2>&1 &
 daemon_pid=$!
 for _ in $(seq 50); do
   [ -S "$XDG_RUNTIME_DIR/owe/socket" ] && break

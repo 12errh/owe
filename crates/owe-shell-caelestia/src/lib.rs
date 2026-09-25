@@ -55,7 +55,9 @@ use std::process::Command;
 use owe_core::config::{CaelestiaConfig, ShellConfig};
 use owe_core::output::OutputInfo;
 use owe_core::path::expand_with;
-use owe_core::shell::{ApplyOutcome, Detection, DrawMode, EnvLookup, ShellBackend, ShellError};
+use owe_core::shell::{
+    ApplyOutcome, Confidence, Detection, DrawMode, EnvLookup, ShellBackend, ShellError,
+};
 
 /// The id this backend registers under (`shell.backend = caelestia`).
 pub const ID: &str = "caelestia";
@@ -442,7 +444,7 @@ impl ShellBackend for CaelestiaBackend {
     }
 
     fn detect(&self, env: EnvLookup<'_>) -> bool {
-        detect_from(env, &(self.processes)()).is_detected()
+        detect_from(env, &(self.processes)()).confidence == Confidence::Strong
     }
 
     fn detection(&self, env: EnvLookup<'_>) -> Detection {
@@ -486,6 +488,9 @@ impl ShellBackend for CaelestiaBackend {
         output: Option<&str>,
         wallpaper: &str,
     ) -> Result<ApplyOutcome, ShellError> {
+        if self.draw_mode(config) != DrawMode::ShellRouted {
+            return Ok(ApplyOutcome::NotApplicable);
+        }
         if let Some(name) = output {
             return Err(ShellError::Backend {
                 backend: ID.to_string(),
@@ -541,8 +546,10 @@ impl ShellBackend for CaelestiaBackend {
         config: &ShellConfig,
         output: Option<&str>,
     ) -> Result<ApplyOutcome, ShellError> {
+        if self.draw_mode(config) != DrawMode::ShellRouted {
+            return Ok(ApplyOutcome::NotApplicable);
+        }
         let _ = output;
-        let _ = config;
         Err(ShellError::Backend {
             backend: ID.to_string(),
             detail: "Caelestia cannot express `no wallpaper`: it always keeps one and its \
@@ -675,6 +682,21 @@ mod tests {
             "{}",
             detection.reason
         );
+    }
+
+    #[test]
+    fn an_installed_but_idle_cli_does_not_satisfy_boolean_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join(BINARY);
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().display().to_string();
+        let backend = CaelestiaBackend::with_env(
+            std::sync::Arc::new(Vec::new),
+            std::sync::Arc::new(move |name| (name == "PATH").then(|| path.clone())),
+        );
+        assert!(!backend.detect(backend.env_lookup()));
     }
 
     #[test]
@@ -844,6 +866,20 @@ mod tests {
         assert_eq!(
             backend.draw_mode(&config("nonsense", true)),
             DrawMode::DaemonDrawn
+        );
+    }
+
+    #[test]
+    fn daemon_drawn_apply_and_clear_are_not_shell_operations() {
+        let backend = CaelestiaBackend::new();
+        let daemon = config("daemon-drawn", true);
+        assert_eq!(
+            backend.apply_wallpaper(&daemon, Some("eDP-1"), "/missing.png"),
+            Ok(ApplyOutcome::NotApplicable)
+        );
+        assert_eq!(
+            backend.clear_wallpaper(&daemon, Some("eDP-1")),
+            Ok(ApplyOutcome::NotApplicable)
         );
     }
 

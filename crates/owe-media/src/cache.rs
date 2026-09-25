@@ -62,16 +62,44 @@ impl Compression {
     /// Expand one frame's pixels back to `raw_len` bytes.
     fn decode(self, data: &[u8], raw_len: usize) -> Result<Vec<u8>, MediaError> {
         match self {
-            Compression::None => Ok(data.to_vec()),
+            Compression::None => {
+                if data.len() != raw_len {
+                    return Err(MediaError::Cache {
+                        detail: "uncompressed frame length does not match its image".to_string(),
+                    });
+                }
+                Ok(data.to_vec())
+            }
             Compression::Zstd => {
                 zstd::bulk::decompress(data, raw_len).map_err(|error| MediaError::Cache {
                     detail: format!("zstd frame is not readable: {error}"),
                 })
             }
             Compression::Lz4 => {
-                lz4_flex::decompress_size_prepended(data).map_err(|error| MediaError::Cache {
-                    detail: format!("lz4 frame is not readable: {error}"),
-                })
+                let size = data
+                    .get(..4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte slice")))
+                    .ok_or_else(|| MediaError::Cache {
+                        detail: "lz4 frame has no size prefix".to_string(),
+                    })?;
+                if usize::try_from(size).ok() != Some(raw_len) {
+                    return Err(MediaError::Cache {
+                        detail: "lz4 frame size does not match its image".to_string(),
+                    });
+                }
+                let mut pixels = vec![0; raw_len];
+                let written =
+                    lz4_flex::decompress_into(&data[4..], &mut pixels).map_err(|error| {
+                        MediaError::Cache {
+                            detail: format!("lz4 frame is not readable: {error}"),
+                        }
+                    })?;
+                if written != raw_len {
+                    return Err(MediaError::Cache {
+                        detail: "lz4 frame decoded to the wrong length".to_string(),
+                    });
+                }
+                Ok(pixels)
             }
         }
     }
@@ -181,12 +209,20 @@ impl FrameCache {
     /// for a pointless one.
     pub fn insert(&mut self, frame: &DecodedFrame) -> Result<bool, MediaError> {
         let data = self.compression.encode(frame.pixels());
-        if self.stored_bytes + data.len() > self.cap_bytes {
-            self.refusals += 1;
+        let Some(stored_bytes) = self.stored_bytes.checked_add(data.len()) else {
+            self.refusals = self.refusals.saturating_add(1);
+            return Ok(false);
+        };
+        let Some(raw_bytes) = self.raw_bytes.checked_add(frame.pixels().len()) else {
+            self.refusals = self.refusals.saturating_add(1);
+            return Ok(false);
+        };
+        if stored_bytes > self.cap_bytes {
+            self.refusals = self.refusals.saturating_add(1);
             return Ok(false);
         }
-        self.stored_bytes += data.len();
-        self.raw_bytes += frame.pixels().len();
+        self.stored_bytes = stored_bytes;
+        self.raw_bytes = raw_bytes;
         self.frames.push_back(CachedFrame {
             index: frame.index(),
             width: frame.width(),
@@ -370,6 +406,20 @@ mod tests {
         let error = cache.get(0).expect_err("corrupt data must not decode");
         assert!(matches!(error, MediaError::Cache { .. }), "{error}");
         assert!(error.to_string().contains("zstd"), "{error}");
+    }
+
+    #[test]
+    fn lz4_size_prefix_cannot_request_an_unbounded_allocation() {
+        let mut cache = FrameCache::new(1 << 20, Compression::Lz4);
+        assert!(cache.insert(&frame(0, 3)).expect("insert"));
+        if let Some(entry) = cache.frames.front_mut() {
+            entry.data[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        let error = cache
+            .get(0)
+            .expect_err("a corrupt size prefix must not allocate from the cache");
+        assert!(matches!(error, MediaError::Cache { .. }), "{error}");
+        assert!(error.to_string().contains("size"), "{error}");
     }
 
     #[test]

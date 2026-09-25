@@ -238,6 +238,7 @@ fn serve_connection(stream: UnixStream, handler: Arc<dyn Handler>) -> std::io::R
     let mut reader = BufReader::new(stream);
     let mut decoder = FrameDecoder::new();
     let mut buffer = [0_u8; 8192];
+    let mut handshaken = false;
 
     loop {
         let read = match reader.read(&mut buffer) {
@@ -261,7 +262,7 @@ fn serve_connection(stream: UnixStream, handler: Arc<dyn Handler>) -> std::io::R
         loop {
             match decoder.next_frame() {
                 Ok(Some(payload)) => {
-                    let reply = handle_payload(&*handler, &payload);
+                    let reply = handle_payload(&*handler, &payload, &mut handshaken);
                     if write_reply(&mut writer, &reply).is_err() {
                         return Ok(());
                     }
@@ -289,14 +290,27 @@ fn serve_connection(stream: UnixStream, handler: Arc<dyn Handler>) -> std::io::R
     }
 }
 
-fn handle_payload(handler: &dyn Handler, payload: &[u8]) -> ReplyFrame {
+fn handle_payload(handler: &dyn Handler, payload: &[u8], handshaken: &mut bool) -> ReplyFrame {
     match protocol::decode_request(payload) {
         Ok(request) => {
             tracing::trace!(id = %request.id, method = %request.method, "ipc request");
-            match handler.handle(&request) {
+            if !*handshaken && request.method != protocol::method::HELLO {
+                return ReplyFrame::err(
+                    request.id,
+                    ErrorBody::bad_request(format!(
+                        "hello must be the first request; received `{}`",
+                        request.method
+                    )),
+                );
+            }
+            let reply = match handler.handle(&request) {
                 Ok(value) => ReplyFrame::ok(request.id, value),
                 Err(error) => ReplyFrame::err(request.id, error),
+            };
+            if request.method == protocol::method::HELLO && reply.ok.is_some() {
+                *handshaken = true;
             }
+            reply
         }
         Err(error) => ReplyFrame::err(
             protocol::extract_id(payload),

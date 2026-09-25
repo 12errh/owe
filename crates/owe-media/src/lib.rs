@@ -44,8 +44,8 @@ pub use still::{
     decode_file_with_budget, thumbnail_png, thumbnail_png_from, thumbnail_size,
 };
 pub use video::{
-    VaapiStatus, VideoDecoder, ffmpeg_frame_argv, gstreamer_frame_argv, vaapi_failure_marks,
-    vaapi_status,
+    DecoderCancellation, VaapiStatus, VideoDecoder, ffmpeg_frame_argv, gstreamer_frame_argv,
+    vaapi_failure_marks, vaapi_status,
 };
 
 // Re-exported because it is part of this crate's own public surface: [`open`] and
@@ -206,6 +206,35 @@ impl MediaError {
     }
 }
 
+pub(crate) fn pixel_count(width: u32, height: u32) -> Option<u64> {
+    u64::from(width).checked_mul(u64::from(height))
+}
+
+pub(crate) fn rgba8_buffer_len(width: u32, height: u32) -> Option<usize> {
+    pixel_count(width, height)?
+        .checked_mul(4)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+}
+
+pub(crate) fn bounded_frame_len(
+    path: &Path,
+    width: u32,
+    height: u32,
+    max_pixels: u64,
+) -> Result<usize, MediaError> {
+    let pixels = pixel_count(width, height).unwrap_or(u64::MAX);
+    if pixels <= max_pixels {
+        if let Some(bytes) = rgba8_buffer_len(width, height) {
+            return Ok(bytes);
+        }
+    }
+    Err(MediaError::TooLarge {
+        path: path.display().to_string(),
+        pixels: pixels.div_ceil(1_000_000),
+        limit: max_pixels / 1_000_000,
+    })
+}
+
 /// Static metadata about a piece of content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaInfo {
@@ -253,7 +282,7 @@ impl DecodedFrame {
         delay: Duration,
         pixels: Vec<u8>,
     ) -> Result<Self, MediaError> {
-        let expected = width as usize * height as usize * 4;
+        let expected = rgba8_buffer_len(width, height).unwrap_or(usize::MAX);
         if pixels.len() != expected {
             return Err(MediaError::BufferLength {
                 width,
@@ -435,21 +464,75 @@ pub trait MediaDecoder {
 
     /// Cache/streaming mode, decoder path and counters.
     fn stats(&self) -> DecoderStats;
+
+    /// A handle that can interrupt a decoder blocked on external input.
+    fn cancellation(&self) -> Option<video::DecoderCancellation> {
+        None
+    }
 }
 
-/// Open `path` as the kind the file's own extension/format implies.
+fn classify_image(path: &Path) -> Result<Option<ContentKind>, MediaError> {
+    let Some(format) = animated::image_format(path)? else {
+        return Ok(None);
+    };
+    let animated = animated::is_animated_format(format) && animated::has_animation(path, format)?;
+    Ok(Some(if animated {
+        ContentKind::AnimatedImage
+    } else {
+        ContentKind::StaticImage
+    }))
+}
+
+fn classify_path(path: &Path) -> Result<Option<ContentKind>, MediaError> {
+    match ContentKind::from_path(path) {
+        Some(ContentKind::Video) if path.exists() => {
+            Ok(classify_image(path)?.or(Some(ContentKind::Video)))
+        }
+        Some(kind @ (ContentKind::Video | ContentKind::Shader | ContentKind::Plugin)) => {
+            Ok(Some(kind))
+        }
+        Some(kind @ (ContentKind::StaticImage | ContentKind::AnimatedImage)) => {
+            Ok(classify_image(path)?.or(Some(kind)))
+        }
+        None => classify_image(path),
+    }
+}
+
+/// Open `path` as the kind its content implies.
 pub fn open(path: &Path, config: &MediaConfig) -> Result<Box<dyn MediaDecoder>, MediaError> {
-    let kind =
-        ContentKind::from_path(path).ok_or(MediaError::UnsupportedKind { kind: "unknown" })?;
-    open_kind(path, kind, config)
+    let kind = classify_path(path)?.ok_or(MediaError::UnsupportedKind { kind: "unknown" })?;
+    open_resolved_kind(path, kind, config)
 }
 
 /// Open `path` as `kind`.
-///
-/// The kind is passed in rather than only sniffed because a `library:<id>`
-/// reference has no extension to inspect — its kind lives in the library row, and
-/// the daemon already resolves it before asking for a decoder.
 pub fn open_kind(
+    path: &Path,
+    kind: ContentKind,
+    config: &MediaConfig,
+) -> Result<Box<dyn MediaDecoder>, MediaError> {
+    let kind = match kind {
+        ContentKind::StaticImage | ContentKind::AnimatedImage => {
+            classify_image(path)?.unwrap_or(kind)
+        }
+        kind => kind,
+    };
+    open_resolved_kind(path, kind, config)
+}
+
+/// Opens a previously probed media file without repeating its initial probe.
+pub fn open_kind_with_info(
+    path: &Path,
+    kind: ContentKind,
+    config: &MediaConfig,
+    info: MediaInfo,
+) -> Result<Box<dyn MediaDecoder>, MediaError> {
+    match kind {
+        ContentKind::Video => Ok(Box::new(VideoDecoder::open_with_info(path, config, info)?)),
+        kind => open_kind(path, kind, config),
+    }
+}
+
+fn open_resolved_kind(
     path: &Path,
     kind: ContentKind,
     config: &MediaConfig,
@@ -466,8 +549,7 @@ pub fn open_kind(
 
 /// Static metadata for `path`, without opening a frame stream.
 pub fn probe(path: &Path, config: &MediaConfig) -> Result<MediaInfo, MediaError> {
-    let kind =
-        ContentKind::from_path(path).ok_or(MediaError::UnsupportedKind { kind: "unknown" })?;
+    let kind = classify_path(path)?.ok_or(MediaError::UnsupportedKind { kind: "unknown" })?;
     match kind {
         ContentKind::StaticImage | ContentKind::AnimatedImage => {
             let mut decoder = open_kind(path, kind, config)?;
@@ -500,9 +582,8 @@ pub fn ensure_supported(kind: ContentKind) -> Result<(), MediaError> {
 
 /// Content kinds the decode layer can produce frames for on this machine.
 ///
-/// This is deliberately about *decoding*: presenting an animated wallpaper also
-/// needs the frame-pacing work that is still open in P4, so the daemon's
-/// `capabilities.content_kinds` (what it can render) is a separate, narrower list.
+/// This is deliberately about decoding. The daemon separately reports the
+/// presentation capabilities it has wired for those kinds.
 pub fn content_kinds() -> Vec<&'static str> {
     let mut kinds = vec!["static-image", "animated-image"];
     if any_video_runtime() {
@@ -632,5 +713,38 @@ mod tests {
         assert!(matches!(error, MediaError::BufferLength { .. }), "{error}");
         let error = DecodedFrame::new(0, 0, 2, Duration::ZERO, vec![]).unwrap_err();
         assert!(matches!(error, MediaError::EmptyImage { .. }), "{error}");
+    }
+
+    #[test]
+    fn image_content_refines_ambiguous_extensions_without_losing_stills() {
+        let dir = tempfile::tempdir().unwrap();
+        let renamed_gif = dir.path().join("animation.png");
+        let renamed_png = dir.path().join("still.gif");
+        let video_named_png = dir.path().join("still.mp4");
+        std::fs::copy(GIF, &renamed_gif).unwrap();
+        std::fs::copy(PNG, &renamed_png).unwrap();
+        std::fs::copy(PNG, &video_named_png).unwrap();
+
+        let mut animated = open(&renamed_gif, &MediaConfig::default()).expect("animated content");
+        assert_eq!(animated.info().kind, ContentKind::AnimatedImage);
+        assert_eq!(animated.next_frame().unwrap().unwrap().index(), 0);
+
+        let mut still = open(&renamed_png, &MediaConfig::default()).expect("still content");
+        assert_eq!(still.info().kind, ContentKind::StaticImage);
+        assert_eq!(still.next_frame().unwrap().unwrap().index(), 0);
+        assert!(still.next_frame().unwrap().is_none());
+
+        let mut video_named_png =
+            open(&video_named_png, &MediaConfig::default()).expect("image content");
+        assert_eq!(video_named_png.info().kind, ContentKind::StaticImage);
+        assert!(video_named_png.next_frame().unwrap().is_some());
+    }
+
+    #[test]
+    fn overflowing_frame_dimensions_are_rejected_without_arithmetic_wraparound() {
+        let error =
+            DecodedFrame::new(0, u32::MAX, u32::MAX, Duration::ZERO, Vec::new()).unwrap_err();
+        assert!(matches!(error, MediaError::BufferLength { .. }), "{error}");
+        assert!(rgba8_buffer_len(u32::MAX, u32::MAX).is_none());
     }
 }

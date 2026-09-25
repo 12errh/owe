@@ -112,6 +112,20 @@ fn a_cap_that_cannot_hold_the_animation_falls_back_to_streaming_without_losing_f
         indices.push(frame.index());
     }
     assert_eq!(indices, vec![0, 1, 2], "streaming must not skip a frame");
+
+    decoder.rewind().expect("streaming rewind");
+    let replay = (0..3)
+        .map(|_| {
+            decoder
+                .next_frame()
+                .expect("replayed frame")
+                .expect("frame")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replay.iter().map(|frame| frame.index()).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
 }
 
 #[test]

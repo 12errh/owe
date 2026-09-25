@@ -5,11 +5,13 @@ import {
   asFailure,
   clearWallpaper,
   daemonStatus,
+  getStats,
   libraryIndex,
   libraryScan,
   libraryThumbnail,
   listOutputs,
   patchShell,
+  playbackCommand,
   shellStatus,
   type ApplyOutcome,
   type DaemonStatus,
@@ -17,8 +19,12 @@ import {
   type LibraryItem,
   type LibraryPage,
   type OutputsView,
+  type PlaybackCommand,
+  type PlaybackResult,
   type ShellStatus,
   type ShellPatch,
+  type StatsRow,
+  type StatsView,
   type TransitionRequest,
 } from "./ipc";
 import { t, tList } from "./i18n";
@@ -46,6 +52,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const [outputs, setOutputs] = useState<OutputsView | null>(null);
+  const [stats, setStats] = useState<StatsView | null>(null);
   const [shell, setShell] = useState<ShellStatus | null>(null);
 
   const [page, setPage] = useState<LibraryPage | null>(null);
@@ -102,10 +109,12 @@ export default function App() {
       setStatus(next);
       if (next.connected) {
         setOutputs(await listOutputs().catch(() => null));
+        setStats(await getStats().catch(() => null));
         setShell(await shellStatus().catch(() => null));
         await loadLibrary({ page: 1, scan: true });
       } else {
         setOutputs(null);
+        setStats(null);
         setShell(null);
         setPage(null);
       }
@@ -173,6 +182,7 @@ export default function App() {
       try {
         setNotice(await action());
         setOutputs(await listOutputs().catch(() => null));
+        setStats(await getStats().catch(() => null));
       } catch (error) {
         setFailure(asFailure(error));
       } finally {
@@ -223,6 +233,28 @@ export default function App() {
         const next = await patchShell(patch);
         setShell(next);
         return next.runtime_note ?? t("shellApplied");
+      }),
+    [run],
+  );
+
+  const refreshStats = useCallback(
+    () =>
+      run(async () => {
+        const next = await getStats();
+        setStats(next);
+        return t("statsRefreshed");
+      }),
+    [run],
+  );
+
+  const sendPlayback = useCallback(
+    (output: string, command: PlaybackCommand) =>
+      run(async () => {
+        const result: PlaybackResult = await playbackCommand(output, command);
+        const state = result.states[0];
+        return state
+          ? `${t("playbackUpdated")} ${state.output} · ${state.decode}`
+          : t("statsNoRows");
       }),
     [run],
   );
@@ -331,6 +363,13 @@ export default function App() {
               <p className="panel__note">{t("governorPaused")}</p>
             )}
           </section>
+
+          <StatsPanel
+            stats={stats}
+            busy={busy}
+            onRefresh={() => void refreshStats()}
+            onCommand={(output, command) => void sendPlayback(output, command)}
+          />
 
           <ShellCard
             shell={shell}
@@ -543,6 +582,10 @@ export default function App() {
               label={t("mediaBackendsLabel")}
               value={tList(status.media_backends, "none")}
             />
+            <Detail
+              label={t("ipcEventsLabel")}
+              value={status.events.length > 0 ? status.events.join(", ") : t("none")}
+            />
           </section>
 
           {status.unavailable.length > 0 && (
@@ -563,6 +606,186 @@ export default function App() {
       <p className="placeholder__note">{t("disposableNote")}</p>
     </main>
   );
+}
+
+function StatsPanel({
+  stats,
+  busy,
+  onRefresh,
+  onCommand,
+}: {
+  stats: StatsView | null;
+  busy: boolean;
+  onRefresh: () => void;
+  onCommand: (output: string, command: PlaybackCommand) => void;
+}) {
+  return (
+    <section className="panel">
+      <div className="panel__heading">
+        <h2 className="panel__title">{t("statsTitle")}</h2>
+        <button
+          type="button"
+          className="button"
+          disabled={busy}
+          onClick={onRefresh}
+        >
+          {busy ? t("statsRefreshing") : t("statsRefresh")}
+        </button>
+      </div>
+      {stats === null ? (
+        <p className="panel__empty">{t("statsUnavailable")}</p>
+      ) : (
+        <>
+          <div className="stats__summary">
+            <Detail
+              label={t("statsRss")}
+              value={stats.rss_bytes === null ? t("statsRssUnavailable") : formatBytes(stats.rss_bytes)}
+            />
+            <Detail
+              label={t("statsGovernor")}
+              value={stats.paused ? t("statsGovernorPaused") : t("statsGovernorRunning")}
+            />
+          </div>
+          {stats.stats.length === 0 ? (
+            <p className="panel__empty">{t("statsNoRows")}</p>
+          ) : (
+            <ul className="list">
+              {stats.stats.map((row) => (
+                <PlaybackRow
+                  key={row.output}
+                  row={row}
+                  busy={busy}
+                  onCommand={onCommand}
+                />
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function PlaybackRow({
+  row,
+  busy,
+  onCommand,
+}: {
+  row: StatsRow;
+  busy: boolean;
+  onCommand: (output: string, command: PlaybackCommand) => void;
+}) {
+  const [seek, setSeek] = useState(0);
+  const [loopStart, setLoopStart] = useState(0);
+  const [loopEnd, setLoopEnd] = useState(1);
+  const controllable = row.mode !== "" && row.failed === null;
+  const decode =
+    row.decode === "hardware"
+      ? t("statsDecodeHardware")
+      : row.decode === "software"
+        ? t("statsDecodeSoftware")
+        : t("statsDecodeUnknown");
+
+  return (
+    <li className="stats-row">
+      <div className="stats-row__main">
+        <div className="stats-row__title">
+          <strong>{row.output}</strong>
+          <span className={`badge badge--${row.decode || "unknown"}`}>{decode}</span>
+          <span className="stats-row__state">
+            {row.playing ? "▶" : row.held ? "Ⅱ" : "·"}
+          </span>
+        </div>
+        <div className="stats-row__meta">
+          {t("statsDecode")}: {decode} · {t("statsFps")}: {row.fps > 0 ? row.fps.toFixed(2) : "—"} · {t("statsPosition")}:{" "}
+          {row.position_ms > 0 ? `${(row.position_ms / 1000).toFixed(2)} s` : t("playbackPositionUnavailable")} ·{" "}
+          {t("statsBuffers")}: {row.buffers} ({formatBytes(row.buffer_bytes)}) · {t("statsFrames")}:{" "}
+          {row.frames_presented}
+        </div>
+        {row.mode !== "" && (
+          <div className="stats-row__meta">
+            {t("statsMode")}: {row.mode} · {row.decoder || "—"}
+          </div>
+        )}
+        {row.failed && (
+          <div className="list__sub list__sub--error">
+            {t("statsFailed")}: {row.failed}
+          </div>
+        )}
+        {!controllable && <div className="list__sub">{t("playbackUnavailable")}</div>}
+      </div>
+      <div className="playback-controls">
+        <button
+          type="button"
+          className="button"
+          disabled={busy || !controllable || row.playing}
+          onClick={() => onCommand(row.output, "play")}
+        >
+          {t("playbackPlay")}
+        </button>
+        <button
+          type="button"
+          className="button"
+          disabled={busy || !controllable || !row.playing}
+          onClick={() => onCommand(row.output, "pause")}
+        >
+          {t("playbackPause")}
+        </button>
+        <label className="playback-controls__field">
+          <span>{t("playbackSeek")} ({t("playbackSeekSeconds")})</span>
+          <input
+            type="number"
+            min="0"
+            step="0.1"
+            value={seek}
+            onChange={(event) => setSeek(Number(event.target.value) || 0)}
+          />
+        </label>
+        <button
+          type="button"
+          className="button"
+          disabled={busy || !controllable}
+          onClick={() => onCommand(row.output, { seek })}
+        >
+          {t("playbackSeek")}
+        </button>
+        <label className="playback-controls__field">
+          <span>{t("playbackLoopStart")}</span>
+          <input
+            type="number"
+            min="0"
+            step="0.1"
+            value={loopStart}
+            onChange={(event) => setLoopStart(Number(event.target.value) || 0)}
+          />
+        </label>
+        <label className="playback-controls__field">
+          <span>{t("playbackLoopEnd")}</span>
+          <input
+            type="number"
+            min="0"
+            step="0.1"
+            value={loopEnd}
+            onChange={(event) => setLoopEnd(Number(event.target.value) || 0)}
+          />
+        </label>
+        <button
+          type="button"
+          className="button"
+          disabled={busy || !controllable || loopEnd <= loopStart}
+          onClick={() => onCommand(row.output, { loop: { a: loopStart, b: loopEnd } })}
+        >
+          {t("playbackApplyLoop")}
+        </button>
+      </div>
+    </li>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1_048_576) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / 1_048_576).toFixed(1)} MiB`;
 }
 
 /// The shell card (Phase 3, FR-SHELL-3): which backend is live, why, and the

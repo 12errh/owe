@@ -66,15 +66,16 @@ impl ContentKind {
 
     /// Map a file extension (with or without a leading dot, any case) to a kind.
     ///
-    /// `webp` is treated as a still image even though animated webp exists; the
-    /// animated-webp detector lands with the P4 animated renderer.
+    /// `webp` is a still-image extension here; the media layer refines existing
+    /// animated WebP files from their container contents before decoding.
     pub fn from_extension(extension: &str) -> Option<Self> {
         let ext = extension.trim_start_matches('.').to_ascii_lowercase();
         let kind = match ext.as_str() {
             "png" | "jpg" | "jpeg" | "webp" | "avif" | "jxl" | "tiff" | "tif" | "bmp" | "tga"
             | "pnm" | "ppm" | "pgm" | "pbm" | "farbfeld" | "ff" | "svg" => Self::StaticImage,
             "gif" | "apng" => Self::AnimatedImage,
-            "mp4" | "webm" | "mkv" | "mov" => Self::Video,
+            "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" | "ogv" | "mpeg" | "mpg" | "wmv"
+            | "flv" | "3gp" => Self::Video,
             "wgsl" => Self::Shader,
             _ => return None,
         };
@@ -214,6 +215,8 @@ mod tests {
             ("mp4", ContentKind::Video),
             ("mkv", ContentKind::Video),
             ("webm", ContentKind::Video),
+            ("avi", ContentKind::Video),
+            ("m4v", ContentKind::Video),
             ("wgsl", ContentKind::Shader),
         ];
         for (ext, expected) in cases {

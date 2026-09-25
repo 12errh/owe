@@ -156,6 +156,10 @@ impl Detection {
     pub fn is_detected(&self) -> bool {
         self.confidence != Confidence::None
     }
+
+    fn is_strong(&self) -> bool {
+        self.confidence == Confidence::Strong
+    }
 }
 
 /// Who owns the pixels.
@@ -262,6 +266,15 @@ pub enum ShellEvent {
         /// Connector name.
         monitor: String,
     },
+    #[allow(missing_docs)]
+    MonitorRemovedV2 {
+        #[allow(missing_docs)]
+        id: i64,
+        #[allow(missing_docs)]
+        monitor: String,
+        #[allow(missing_docs)]
+        description: Option<String>,
+    },
     /// `openwindow>>address,workspace,class,title`
     OpenWindow {
         /// Window address.
@@ -348,6 +361,7 @@ impl ShellEvent {
             ShellEvent::FocusedMonitor { .. } => "focusedmon",
             ShellEvent::MonitorAdded { .. } => "monitoradded",
             ShellEvent::MonitorRemoved { .. } => "monitorremoved",
+            ShellEvent::MonitorRemovedV2 { .. } => "monitorremovedv2",
             ShellEvent::OpenWindow { .. } => "openwindow",
             ShellEvent::CloseWindow { .. } => "closewindow",
             ShellEvent::WindowTitle { .. } => "windowtitle",
@@ -725,8 +739,12 @@ impl Registry {
     ) -> Result<(Arc<dyn ShellBackend>, Detection), SelectError> {
         let requested = config.backend.trim();
         if requested.is_empty() || requested == "auto" {
-            for (backend, detection) in self.detections(config, env) {
-                if detection.is_detected() {
+            for id in self.detect_order(config) {
+                let Some(backend) = self.get(&id) else {
+                    continue;
+                };
+                let detection = backend.detection(env);
+                if detection.is_strong() {
                     return Ok((backend, detection));
                 }
             }
@@ -764,11 +782,7 @@ impl Registry {
 
     /// The `auto` chain for this config, in order.
     pub fn detect_order(&self, config: &ShellConfig) -> Vec<String> {
-        if config.detect_order.is_empty() {
-            default_detect_order()
-        } else {
-            config.detect_order.clone()
-        }
+        config.effective_detect_order()
     }
 
     /// Ask every registered backend what it thinks of this session, in the order
@@ -848,6 +862,33 @@ mod tests {
         }
         fn list_outputs(&self) -> Result<Vec<OutputInfo>, ShellError> {
             Ok(self.outputs.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConfidenceBackend {
+        id: &'static str,
+        confidence: Confidence,
+    }
+
+    impl ShellBackend for ConfidenceBackend {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn detect(&self, _env: EnvLookup<'_>) -> bool {
+            self.confidence != Confidence::None
+        }
+
+        fn list_outputs(&self) -> Result<Vec<OutputInfo>, ShellError> {
+            Ok(Vec::new())
+        }
+
+        fn detection(&self, _env: EnvLookup<'_>) -> Detection {
+            Detection {
+                confidence: self.confidence,
+                reason: self.id.to_string(),
+            }
         }
     }
 
@@ -939,6 +980,43 @@ mod tests {
         let shell = config("auto", &["hyprland", "generic-layer-shell"]);
         let selected = registry.select(&shell, &env_with(&[])).unwrap();
         assert_eq!(selected.id(), "generic-layer-shell");
+    }
+
+    #[test]
+    fn auto_uses_the_configured_chain_before_unlisted_backends() {
+        let registry = registry(&[("generic-layer-shell", true), ("unlisted", true)]);
+        let shell = config("auto", &["generic-layer-shell"]);
+        let selected = registry.select(&shell, &env_with(&[])).unwrap();
+        assert_eq!(selected.id(), "generic-layer-shell");
+    }
+
+    #[test]
+    fn auto_does_not_select_a_weak_detection() {
+        let mut registry = Registry::new();
+        registry.register(std::sync::Arc::new(ConfidenceBackend {
+            id: "weak",
+            confidence: Confidence::Weak,
+        }));
+        registry.register(std::sync::Arc::new(ConfidenceBackend {
+            id: "strong",
+            confidence: Confidence::Strong,
+        }));
+        let shell = config("auto", &["weak", "strong"]);
+        let selected = registry.select(&shell, &env_with(&[])).unwrap();
+        assert_eq!(selected.id(), "strong");
+    }
+
+    #[test]
+    fn explicit_selection_keeps_weak_detection_available() {
+        let mut registry = Registry::new();
+        registry.register(std::sync::Arc::new(ConfidenceBackend {
+            id: "weak",
+            confidence: Confidence::Weak,
+        }));
+        let selected = registry
+            .select(&config("weak", &[]), &env_with(&[]))
+            .unwrap();
+        assert_eq!(selected.id(), "weak");
     }
 
     #[test]

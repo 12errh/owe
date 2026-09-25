@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::{
-    DecodeMode, DecodePath, DecodedFrame, DecoderStats, MediaDecoder, MediaError, MediaInfo,
+    DecodeMode, DecodePath, DecodedFrame, DecoderStats, MediaConfig, MediaDecoder, MediaError,
+    MediaInfo, VideoDecoder,
 };
 use owe_core::ContentKind;
 
@@ -38,7 +39,7 @@ impl std::fmt::Debug for DecodedImage {
 impl DecodedImage {
     /// Build from raw RGBA8 pixels, checking the length matches the size.
     pub fn new(width: u32, height: u32, pixels: Vec<u8>) -> Result<Self, MediaError> {
-        let expected = width as usize * height as usize * 4;
+        let expected = crate::rgba8_buffer_len(width, height).unwrap_or(usize::MAX);
         if pixels.len() != expected {
             return Err(MediaError::BufferLength {
                 width,
@@ -172,11 +173,33 @@ pub fn thumbnail_png(path: &Path, max_edge: u32) -> Result<Vec<u8>, MediaError> 
     // An animated image's thumbnail is its first frame, at thumbnail size: the
     // poster of a GIF is what a grid cell needs, and decoding every frame to pick
     // one would be the waste the cap exists to prevent.
-    let decoded = match crate::animated::first_frame(path, max_edge)? {
-        Some(frame) => frame,
-        None => decode_file(path)?,
-    };
+    let decoded =
+        match crate::classify_path(path)?.ok_or(MediaError::UnsupportedKind { kind: "unknown" })? {
+            ContentKind::StaticImage => decode_file(path)?,
+            ContentKind::AnimatedImage => match crate::animated::first_frame(path, max_edge)? {
+                Some(frame) => frame,
+                None => decode_file(path)?,
+            },
+            ContentKind::Video => video_thumbnail_frame(path)?,
+            other => {
+                return Err(MediaError::UnsupportedKind {
+                    kind: other.as_str(),
+                });
+            }
+        };
     thumbnail_png_from(&decoded, max_edge, path)
+}
+
+fn video_thumbnail_frame(path: &Path) -> Result<DecodedImage, MediaError> {
+    let mut decoder = VideoDecoder::open(path, &MediaConfig::default())?;
+    let backend = decoder.runtime().as_str().to_string();
+    match decoder.next_frame()? {
+        Some(frame) => Ok(frame.into_image()),
+        None => Err(MediaError::Runtime {
+            backend,
+            detail: "the video pipeline ended without producing a frame".to_string(),
+        }),
+    }
 }
 
 /// Encode a PNG thumbnail from already-decoded pixels.
@@ -319,18 +342,14 @@ impl MediaDecoder for ImageDecoder {
     }
 
     fn stats(&self) -> DecoderStats {
-        let pixels = u64::from(self.info.width) * u64::from(self.info.height) * 4;
+        let pixels = self.frame.as_ref().map_or(0, DecodedImage::byte_len);
         DecoderStats {
             mode: DecodeMode::Cached,
             path: DecodePath::software(DECODER),
             frames_decoded: u64::from(self.frame.is_none()),
             cached_frames: usize::from(self.frame.is_some()),
-            cache_bytes: if self.frame.is_some() {
-                pixels as usize
-            } else {
-                0
-            },
-            cache_cap_bytes: pixels as usize,
+            cache_bytes: pixels,
+            cache_cap_bytes: pixels,
         }
     }
 }
@@ -473,6 +492,12 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_image_dimensions_do_not_wrap_the_expected_length() {
+        let error = DecodedImage::new(u32::MAX, u32::MAX, vec![]).unwrap_err();
+        assert!(matches!(error, MediaError::BufferLength { .. }), "{error}");
+    }
+
+    #[test]
     fn thumbnail_sizes_preserve_aspect_and_never_magnify() {
         // The pure part, so the rules are asserted without any pixels.
         assert_eq!(thumbnail_size((4000, 2000), 512), (512, 256));
@@ -517,6 +542,24 @@ mod tests {
         let png = thumbnail_png(&path, 512).expect("thumbnail");
         let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
         assert_eq!((decoded.width(), decoded.height()), (24, 24));
+    }
+
+    #[test]
+    fn a_video_thumbnail_uses_its_first_frame_or_names_the_missing_runtime() {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/video-5frame.mp4"
+        ));
+        match thumbnail_png(path, 32) {
+            Ok(png) => {
+                let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
+                assert_eq!((decoded.width(), decoded.height()), (32, 24));
+            }
+            Err(error) => {
+                assert!(matches!(error, MediaError::Unavailable { .. }), "{error}");
+                assert!(!crate::any_video_runtime());
+            }
+        }
     }
 
     #[test]

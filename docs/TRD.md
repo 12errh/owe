@@ -11,7 +11,7 @@
 
 ```
 owe (Tauri GUI) ─┐
-owectl (CLI) ────┤─ JSON-lines over Unix socket ($XDG_RUNTIME_DIR/owe/<pid>/socket)
+owectl (CLI) ────┤─ JSON-lines over Unix socket ($XDG_RUNTIME_DIR/owe/socket)
                  ▼
               owed (daemon) ── owns: config, library DB, governor, renderer registry,
                  │                    per-output layer-shell surfaces, wgpu device

@@ -12,7 +12,7 @@
 //! reading something the real CLI left behind.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use owe_core::config::{CaelestiaConfig, ShellConfig};
 use owe_core::shell::{ApplyOutcome, ShellBackend};
@@ -20,17 +20,24 @@ use owe_shell_caelestia::{CaelestiaBackend, ID};
 
 type EnvSource = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+static STUB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 /// A temporary directory holding a stub `caelestia`, a wallpapers directory with
 /// one image in it, and the file the stub records its arguments to.
 struct Stub {
     dir: tempfile::TempDir,
     wallpapers: PathBuf,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl Stub {
     /// `body` is the part of the script that runs after the arguments are
     /// recorded, so every variant records what it was called with.
     fn new(body: &str) -> Self {
+        let guard = STUB_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let wallpapers = dir.path().join("walls");
         std::fs::create_dir_all(&wallpapers).expect("wallpapers dir");
@@ -46,7 +53,11 @@ impl Stub {
         std::fs::write(&binary, script).expect("stub");
         make_executable(&binary);
 
-        Self { dir, wallpapers }
+        Self {
+            dir,
+            wallpapers,
+            _guard: guard,
+        }
     }
 
     fn argv_file(&self) -> PathBuf {
@@ -244,12 +255,37 @@ fn current_wallpaper_reads_what_the_shell_prints() {
         "reading the state is the bare subcommand"
     );
 
+    drop(stub);
     let empty = Stub::new("echo 'No wallpaper set'");
     let backend = empty.backend();
     assert_eq!(
         backend.current_wallpaper(backend.env_lookup()).unwrap(),
         None
     );
+}
+
+#[test]
+fn daemon_drawn_mode_does_not_spawn_the_shell_cli() {
+    let stub = Stub::new("exit 0");
+    let backend = stub.backend();
+    let config = ShellConfig {
+        caelestia: CaelestiaConfig {
+            mode: "daemon-drawn".to_string(),
+            theme_hook: true,
+            ..CaelestiaConfig::default()
+        },
+        ..ShellConfig::default()
+    };
+
+    assert_eq!(
+        backend.apply_wallpaper(&config, None, "x.jpg"),
+        Ok(ApplyOutcome::NotApplicable)
+    );
+    assert_eq!(
+        backend.clear_wallpaper(&config, None),
+        Ok(ApplyOutcome::NotApplicable)
+    );
+    assert!(!stub.argv_file().exists());
 }
 
 #[test]

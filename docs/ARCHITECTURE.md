@@ -176,8 +176,8 @@ CI matrix (GitHub Actions — ADR-016): Linux x86_64 (build+test on ubuntu-24.04
 | Library folders | configured in config.toml |
 | Library DB | `$XDG_DATA_HOME/owe/library.db` |
 | Thumbnails | `$XDG_CACHE_HOME/owe/thumbs/` |
-| Session state | `$XDG_STATE_HOME/owe/session.toml` |
-| IPC socket | `$XDG_RUNTIME_DIR/owe/<HIS-or-pid>/socket` (0600) |
+| Session state | `$XDG_STATE_HOME/owe/session.json` |
+| IPC socket | `$XDG_RUNTIME_DIR/owe/socket` (0600) |
 | Logs | journald (systemd) or stderr; `tracing` with env-filter |
 
 ---
@@ -187,7 +187,7 @@ CI matrix (GitHub Actions — ADR-016): Linux x86_64 (build+test on ubuntu-24.04
 1. **Render-once-then-sleep** for static content; no timer, no polling (wallr-proven pattern).
 2. **Frame-callback pacing** for all animation; governor FPS caps implemented as minimum-frame-interval gates, never busy loops.
 3. **Bounded memory everywhere:** buffer pools sized per output; GIF caches capped+compressed; video never fully buffered (TRD NFR-RES-1).
-4. **Zero-copy path when possible:** dma-buf import of decoded video frames into wgpu; shm fallback always available (we-layerd lesson).
+4. **Zero-copy path when possible:** dma-buf import of decoded video frames into wgpu; the current P4 build uses bounded SHM after CPU decode and leaves dma-buf import as an explicit follow-up. SHM fallback remains always available (we-layerd lesson).
 5. **CPU-idle governor:** all policy evaluation is event-driven; ≥ 1 Hz polling ceiling only for non-event sources (TRD FR-GOV-7).
 6. Numbers are published only from the bench harness (PRD §4 honesty rule).
 

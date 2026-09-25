@@ -37,7 +37,8 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::probe::{
@@ -45,8 +46,8 @@ use crate::probe::{
     parse_gst_discoverer, runtime_availability, select_runtime,
 };
 use crate::{
-    DecodeMode, DecodePath, DecodedFrame, DecoderStats, MediaConfig, MediaDecoder, MediaError,
-    MediaInfo, RawVideo,
+    DEFAULT_MAX_PIXELS, DecodeMode, DecodePath, DecodedFrame, DecoderStats, MediaConfig,
+    MediaDecoder, MediaError, MediaInfo, RawVideo, bounded_frame_len,
 };
 use owe_core::model::ContentKind;
 
@@ -65,6 +66,9 @@ const DEVICE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// The size a decode device probe renders. One 64×64 frame is enough to force
 /// device creation and costs nothing.
 const DEVICE_PROBE_SIZE: &str = "color=black:s=64x64";
+
+const CHILD_STDERR_LIMIT: usize = 64 * 1024;
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The `gst-launch-1.0` argv that turns a file into raw RGBA frames on stdout.
 ///
@@ -288,6 +292,17 @@ struct RunOutput {
     stderr: String,
 }
 
+fn capture_pipe<R>(mut pipe: R) -> std::io::Result<std::thread::JoinHandle<String>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::Builder::new().spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
 /// Run a command with a deadline, capturing its output.
 ///
 /// Implemented by polling `try_wait` rather than blocking in `wait_with_output`:
@@ -304,32 +319,58 @@ fn run_bounded(argv: &[String], timeout: Duration) -> Result<RunOutput, String> 
         .spawn()
         .map_err(|error| format!("could not run `{}`: {error}", program))?;
 
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("`{program}` has no stdout capture"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("`{program}` has no stderr capture"));
+    };
+    let stdout_reader = match capture_pipe(stdout) {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("could not capture `{program}` stdout: {error}"));
+        }
+    };
+    let stderr_reader = match capture_pipe(stderr) {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            return Err(format!("could not capture `{program}` stderr: {error}"));
+        }
+    };
+
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
-            Err(error) => return Err(format!("`{program}` could not be waited on: {error}")),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("`{program}` could not be waited on: {error}"));
+            }
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!(
+            break Err(format!(
                 "`{program}` did not finish within {}s",
                 timeout.as_secs()
             ));
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let status = status?;
     Ok(RunOutput {
         success: status.success(),
         stdout,
@@ -497,6 +538,32 @@ fn hardware_negotiates() -> bool {
     vaapi_status().available
 }
 
+fn frame_delay(fps: Option<f64>) -> Duration {
+    let fps = fps
+        .filter(|fps| fps.is_finite() && *fps > 0.0)
+        .unwrap_or(10.0);
+    Duration::try_from_secs_f64(1.0 / fps).unwrap_or(Duration::from_millis(100))
+}
+
+/// A process cancellation handle for a video decoder.
+#[derive(Clone, Debug)]
+pub struct DecoderCancellation {
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl DecoderCancellation {
+    /// Ask the decoder's child process to stop.
+    pub fn cancel(&self) {
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(child) = child.as_mut() {
+            let _ = child.kill();
+        }
+    }
+}
+
 /// A video as a [`MediaDecoder`].
 pub struct VideoDecoder {
     runtime: VideoRuntime,
@@ -505,7 +572,9 @@ pub struct VideoDecoder {
     info: MediaInfo,
     frame_bytes: usize,
     delay: Duration,
-    child: Option<Child>,
+    child: Arc<Mutex<Option<Child>>>,
+    stdout: Option<ChildStdout>,
+    stderr_reader: Option<std::thread::JoinHandle<String>>,
     hardware: bool,
     next_index: u64,
     frames_decoded: u64,
@@ -536,14 +605,40 @@ impl VideoDecoder {
         })
     }
 
+    pub(crate) fn open_with_info(
+        path: &Path,
+        config: &MediaConfig,
+        info: MediaInfo,
+    ) -> Result<Self, MediaError> {
+        with_runtime(&config.backend, |runtime| {
+            Self::open_with_info_runtime(runtime, path, config, info.clone())
+        })
+    }
+
     /// Open through one specific runtime — the part with no fallback inside it.
     fn open_with(
         runtime: VideoRuntime,
         path: &Path,
         config: &MediaConfig,
     ) -> Result<Self, MediaError> {
-        let tool = frame_tool(runtime)?;
         let info = probe_with(runtime, path)?;
+        Self::open_with_info_runtime(runtime, path, config, info)
+    }
+
+    fn open_with_info_runtime(
+        runtime: VideoRuntime,
+        path: &Path,
+        config: &MediaConfig,
+        info: MediaInfo,
+    ) -> Result<Self, MediaError> {
+        let tool = frame_tool(runtime)?;
+        if info.width == 0 || info.height == 0 {
+            return Err(MediaError::EmptyImage {
+                width: info.width,
+                height: info.height,
+            });
+        }
+        let frame_bytes = bounded_frame_len(path, info.width, info.height, DEFAULT_MAX_PIXELS)?;
         let hardware = hardware_negotiates();
 
         if !hardware && config.hw_decode_required {
@@ -553,14 +648,7 @@ impl VideoDecoder {
             });
         }
 
-        let frame_bytes = info.width as usize * info.height as usize * 4;
-        let delay = Duration::from_secs_f64(
-            1.0 / info
-                .fps
-                .filter(|fps| fps.is_finite() && *fps > 0.0)
-                .unwrap_or(10.0),
-        );
-
+        let delay = frame_delay(info.fps);
         let mut decoder = Self {
             runtime,
             tool,
@@ -568,7 +656,9 @@ impl VideoDecoder {
             info,
             frame_bytes,
             delay,
-            child: None,
+            child: Arc::new(Mutex::new(None)),
+            stdout: None,
+            stderr_reader: None,
             hardware,
             next_index: 0,
             frames_decoded: 0,
@@ -588,19 +678,155 @@ impl VideoDecoder {
             backend: self.runtime.as_str().to_string(),
             detail: "empty pipeline".to_string(),
         })?;
-        let child = Command::new(program)
+        let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| MediaError::Runtime {
                 backend: self.runtime.as_str().to_string(),
                 detail: format!("could not start `{program}`: {error}"),
             })?;
-        self.child = Some(child);
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MediaError::Runtime {
+                backend: self.runtime.as_str().to_string(),
+                detail: "the pipeline has no frame output".to_string(),
+            });
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MediaError::Runtime {
+                backend: self.runtime.as_str().to_string(),
+                detail: "the pipeline has no stderr capture".to_string(),
+            });
+        };
+        let reader = std::thread::Builder::new()
+            .name("owe-video-stderr".to_string())
+            .spawn(move || {
+                let mut stderr = stderr;
+                let mut bytes = Vec::new();
+                {
+                    let mut limited = (&mut stderr).take((CHILD_STDERR_LIMIT + 1) as u64);
+                    let _ = limited.read_to_end(&mut bytes);
+                }
+                let truncated = bytes.len() > CHILD_STDERR_LIMIT;
+                bytes.truncate(CHILD_STDERR_LIMIT);
+                let mut discard = [0_u8; 4096];
+                loop {
+                    match stderr.read(&mut discard) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                let mut detail = String::from_utf8_lossy(&bytes).trim().to_string();
+                if truncated {
+                    detail.push_str(" [truncated]");
+                }
+                detail
+            });
+        let stderr_reader = match reader {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MediaError::Runtime {
+                    backend: self.runtime.as_str().to_string(),
+                    detail: format!("could not capture pipeline stderr: {error}"),
+                });
+            }
+        };
+        self.child = Arc::new(Mutex::new(Some(child)));
+        self.stdout = Some(stdout);
+        self.stderr_reader = Some(stderr_reader);
         self.finished = false;
         Ok(())
+    }
+
+    fn take_stderr(&mut self) -> String {
+        self.stderr_reader
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_else(|| "stderr capture failed".to_string())
+    }
+
+    fn stop_child(&mut self) {
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.stdout.take();
+        let _ = self.take_stderr();
+        self.finished = true;
+    }
+
+    fn finish_child(&mut self) -> Result<(ExitStatus, String), String> {
+        let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+        let status = loop {
+            let mut guard = self
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(child) = guard.as_mut() else {
+                break Err("the pipeline process is missing".to_string());
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("the pipeline could not be waited on: {error}"));
+                }
+            }
+            drop(guard);
+            if Instant::now() >= deadline {
+                self.stop_child();
+                break Err("the pipeline did not exit after closing its output".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        match status {
+            Ok(status) => {
+                self.child
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                self.stdout.take();
+                let stderr = self.take_stderr();
+                Ok((status, stderr))
+            }
+            Err(detail) => {
+                self.stop_child();
+                Err(detail)
+            }
+        }
+    }
+
+    fn runtime_error(&self, detail: impl Into<String>) -> MediaError {
+        MediaError::Runtime {
+            backend: self.runtime.as_str().to_string(),
+            detail: detail.into(),
+        }
+    }
+
+    fn child_completion_detail(status: &ExitStatus, stderr: &str) -> String {
+        let mut details = Vec::new();
+        if !status.success() {
+            details.push(status.to_string());
+        }
+        if !stderr.is_empty() {
+            details.push(stderr.to_string());
+        }
+        details.join(": ")
     }
 
     /// Which pipeline is running.
@@ -612,16 +838,20 @@ impl VideoDecoder {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// A handle that can interrupt a child pipeline blocked on frame output.
+    pub fn cancellation(&self) -> DecoderCancellation {
+        DecoderCancellation {
+            child: Arc::clone(&self.child),
+        }
+    }
 }
 
 impl Drop for VideoDecoder {
     fn drop(&mut self) {
         // A decoder that leaves `ffmpeg`/`gst-launch` behind would outlive the
         // daemon that started it; the child is ours to end.
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.stop_child();
     }
 }
 
@@ -634,67 +864,100 @@ impl MediaDecoder for VideoDecoder {
         if self.finished {
             return Ok(None);
         }
-        let Some(child) = self.child.as_mut() else {
-            return Ok(None);
-        };
-        let Some(stdout) = child.stdout.as_mut() else {
+        let frame_bytes = self.frame_bytes;
+        let mut pixels = Vec::new();
+        if let Err(error) = pixels.try_reserve_exact(frame_bytes) {
+            self.stop_child();
+            return Err(self.runtime_error(format!(
+                "could not allocate a {frame_bytes}-byte frame: {error}"
+            )));
+        }
+        pixels.resize(frame_bytes, 0);
+
+        if self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
             self.finished = true;
-            return Ok(None);
+            return Err(self.runtime_error("the pipeline process is missing"));
+        }
+        let Some(stdout) = self.stdout.as_mut() else {
+            self.stop_child();
+            return Err(self.runtime_error("the pipeline has no frame output"));
         };
 
-        let mut pixels = vec![0_u8; self.frame_bytes];
         let mut filled = 0;
-        while filled < self.frame_bytes {
+        let mut read_error = None;
+        while filled < frame_bytes {
             match stdout.read(&mut pixels[filled..]) {
                 Ok(0) => break,
                 Ok(read) => filled += read,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
-                    return Err(MediaError::Runtime {
-                        backend: self.runtime.as_str().to_string(),
-                        detail: error.to_string(),
-                    });
+                    read_error = Some(error.to_string());
+                    break;
                 }
             }
+        }
+        if let Some(error) = read_error {
+            self.stop_child();
+            return Err(self.runtime_error(format!("could not read the frame output: {error}")));
         }
 
         if filled == 0 {
             self.finished = true;
+            let (status, stderr) = self
+                .finish_child()
+                .map_err(|detail| self.runtime_error(detail))?;
+            if !status.success() {
+                let detail = Self::child_completion_detail(&status, &stderr);
+                return Err(
+                    self.runtime_error(format!("the pipeline failed at end of stream: {detail}"))
+                );
+            }
             return Ok(None);
         }
-        if filled < self.frame_bytes {
+        if filled < frame_bytes {
             // A partial frame is a broken pipeline, not an end of stream: handing
             // it to the renderer would paint garbage from a short buffer.
             self.finished = true;
-            return Err(MediaError::Runtime {
-                backend: self.runtime.as_str().to_string(),
-                detail: format!(
-                    "the pipeline ended mid-frame ({filled} of {} bytes)",
-                    self.frame_bytes
-                ),
-            });
+            let (status, stderr) = self
+                .finish_child()
+                .map_err(|detail| self.runtime_error(detail))?;
+            let mut detail =
+                format!("the pipeline ended mid-frame ({filled} of {frame_bytes} bytes)");
+            let completion = Self::child_completion_detail(&status, &stderr);
+            if !completion.is_empty() {
+                detail.push_str("; ");
+                detail.push_str(&completion);
+            }
+            return Err(self.runtime_error(detail));
         }
 
         let index = self.next_index;
-        self.next_index += 1;
-        self.frames_decoded += 1;
-        Ok(Some(DecodedFrame::new(
-            index,
-            self.info.width,
-            self.info.height,
-            self.delay,
-            pixels,
-        )?))
+        let frame =
+            match DecodedFrame::new(index, self.info.width, self.info.height, self.delay, pixels) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.stop_child();
+                    return Err(error);
+                }
+            };
+        self.next_index = self.next_index.saturating_add(1);
+        self.frames_decoded = self.frames_decoded.saturating_add(1);
+        Ok(Some(frame))
     }
 
     fn rewind(&mut self) -> Result<(), MediaError> {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.child = None;
+        self.stop_child();
         self.next_index = 0;
         self.spawn()
+    }
+
+    fn cancellation(&self) -> Option<DecoderCancellation> {
+        Some(self.cancellation())
     }
 
     fn stats(&self) -> DecoderStats {
@@ -1029,6 +1292,109 @@ mod tests {
                 None
             }
         }
+    }
+
+    #[test]
+    fn child_failures_are_distinct_from_clean_eof_and_retain_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            path
+        }
+
+        fn decoder_with_tool(tool: PathBuf) -> VideoDecoder {
+            let mut decoder = VideoDecoder {
+                runtime: VideoRuntime::Ffmpeg,
+                tool,
+                path: PathBuf::from("/tmp/test.mp4"),
+                info: MediaInfo {
+                    kind: ContentKind::Video,
+                    width: 1,
+                    height: 1,
+                    frame_count: None,
+                    fps: Some(10.0),
+                    duration: None,
+                    codec: Some("test".to_string()),
+                },
+                frame_bytes: 4,
+                delay: Duration::from_millis(100),
+                child: Arc::new(Mutex::new(None)),
+                stdout: None,
+                stderr_reader: None,
+                hardware: false,
+                next_index: 0,
+                frames_decoded: 0,
+                finished: false,
+            };
+            decoder.spawn().unwrap();
+            decoder
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let clean = script(dir.path(), "clean", "exit 0\n");
+        let mut clean = decoder_with_tool(clean);
+        assert!(clean.next_frame().unwrap().is_none());
+
+        let failed = script(
+            dir.path(),
+            "failed",
+            "printf 'decoder exploded' >&2\ndd if=/dev/zero bs=70000 count=1 >&2 2>/dev/null\nexit 7\n",
+        );
+        let mut failed = decoder_with_tool(failed);
+        let error = failed
+            .next_frame()
+            .expect_err("a nonzero child exit is not EOF");
+        assert!(matches!(error, MediaError::Runtime { .. }), "{error}");
+        assert!(error.to_string().contains("exit status: 7"), "{error}");
+        assert!(error.to_string().contains("decoder exploded"), "{error}");
+        assert!(error.to_string().contains("truncated"), "{error}");
+
+        let partial = script(
+            dir.path(),
+            "partial",
+            "printf 'abc'\nprintf 'short frame' >&2\nexit 9\n",
+        );
+        let mut partial = decoder_with_tool(partial);
+        let error = partial.next_frame().expect_err("a short frame is not EOF");
+        assert!(error.to_string().contains("ended mid-frame"), "{error}");
+        assert!(error.to_string().contains("short frame"), "{error}");
+
+        let blocked = script(dir.path(), "blocked", "exec sleep 30\n");
+        let mut blocked = decoder_with_tool(blocked);
+        let cancellation = blocked.cancellation();
+        let started = Instant::now();
+        cancellation.cancel();
+        assert!(blocked.next_frame().is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation must interrupt a blocked frame read"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_frame_rates_use_the_fallback_delay() {
+        assert_eq!(frame_delay(None), Duration::from_millis(100));
+        assert_eq!(
+            frame_delay(Some(f64::MIN_POSITIVE)),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn video_frame_lengths_are_bounded_before_allocation() {
+        let path = Path::new("/tmp/huge.mp4");
+        assert_eq!(
+            bounded_frame_len(path, 1, 1, DEFAULT_MAX_PIXELS).unwrap(),
+            4
+        );
+        let error = bounded_frame_len(path, u32::MAX, u32::MAX, DEFAULT_MAX_PIXELS)
+            .expect_err("oversized dimensions must be refused");
+        assert!(matches!(error, MediaError::TooLarge { .. }), "{error}");
     }
 
     #[test]

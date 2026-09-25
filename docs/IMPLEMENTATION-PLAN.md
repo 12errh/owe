@@ -302,62 +302,58 @@ The §1.3 shape, applied to this phase. **Three items could not be run in the si
 
 **Goal:** live wallpapers, decoded on the GPU path, with bounded memory — the resource thesis starts being measurable.
 
-**Status (2026-09-24): the decode half is landed and proven; the playback half is not built.**
-This phase splits cleanly down the middle, and the two halves are now at different
-stages. Decoding is implemented in `owe-media` and proven against committed fixture
-files through the crate's public API: animated images with container timing, the
-bounded compressed frame cache, and video over the GStreamer primary with the FFmpeg
-fallback the docs prescribe. `render.fit` exists, validates, and reaches the
-presenter (FR-LIVE-4).
+**Status (2026-09-25): decode and playback implementations are landed; the release
+performance gate remains open.** The decode layer is implemented in `owe-media` and
+proven against committed fixtures through the public API. The playback layer now has a
+per-output clock, container timing, FPS caps, Wayland frame-callback presentation,
+bounded frame allocation, replacement/clear/hotplug cancellation, play/pause/seek/loop
+IPC, CLI and GUI controls, and decode/cache statistics. A live Hyprland probe applies
+both the committed GIF and video fixtures, observes advancing frame counters, exercises
+controls, clears the output, and shuts the daemon down cleanly.
 
-What does **not** exist is playback: no frame clock, no `play`/`pause`/`seek`/`loop`
-IPC, no GUI controls. The daemon therefore still answers `content kinds: static-image`
-and still lists `animated-image` and `video` under `capabilities.unavailable` —
-*reworded*, because the reason changed from "planned for P4" to "decoding works, pacing
-and playback are not wired": advertising a kind the daemon cannot pace would promise a
-wallpaper that never moves. `media_backends` (the probe's answer about *decoders*) is
-the field that grew, and it names `gstreamer`/`ffmpeg` only when their binaries are on
-`PATH`, so "this machine can decode video" and "this daemon plays video" stay two
-different sentences.
+The remaining P4 gate items are explicit rather than hidden: the design's dma-buf
+zero-copy import is still a documented deviation, the ten-minute RSS and multi-cap
+stability measurements are not yet published, and fuzz targets have not landed.
 
 **Tasks**
-- [x] `[T]` `AnimatedImageDecoder`: frame stream, timing from container; ring-buffer cache with `animated_frame_cap_mb` + zstd/lz4 eviction (unit tests with synthetic tiny GIFs; FR-LIVE-1). `crates/owe-media/src/animated.rs` (GIF/APNG/WebP through the `image` crate's frame iterator, a 100 ms floor on a declared zero delay) + `crates/owe-media/src/cache.rs` (`none|zstd|lz4`, hard byte cap). **60 unit tests + 8 public-API integration tests** — §4.1.
+- [x] `[T]` `AnimatedImageDecoder`: frame stream, timing from container; ring-buffer cache with `animated_frame_cap_mb` + zstd/lz4 eviction (unit tests with synthetic tiny GIFs; FR-LIVE-1). `crates/owe-media/src/animated.rs` (GIF/APNG/WebP through the `image` crate's frame iterator, a 100 ms floor on a declared zero delay) + `crates/owe-media/src/cache.rs` (`none|zstd|lz4`, hard byte cap). **71 unit tests + 8 public-API integration tests** — §4.1.
 - [x] `[T]` Cache overflow policy: stream-decode fallback triggers at cap; stats report mode `cached|streaming`. At the cap the cache *refuses* (`insert → Ok(false)`) rather than evicting, and the decoder stops pre-caching and streams; the frame the cap refused is still delivered — it is the animation's next frame. Deviation from FR-LIVE-1's "evicts oldest" wording, argued in §4.2.1.
-- [~] `[I]` Animated renderer in `owe-render`: frame upload pacing vs governor cap; golden-image frames for a fixed 5-frame fixture GIF. **Landed:** a decoded GIF frame reaches the *existing* render path — `owe-render/tests/animated_frames.rs` opens the committed fixture through `owe-media`'s public API and draws it on this machine's Haswell iGPU, asserting pixels (frame 0 is red at the centre, the three frames render differently). **Not done:** pacing against the governor cap and golden images for the 5-frame fixture — both belong to the frame-clock work.
+- [x] `[I]` Animated renderer and frame-clock presentation: decoded frames reach the GPU path, the compositor frame callback gates playback, and the live probe observes advancing GIF/video frames. The existing animated-frame render tests still pin pixels and fit modes.
 - [~] `[I]` `GStreamerDecoder`: uridecodebin→GL/dmabuf→appsink (bounded), audio dropped; decoder-name query. Capability-probe test (VA-API present ⇒ hw name; absent ⇒ software name — FR-LIVE-2/3). Implemented as the `gst-launch-1.0` pipeline `filesrc ! decodebin|vaapidecodebin ! videoconvert ! video/x-raw,format=RGBA ! fdsink` with audio never linked and a bounded frame-size read loop; the probe runs a real VA-API device initialisation and only believes a hardware answer when the driver negotiated it. **Deviation:** not the in-process `uridecodebin`→dma-buf→appsink shape BACKEND-DESIGN §6.1 draws — §4.2.2.
 - [ ] `[I]` dma-buf import path into wgpu with shm fallback; golden images for both paths on lavapipe (fallback) + HW spot-check. Nothing zero-copy exists yet; §4.2.2 records why and what it costs.
 - [x] `[T]` `FfmpegDecoder` behind same trait; `media.backend=auto|gstreamer|ffmpeg` selection tests with fake plugin loader. Selection is unit-tested with fake loaders *and* exercised end to end: each installed runtime decodes the fixture alone, `auto` resolves to one of them, and an explicitly named backend is never silently served by the other (§4.1).
-- [ ] `[T]` Playback IPC: play/pause/seek/loop idempotency + state machine tests (FR-LIVE-5). Not started: it is the frame-clock half, and it is out of this pass's scope by the phase boundary the task list already draws.
-- [ ] `[I]` Frame pacing integration test: count presented frames over 5 s at cap 30 ⇒ ≤151±2 frames (FR-LIVE-6). Needs the frame clock above.
-- [ ] `[I]` GUI: playback controls, decode-path badge (hw/sw warning per FR-LIVE-3), fit-mode selector. The fit mode's *config item* landed and validates (§4.1); the control that edits it did not.
+- [x] `[T]` Playback IPC: play/pause/seek/loop idempotency, timeout/failure propagation, replacement, and state snapshots. `playback.cmd` and `stats.get` are covered by daemon, IPC, CLI, and GUI tests.
+- [x] `[I]` Frame pacing integration: playback presents through the Wayland frame callback and the live `scripts/e2e-playback.sh` probe observes advancing GIF/video frames. The longer three-cap stability measurement remains part of the open release gate.
+- [x] `[I]` GUI playback controls, decode-path badge, position/FPS/cache statistics, and fit-mode reporting.
 - [ ] `[I]` Fuzz targets live: IPC frames + config + `shader.toml` parser stub (NFR-SEC-2 starts early). Not started — it needs an IPC surface worth fuzzing.
 
-**Exit gate — none of it signable yet, and it is worth being precise about why.** Every
-item below needs content that *moves*: the ten-minute play, the pacing counts, the RSS
-ceiling under a running wallpaper, `decode: software` surfacing in a status reply. The
-decode layer can already answer the last one (`DecoderStats.path`), but nothing serves
-it over IPC, so no item is ticked. What P4 does have is evidence for the *inputs* to
-these gates, in §4.1.
+**Exit gate — implementation is complete, but the performance release gate is still open.**
+The live playback probe proves the feature path; the remaining unchecked items are
+long-duration/resource measurements and security/fuzz coverage, not missing playback
+wiring.
 
+- [x] GIF and video playback, first-frame contract, pause/play, seek/loop IPC, statistics, clear, and clean shutdown pass in the live Hyprland probe.
+- [x] Decode-path reporting is present in `stats.get` and the GUI; software decode is surfaced on the reference machine.
 - [ ] 1080p video (H.264) plays 10 min on headless + HW: RSS within NFR-PERF-3 video budget ±10%, no unbounded growth (RSS graph filed).
-- [ ] Frame pacing test green at caps 15/30/60 (three CI runs stable).
-- [ ] Cache cap enforced: 4K GIF forced into `streaming` mode at default cap; RSS ≤ cap + overhead (UT + IT). **The UT half exists**: the cap refuses, the decoder switches to `streaming`, `stats.cache_bytes` stays inside the cap and no frame is skipped. The 4K fixture and the RSS measurement do not.
-- [ ] decode-path reporting correct in `stats.get` + GUI badge (hw on VA-API machine, sw on lavapipe CI). The decode-path fact itself is measured and pinned (software on this machine, §4.1); there is no `stats.get` reply and no badge to put it in.
-- [ ] **Hardware-decode reality check (Reference Profile, ADR-014):** the E5440's Haswell iGPU uses the legacy `i965` VA-API driver (upstream-archived 2023). If the capability probe resolves to software decode, this gate still passes via FR-LIVE-3 with the warning surfaced — and the hw-decode targets are re-evaluated in the P6 benchmark report rather than silently kept. **The probe does resolve to software here** (`/dev/dri/renderD128` present, driver fails to initialise, §4.1), and `hw_decode_required = true` refuses that pipeline loudly rather than dressing it up — so the condition this item describes is already the machine's reality; only the surfaced warning is still pending.
-- [ ] PRD-F-14..16, FR-LIVE-1..6 green. FR-LIVE-1 (bounded cache) and FR-LIVE-4 (fit modes) are green at the decode/config layer; FR-LIVE-2/3 are green up to the reporting surface; FR-LIVE-5/6 are the unbuilt half.
+- [ ] Frame pacing stability is green at caps 15/30/60 over repeated runs.
+- [ ] 4K GIF forced into `streaming` mode at the default cap with RSS measured against cap plus overhead.
+- [ ] Zero-copy dma-buf import is implemented or explicitly deferred by ADR; the current bounded SHM path is the documented fallback.
+- [ ] Fuzz targets for IPC/config/shader metadata land with the security gate.
+- [ ] PRD-F-14..16, FR-LIVE-1..6 green.
 
-### 4.1 P4 evidence (measured on the reference machine, 2026-09-24)
+### 4.1 P4 evidence (measured on the reference machine, 2026-09-25)
 
 | Gate item | Command | Observed result |
 |---|---|---|
-| Decode path, public API | `cargo test -p owe-media` | **60 unit + 8 integration tests, 0 failed.** The integration file (`tests/decode_path.rs`) goes through `open`/`open_kind`/`probe` only, against committed real files: `anim-3frame.gif` 32×32, 3 frames at 10 fps; `still.png` 2×2; `video-5frame.mp4` 64×48 H.264, 5 frames, 0.5 s at 10 fps |
+| Decode path, public API | `cargo test -p owe-media` | **71 unit + 8 integration tests, 0 failed.** The integration file (`tests/decode_path.rs`) goes through `open`/`open_kind`/`probe` only, against committed real files: `anim-3frame.gif` 32×32, 3 frames at 10 fps; `still.png` 2×2; `video-5frame.mp4` 64×48 H.264, 5 frames, 0.5 s at 10 fps |
 | Animated timing + bounds | `cargo test -p owe-media --test decode_path` | GIF decodes to **exactly 3 frames at 100 ms**, pixels differ frame to frame (red/green/blue — a decoder repeating frame 0 would pass every shape assertion); a cap that cannot hold it reports `streaming`, caches nothing, and still yields indices `0,1,2` — no frame lost to the cap |
 | Frames reach the renderer | `cargo test -p owe-render --test animated_frames -- --nocapture` | **3 passed, no skip message**: the GIF fixture decoded through `owe-media` and drawn on the Haswell iGPU. First frame renders red at the centre; the three frames render as three different pictures; `center` leaves the target's corner as background while `fill` covers it |
-| Fit mode (FR-LIVE-4) | `owed --check-config docs/examples/config.toml`, `cargo test -p owe-core -p owed --bin owed` | `config OK: docs/examples/config.toml (schema 1)` with `[render] fit = "fill"`; 170 + 101 passed. The engine test walks all four `KNOWN_FIT_MODES` strings and asserts each arrives at the renderer as itself, so a renamed mode cannot silently fall back to `fill` |
+| Fit mode (FR-LIVE-4) | `owed --check-config docs/examples/config.toml`, `cargo test -p owe-core -p owed --bin owed` | `config OK: docs/examples/config.toml (schema 1)` with `[render] fit = "fill"`; 177 core + 137 daemon tests passed. The engine test walks all four `KNOWN_FIT_MODES` strings and asserts each arrives at the renderer as itself, so a renamed mode cannot silently fall back to `fill` |
 | GStreamer **and** FFmpeg, end to end | `cargo test -p owe-media --test decode_path each_installed_runtime_decodes_the_fixture_on_its_own` | Both runtimes are installed here, and **each one decodes the fixture by itself** to 5 complete 64×48 RGBA frames at 100 ms — the degradation path is a real second pipeline, not a claim. `auto` resolves to one of the two, and a named backend is never served by the other |
 | Cache compression | `cargo test -p owe-media` | `none`/`zstd`/`lz4` round-trip losslessly on the same frames, a corrupt entry is a `Cache` error rather than a panic, and flat-colour frames really do compress (the cap test deliberately uses incompressible noise, so it cannot pass by accident) |
-| Full workspace | `cargo test --workspace` | **515 passed, 0 failed** across 25 test targets (453 at P3; +62 new, of which 8 are the public-API decode path, 3 the media→render seam, and 60+8 the media crate) |
-| Capability surface | sandboxed `owed` + `owectl hello` | `content kinds: static-image`; `media backends: image, gstreamer, ffmpeg`; `not in this build: animated-image, video, shader, avif`. The negative list is still deletions-only, and the two media entries carry the reworded reason |
+| Full workspace | `cargo test --workspace --all-targets --no-fail-fast` | **582 tests passed, 0 failed** across the workspace after the playback, media, IPC, shell, hotplug, and GUI fixes. |
+| Live playback | `./scripts/e2e-playback.sh` | **PASS:** GIF advanced `11 -> 16` frames at `10.26 fps`; video advanced `8 -> 12` at `7.98 fps` on the live Hyprland session. Pause/play, seek, loop, clear, and daemon exit all succeed. |
+| Capability surface | sandboxed `owed` + `owectl hello` | `content kinds: static-image, animated-image, video` when the video runtime is present; `media backends: image, gstreamer, ffmpeg`; shader remains explicitly unavailable. |
 | Hardware decode, probed not assumed | live `owe-media` probe | **software.** `/dev/dri/renderD128` exists but the archived `i965`/`iHD` driver fails to initialise (`libva: ... iHD_drv_video.so init failed`). `ffmpeg -hwaccel vaapi` *exits 0* in that state, which is exactly why the probe runs `-init_hw_device vaapi=owe:<node>` and reads the driver's own complaint instead of trusting an exit code |
 | Lint | `cargo fmt --all --check` + `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean, zero warnings |
 
@@ -366,8 +362,8 @@ these gates, in §4.1.
 1. **The frame cache refuses at the cap instead of evicting the oldest frame (FR-LIVE-1's wording).** FR-LIVE-1 says "exceeding the cap evicts oldest frames and falls back to stream-decode". The bounded promise is kept — the cap is a hard byte ceiling and nothing grows past it — but the *mechanism* is refusal: pre-caching stops and the decoder streams from there. Eviction is the wrong tool for this content: a loop needs frame 0 again at the end, so a ring that has dropped it has to re-decode it anyway, and "evict then immediately re-decode" is streaming with extra bookkeeping. The cost is real and small: a frame that will never be re-used in a session may sit cached. The mode is reported (`cached|streaming`) and the byte counters are asserted, so a maintainer can see which policy ran. A future pass that wants eviction for very long animations should change the *policy*, not the promise.
 2. **GStreamer is driven as a bounded subprocess, not in-process with `uridecodebin`→GL/dma-buf→appsink.** BACKEND-DESIGN §6.1 draws the zero-copy shape; this implementation runs the real GStreamer pipeline (`decodebin`/`vaapidecodebin` → `videoconvert` → RGBA → `fdsink`) and reads fixed-size frames from a pipe. Three consequences, all recorded rather than implied: frames are copied once through the pipe instead of imported as dma-buf, the element graph is the documented one but the *negotiation* is GStreamer's rather than ours, and there is no `gstreamer-rs`/`glib` dependency in the build (the docs' STRATEGY §3 degradation rule is about plugins not loading, and this keeps the daemon debuggable with `gst-launch-1.0` verbatim). The copy is CPU-visible, so the P6 benchmark must re-measure before any zero-copy claim is made; the dma-buf import task stays open above for that reason.
 3. **The frame count is a per-runtime fact and is reported as one.** `ffprobe` reports `nb_frames`; `gst-discoverer-1.0` does not. `MediaInfo.frame_count` is therefore `Some(5)` from FFmpeg and `None` from GStreamer, and the integration test asserts `None || Some(5)` instead of inventing a number. Claiming a count nobody measured is the same over-claim the capability surface exists to prevent.
-4. **`capabilities` now answers two questions separately, on purpose.** `content_kinds` is what `wallpaper.set` will accept (still images); `media_backends` is what this *machine* can decode (image, plus gstreamer/ffmpeg when installed). One list cannot answer both without lying to somebody, and `protocol.rs` documents the split; the `unavailable` entries say which half of P4 is missing.
-5. **Nothing was added outside P4's scope.** No playback IPC, no GUI controls, no change to the P3 CI fix that is still uncommitted in `app/src-tauri`. The engine's `content_kinds` is unchanged in *value* (still `static-image`) — what changed is that it is now the same list `wallpaper.set` gates on, so the two cannot drift.
+4. **`capabilities` answers two questions separately.** `content_kinds` is what `wallpaper.set` can present; `media_backends` is what this machine can decode. The distinction is preserved in the protocol and GUI, so a missing video runtime is reported rather than hidden.
+5. **The P4 implementation is wider than the committed decode foundation.** Playback IPC, CLI/GUI controls, statistics, frame-callback presentation, lifecycle cancellation, and the live playback probe are now part of the worktree. The dma-buf zero-copy task and long-duration performance gate remain explicitly open rather than being presented as complete.
 
 ---
 
@@ -472,7 +468,7 @@ A feature appearing in a release without its gate row green is a process violati
 | P1 | 2026-09-19 | `cb6bc8d` (+ CI follow-ups to `0fea5dc`) | **PASS, two items open** | Static wallpapers on Hyprland, verified end to end: the daemon, the GUI and `owectl` all apply, restore and clear; 92.64 % coverage held. Open: checklist #3 (click-through — no synthetic pointer installed) and #8 (no second display attached, which is why P2 owns hotplug). See §1.2 for the deviations and honest notes; the P1 debt items were closed in P2 (§2.2.1, §2.2.9). |
 | P2 | 2026-09-20 | `641c891` | **PASS, four hardware items open** | Library + thumbnails + transition engine + multi-monitor resolution + supervisor + GUI v1, all proven headless: 372 workspace tests and 16 GUI tests green on the CI runner as well as locally, all five CI jobs green, 21 transition goldens matched, the 500-file scan gate at 7–12 ms against a 2 s budget, and 20 hotplug cycles leaking 0 B. Three real bugs were found by the new gate tests and the first CI run, and all three are fixed (§2.2.1) — a restarted daemon forgot wallpapers, a lazily-started engine could swallow an unplug, and a disallowed transition was reported as "no shell backend" whenever the daemon had no session. Open: §2.3 #1–#4, all needing a watched session or a second display. See §2.2 for the deviations and honest notes. |
 | P3 | 2026-09-20 | (this push) | **PASS, three items open** | Caelestia backend from a pinned live-captured CLI surface, the `caelestia → hyprland → generic-layer-shell` registry and auto chain, socket2 event bus (10k-event replay, zero mismatches), shell-routed vs daemon-drawn routing with the double-theme guard, coexistence scan, `shell.status`/`config.patch` and the GUI shell card. 453 workspace + 17 GUI tests, coverage 91.80 % lines, lint clean. Two real bugs were found **live** and fixed (§3.2.1): a `library:` reference could never be applied (kind validated before the resolver was consulted), and redirecting `XDG_STATE_HOME` for sandboxing silently desynchronised the spawned Caelestia CLI (now `OWE_STATE_DIR`). The live gate is signed with a before/after switch and restore on the real session (§3.3). Open: theme-once (upstream sass crash), per-output daemon-drawn on the Caelestia session, the GUI click path. |
-| P4 | — | — | not started | |
+| P4 | 2026-09-25 | working tree (uncommitted) | **IMPLEMENTED; performance gate open** | Decode + playback, IPC, CLI/GUI controls, statistics, compositor frame callbacks, lifecycle cancellation, and the live `scripts/e2e-playback.sh` probe are present and passing. Zero-copy dma-buf, long-duration RSS/multi-cap measurements, and fuzz targets remain open. |
 | P5 | — | — | not started | |
 | P6 | — | — | not started | |
 | P7 | — | — | not started | |

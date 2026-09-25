@@ -218,13 +218,13 @@ impl RawVideo {
     pub fn duration(&self) -> Option<Duration> {
         self.duration_secs
             .filter(|secs| secs.is_finite() && *secs >= 0.0)
-            .map(Duration::from_secs_f64)
+            .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
     }
 
     /// Per-frame presentation delay implied by the frame rate.
     pub fn frame_delay(&self) -> Duration {
         if self.fps.is_finite() && self.fps > 0.0 {
-            Duration::from_secs_f64(1.0 / self.fps)
+            Duration::try_from_secs_f64(1.0 / self.fps).unwrap_or(Duration::from_millis(100))
         } else {
             Duration::from_millis(100)
         }
@@ -453,6 +453,19 @@ mod tests {
             codec: "x".to_string(),
         };
         assert_eq!(raw.frame_delay(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn unrepresentable_probe_durations_are_none_not_panics() {
+        let raw = RawVideo {
+            width: 2,
+            height: 2,
+            fps: 10.0,
+            frame_count: None,
+            duration_secs: Some(f64::MAX),
+            codec: "x".to_string(),
+        };
+        assert_eq!(raw.duration(), None);
     }
 
     #[test]

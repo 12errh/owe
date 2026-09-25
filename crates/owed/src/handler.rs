@@ -29,6 +29,7 @@ use crate::coexist::CoexistenceReport;
 use crate::engine::{Engine, EngineError, ShellPatch};
 use crate::events::ShellEventBus;
 use crate::library::{LibraryService, parse_kind};
+use crate::playback::{self, PlaybackCmd, PlaybackError};
 
 /// Protocol methods actually implemented by this build, in advertised order.
 ///
@@ -42,10 +43,12 @@ pub const IMPLEMENTED_METHODS: &[&str] = &[
     method::OUTPUTS_LIST,
     method::WALLPAPER_SET,
     method::WALLPAPER_CLEAR,
+    method::PLAYBACK_CMD,
     method::GOVERNOR_OVERRIDE,
     method::LIBRARY_SCAN,
     method::LIBRARY_LIST,
     method::LIBRARY_THUMB,
+    method::STATS_GET,
     method::SHELL_STATUS,
     method::CONFIG_PATCH,
 ];
@@ -62,24 +65,11 @@ const KNOWN_BUT_NOT_YET: &[(&str, &str)] = &[
     // is the registry's own answer). The list exists so a client can say "planned"
     // instead of staying silent, not so it can stay populated.
     //
-    // The two media entries were reworded in P4 rather than deleted, because P4
-    // split their work in half: `owe-media` now decodes GIF/APNG/WebP and video,
-    // and this build can prove it with frames (see `crates/owe-media/tests/`), but
-    // nothing paces or presents those frames yet — so `wallpaper.set` still
-    // refuses them. Saying "decode landed, playback not wired" is the honest
-    // sentence; saying "planned for P4" now would be the drift.
-    (
-        "animated-image",
-        "P4 landed the decode (frames, container timing, bounded cache) in owe-media, but no playback \
-         loop paces or presents it, so `wallpaper.set` refuses GIF/APNG/WebP; by decision this list \
-         names what cannot be rendered, not what cannot be decoded",
-    ),
-    (
-        "video",
-        "P4 landed the decode behind GStreamer/FFmpeg when either is installed, but there is no \
-         playback (pacing, play/pause) wired into the daemon; by decision a content kind is \
-         advertised only once it can actually play",
-    ),
+    // `animated-image` and `video` were deleted from this list in P4, when the frame
+    // clock learned to pace and present them: they are now in `content_kinds`, and
+    // the only way either reappears here is the derived half below — video on a
+    // machine with no runtime to decode it, which is a fact about that machine and
+    // not about the phase.
     (
         "shader",
         "content kind planned for P5 (WGSL packs, previews)",
@@ -158,6 +148,27 @@ struct SetParams {
 #[derive(Debug, Default, Deserialize)]
 struct ClearParams {
     /// Output target; defaults to `all`.
+    #[serde(default)]
+    output: Option<String>,
+}
+
+/// Parameters of `playback.cmd` (BACKEND-DESIGN §3: `{output, cmd}`).
+#[derive(Debug, Deserialize)]
+struct PlaybackParams {
+    /// Output whose clock the command acts on. `all` means every output that is
+    /// playing; the protocol takes one output per request, so `all` is sugar for
+    /// the CLI rather than a second reply shape.
+    #[serde(default)]
+    output: Option<String>,
+    /// The command: `"play"`, `"pause"`, `{"seek": <seconds>}`, or
+    /// `{"loop": {"a": <s>, "b": <s>}}`.
+    cmd: Value,
+}
+
+/// Parameters of `stats.get` (BACKEND-DESIGN §3: `{output?}`).
+#[derive(Debug, Default, Deserialize)]
+struct StatsParams {
+    /// One output; omitted means every connected output.
     #[serde(default)]
     output: Option<String>,
 }
@@ -346,6 +357,7 @@ impl IpcHandler {
                 .iter()
                 .map(|m| (*m).to_string())
                 .collect(),
+            events: Vec::new(),
             // Real registry ids, not a static list of everything the project has
             // ever heard of (the P0 §0.2.4 finding).
             shell_backends: self.state.engine.backend_ids(),
@@ -370,11 +382,43 @@ impl IpcHandler {
             // The live config's allow-list, not the full catalogue: a picker that
             // offers what `wallpaper.set` will refuse is worse than a short list.
             transitions: self.state.config.render.allow_transitions.clone(),
-            unavailable: KNOWN_BUT_NOT_YET
-                .iter()
-                .map(|(id, why)| format!("{id}: {why}"))
-                .collect(),
+            unavailable: self.unavailable_entries(),
         }
+    }
+
+    /// What this build — and this machine — cannot render, with the reason.
+    ///
+    /// Two sources on purpose. [`KNOWN_BUT_NOT_YET`] is the static half: what the
+    /// build has never had. The derived half covers a content kind that is
+    /// implemented and that *this machine* cannot drive, so a kind missing from
+    /// `content_kinds` is always explained rather than silently absent — a
+    /// deletion-only list would under-report, which is the failure the P0 finding
+    /// warned about from the other side.
+    fn unavailable_entries(&self) -> Vec<String> {
+        let mut entries: Vec<String> = KNOWN_BUT_NOT_YET
+            .iter()
+            .map(|(id, why)| format!("{id}: {why}"))
+            .collect();
+
+        if !self
+            .state
+            .engine
+            .content_kinds()
+            .contains(&ContentKind::Video)
+        {
+            let tools: Vec<String> = owe_media::VideoRuntime::ALL
+                .iter()
+                .map(|runtime| runtime.required_tools()[0].to_string())
+                .collect();
+            entries.push(format!(
+                "video: no video decode runtime is installed on this machine (looked for {} on \
+                 PATH), so a video wallpaper could not be decoded at all; by decision the kind is \
+                 advertised only while a runtime is present (P4, docs/BACKEND-DESIGN.md §6.1)",
+                tools.join(", ")
+            ));
+        }
+
+        entries
     }
 
     fn hello(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
@@ -405,7 +449,8 @@ impl IpcHandler {
     fn config_get(&self, _request: &RequestFrame) -> Result<Value, ErrorBody> {
         let toml_text = self
             .state
-            .config
+            .engine
+            .effective_config()
             .to_toml_string()
             .map_err(|error| ErrorBody::internal(error.to_string()))?;
         Ok(json!({
@@ -547,6 +592,155 @@ impl IpcHandler {
         Ok(json!({ "cleared": cleared }))
     }
 
+    /// `playback.cmd` (FR-LIVE-5): play/pause/seek/loop on one output's clock.
+    ///
+    /// The reply carries the clock's state *after* the command, so a client can
+    /// render "paused at 1.2 s" without a second call — and because every command is
+    /// idempotent, applying the same one twice answers the same state rather than
+    /// toggling anything.
+    fn playback_cmd(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
+        let params: PlaybackParams = request.params_as()?;
+        let cmd = PlaybackCmd::parse(&params.cmd).map_err(ErrorBody::bad_request)?;
+        let target = params.output.as_deref().unwrap_or("all").trim();
+
+        let outputs: Vec<String> = if target.is_empty() || target == "all" || target == "*" {
+            let playing = self.state.engine.playback_outputs();
+            if playing.is_empty() {
+                return Err(ErrorBody::new(
+                    ErrorCode::NotFound,
+                    "nothing is playing on any output: `playback.cmd` acts on a running \
+                     wallpaper, and a static image has no clock to command (start one with \
+                     `wallpaper.set` and an animated or video file)",
+                ));
+            }
+            playing
+        } else {
+            vec![target.to_string()]
+        };
+
+        let mut states = Vec::with_capacity(outputs.len());
+        for output in &outputs {
+            let state = self
+                .state
+                .engine
+                .playback_command(output, cmd)
+                .map_err(|error| engine_error(&EngineError::Playback(error)))?;
+            states.push(state);
+        }
+
+        tracing::info!(outputs = %outputs.join(", "), "playback command applied");
+        Ok(match states.len() {
+            1 => json!({ "ok": true, "state": states[0] }),
+            _ => json!({ "ok": true, "states": states }),
+        })
+    }
+
+    /// `stats.get` (FR-GOV-6): what each output is presenting, and how.
+    ///
+    /// Reports the decode path and the cache the governor requirements are about
+    /// (FR-LIVE-1/2/3): the point of this method is that a user can answer "is my
+    /// GPU decoding this, or is it eating a core?" without a profiler. RSS is the
+    /// daemon's own, reported once because all outputs share one process — dividing
+    /// it per output would be inventing numbers.
+    fn stats_get(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
+        let params: StatsParams = request.params_as()?;
+        let views = self
+            .state
+            .engine
+            .output_views()
+            .map_err(|error| engine_error(&error))?;
+
+        let named = params
+            .output
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != "all" && *name != "*");
+        if let Some(name) = named
+            && !views.iter().any(|view| view.name == name)
+        {
+            let available: Vec<&str> = views.iter().map(|view| view.name.as_str()).collect();
+            return Err(ErrorBody::new(
+                ErrorCode::OutputUnknown,
+                format!(
+                    "no output named `{name}`; connected: {}",
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ),
+            ));
+        }
+
+        let rows: Vec<Value> = views
+            .iter()
+            .filter(|view| named.is_none_or(|name| view.name == name))
+            .map(|view| {
+                let playback = self.state.engine.playback_snapshot(&view.name);
+                match playback {
+                    Some(state) => json!({
+                        "output": view.name,
+                        "kind": state.kind,
+                        "wallpaper": view.wallpaper,
+                        "playing": state.playing,
+                        "held": state.held,
+                        "fps": state.fps,
+                        "fps_cap": state.fps_cap,
+                        "decode": state.decode,
+                        "decoder": state.decoder,
+                        "mode": state.mode,
+                        "buffers": state.buffers,
+                        "buffer_bytes": state.cache_bytes,
+                        "buffer_cap_bytes": state.cache_cap_bytes,
+                        "width": state.width,
+                        "height": state.height,
+                        "position": state.position,
+                        "position_ms": state.position_ms,
+                        "total_frames": state.total_frames,
+                        "frames_presented": state.frames_presented,
+                        "loop_start_ms": state.loop_start_ms,
+                        "loop_end_ms": state.loop_end_ms,
+                        "failed": state.failed,
+                    }),
+                    // No clock: the output shows a still, or nothing at all. The
+                    // still was decoded once, in software, and is not being decoded
+                    // now — so there is a decode *path* to name and no frame rate to
+                    // report, and both are said as such rather than as a zero.
+                    None => json!({
+                        "output": view.name,
+                        "kind": view.kind,
+                        "wallpaper": view.wallpaper,
+                        "playing": false,
+                        "held": false,
+                        "fps": null,
+                        "fps_cap": null,
+                        "decode": "software",
+                        "decoder": null,
+                        "mode": null,
+                        "buffers": 0,
+                        "buffer_bytes": 0,
+                        "buffer_cap_bytes": 0,
+                        "width": view.width,
+                        "height": view.height,
+                        "position": null,
+                        "position_ms": null,
+                        "total_frames": null,
+                        "frames_presented": 0,
+                        "loop_start_ms": null,
+                        "loop_end_ms": null,
+                        "failed": view.error,
+                    }),
+                }
+            })
+            .collect();
+
+        Ok(json!({
+            "stats": rows,
+            "rss_bytes": playback::rss_bytes(),
+            "paused": self.state.engine.is_paused(),
+        }))
+    }
+
     fn governor_override(&self, request: &RequestFrame) -> Result<Value, ErrorBody> {
         let params: OverrideParams = request.params_as()?;
         let paused = match params.policy.trim().to_ascii_lowercase().as_str() {
@@ -568,10 +762,10 @@ impl IpcHandler {
         );
         Ok(json!({
             "paused": paused,
-            // Honest about reach: with static wallpapers there is nothing to stop,
-            // so the override is recorded now and takes effect when animated
-            // content lands in P4 (the policy engine itself is P6).
-            "affects": "animated and video wallpapers; static wallpapers are already motionless",
+            // Honest about reach: the override is a daemon-wide hold, so it stops
+            // every frame clock. The policy *engine* (per-output rules: fullscreen,
+            // battery, DPMS) is still P6.
+            "affects": "running playback clocks; static wallpapers are already motionless",
         }))
     }
 
@@ -781,9 +975,13 @@ fn parse_transition(value: &Value) -> Result<Transition, ErrorBody> {
                 None => defaults.duration_ms,
             };
             let fps = match map.get("fps") {
-                Some(value) => value.as_u64().ok_or_else(|| {
-                    ErrorBody::bad_request("`transition.fps` must be a positive integer")
-                })? as u32,
+                Some(value) => {
+                    let fps = value.as_u64().ok_or_else(|| {
+                        ErrorBody::bad_request("`transition.fps` must be a positive integer")
+                    })?;
+                    u32::try_from(fps)
+                        .map_err(|_| ErrorBody::bad_request("`transition.fps` is too large"))?
+                }
                 None => defaults.fps,
             };
             Ok(Transition {
@@ -820,6 +1018,7 @@ fn engine_error(error: &EngineError) -> ErrorBody {
         // Invalid reference strings and unknown backends are configuration
         // mistakes, which the client can fix.
         EngineError::Model(_) => ErrorBody::new(ErrorCode::BadRequest, error.to_string()),
+        EngineError::Config(_) => ErrorBody::new(ErrorCode::ConfigInvalid, error.to_string()),
         EngineError::ShellSelection(SelectError::UnknownBackend { .. }) => {
             ErrorBody::new(ErrorCode::ConfigInvalid, error.to_string())
         }
@@ -842,6 +1041,22 @@ fn engine_error(error: &EngineError) -> ErrorBody {
 
         EngineError::Unsupported(_) => ErrorBody::unsupported(error.to_string()),
 
+        // Playback failures are three different answers, and a client that gets
+        // `INTERNAL` for all of them can only retry blindly: nothing is playing on
+        // that output ("pick another output"), a command this build cannot honour
+        // ("this seek is further than rewinding can reach"), or content that
+        // stopped decoding ("the file went away").
+        EngineError::Playback(PlaybackError::NotPlaying { .. }) => {
+            ErrorBody::new(ErrorCode::NotFound, error.to_string())
+        }
+        EngineError::Playback(PlaybackError::Refused { .. }) => {
+            ErrorBody::unsupported(error.to_string())
+        }
+        EngineError::Playback(PlaybackError::Decode { .. }) => {
+            ErrorBody::new(ErrorCode::BadRequest, error.to_string())
+        }
+        EngineError::Playback(_) => ErrorBody::new(ErrorCode::Internal, error.to_string()),
+
         EngineError::Shell(_)
         | EngineError::Render(_)
         | EngineError::Present(_)
@@ -859,6 +1074,8 @@ impl Handler for IpcHandler {
             method::OUTPUTS_LIST => self.outputs_list(request),
             method::WALLPAPER_SET => self.wallpaper_set(request),
             method::WALLPAPER_CLEAR => self.wallpaper_clear(request),
+            method::PLAYBACK_CMD => self.playback_cmd(request),
+            method::STATS_GET => self.stats_get(request),
             method::GOVERNOR_OVERRIDE => self.governor_override(request),
             method::LIBRARY_LIST => self.library_list(request),
             method::LIBRARY_SCAN => self.library_scan(request),
@@ -953,18 +1170,26 @@ mod tests {
             json!({
                 "client": "test",
                 "client_version": "0.2.0",
-                "schema": [{ "major": 1, "minor": 1 }],
+                "schema": [{ "major": 1, "minor": 2 }],
             }),
         );
         let value = handler.handle(&request).expect("hello ok");
         let reply: HelloReply = serde_json::from_value(value).unwrap();
         assert_eq!(reply.schema, SchemaVersion::CURRENT);
-        assert_eq!(SchemaVersion::CURRENT.minor, 1, "P2 bumped the minor");
+        assert_eq!(
+            SchemaVersion::CURRENT.minor,
+            2,
+            "P4 event capability bumped the minor"
+        );
     }
 
     #[test]
     fn capabilities_never_advertise_unimplemented_methods() {
         let capabilities = handler().capabilities();
+        assert!(
+            capabilities.events.is_empty(),
+            "the server has no unsolicited IPC event publisher"
+        );
         for advertised in &capabilities.methods {
             assert!(
                 method::ALL.contains(&advertised.as_str()),
@@ -976,17 +1201,13 @@ mod tests {
             );
         }
         // `config.patch` left this list in P3, when it started validating and
-        // hot-applying the `[shell]` subtree.
-        for unimplemented in [
-            method::PLAYBACK_CMD,
-            method::STATS_GET,
-            method::GOVERNOR_POLICY,
-        ] {
-            assert!(
-                !capabilities.methods.iter().any(|m| m == unimplemented),
-                "`{unimplemented}` must not be advertised before it works"
-            );
-        }
+        // hot-applying the `[shell]` subtree; `playback.cmd` and `stats.get` left it
+        // in P4, when the frame clock started answering them.
+        let unimplemented = method::GOVERNOR_POLICY;
+        assert!(
+            !capabilities.methods.iter().any(|m| m == unimplemented),
+            "`{unimplemented}` must not be advertised before it works"
+        );
     }
 
     #[test]
@@ -1184,12 +1405,21 @@ mod tests {
 
     #[test]
     fn content_kinds_are_limited_to_what_the_daemon_can_really_present() {
-        // `content_kinds` is what `wallpaper.set` accepts, so it lags the decode
-        // layer on purpose: P4 taught `owe-media` to produce GIF and video frames,
-        // but until pacing and playback are wired in, advertising those kinds here
-        // would promise a wallpaper that never moves.
+        // `content_kinds` is what `wallpaper.set` accepts, so it is derived from what
+        // this build and this machine can really put on screen: stills and animated
+        // images always (the decoders are compiled in), video only when a runtime is
+        // installed, shaders never before P5.
         let capabilities = handler().capabilities();
-        assert_eq!(capabilities.content_kinds, vec!["static-image".to_string()]);
+        assert_eq!(
+            capabilities.content_kinds,
+            vec![
+                "static-image".to_string(),
+                "animated-image".to_string(),
+                "video".to_string()
+            ],
+            "this reference machine has both video runtimes installed"
+        );
+        assert!(!capabilities.content_kinds.contains(&"shader".to_string()));
 
         // `media_backends` answers the other question — which decoders this build
         // can drive — and it is the probe's list, never a hand-written wish list.
@@ -1219,15 +1449,32 @@ mod tests {
         }
 
         // And every kind the daemon cannot present is named, never silently absent:
-        // "this build does not do video" is an answer, "no entry" is not.
-        for kind in ["animated-image", "video"] {
-            assert!(!capabilities.content_kinds.contains(&kind.to_string()));
+        // "this machine has no video runtime" is an answer, "no entry" is not. Video
+        // is the one kind whose answer depends on the machine, so it is asserted
+        // against the probe rather than hardcoded either way.
+        let video_renderable = capabilities.content_kinds.contains(&"video".to_string());
+        assert_eq!(video_renderable, owe_media::any_video_runtime());
+        assert_eq!(
+            capabilities
+                .unavailable
+                .iter()
+                .any(|entry| entry.starts_with("video:")),
+            !video_renderable,
+            "video must be either advertised or explained, never neither: {:?}",
+            capabilities.unavailable
+        );
+
+        for kind in ["static-image", "animated-image"] {
             assert!(
-                capabilities
+                capabilities.content_kinds.contains(&kind.to_string()),
+                "`{kind}` has a real path to the screen"
+            );
+            assert!(
+                !capabilities
                     .unavailable
                     .iter()
                     .any(|entry| entry.starts_with(&format!("{kind}:"))),
-                "`{kind}` is neither renderable nor explained"
+                "`{kind}` renders and must not be reported as unavailable"
             );
         }
     }
@@ -1300,11 +1547,11 @@ mod tests {
 
     #[test]
     fn unimplemented_methods_answer_unsupported_with_a_pointer() {
-        // `playback.cmd` is the next method the plan lands (P4). Using it here
-        // proves the unsupported path still exists now that every library method
-        // is implemented.
+        // `governor.policy` is what the plan lands next (P6's policy engine). Using
+        // it here proves the unsupported path still exists now that the playback and
+        // library methods are implemented.
         let handler = handler();
-        let request = RequestFrame::new("c1", method::PLAYBACK_CMD, json!({}));
+        let request = RequestFrame::new("c1", method::GOVERNOR_POLICY, json!({}));
 
         let error = handler.handle(&request).unwrap_err();
         assert_eq!(error.code, ErrorCode::Unsupported);
@@ -1323,7 +1570,7 @@ mod tests {
     #[test]
     fn error_bodies_serialize_into_reply_frames() {
         let handler = handler();
-        let request = RequestFrame::new("c1", method::PLAYBACK_CMD, json!({}));
+        let request = RequestFrame::new("c1", method::GOVERNOR_POLICY, json!({}));
         let error = handler.handle(&request).unwrap_err();
         let frame = ReplyFrame::err("c1", error);
         let value = serde_json::to_value(frame).unwrap();
@@ -1740,6 +1987,7 @@ mod tests {
         for bad in [
             json!({}),
             json!({"duration_ms": 100}),
+            json!({"name": "fade", "fps": u64::MAX}),
             json!(7),
             json!(null),
         ] {

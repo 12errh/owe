@@ -14,11 +14,12 @@
 //! per-frame content, and it arrives in P4 with video — where it is actually
 //! needed. This is a deliberate P1 deviation, recorded in the plan.
 //!
-//! **Exactly two buffers per output, reused forever.** Ported lesson from the
+//! **A bounded buffer pool per output, reused forever.** Ported lesson from the
 //! studied reference engines: pools that grow on demand high-water-mark the
 //! process (wallr measured ~390 MiB retained after 90 rapid switches with
-//! unbounded growth). Two slots is enough to keep the compositor fed and bounds
-//! memory at 2 × width × height × 4 bytes per output.
+//! unbounded growth). The default is three slots, and the daemon's validated
+//! `render.buffering.max_in_flight` can raise or lower that bound without ever
+//! making the pool grow on demand.
 //!
 //! **The compositor's `configure` size is authoritative.** We never assume the
 //! size we rendered at is the size we should present; when they differ we report
@@ -40,7 +41,7 @@
 //! single flat dispatch machine.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -81,6 +82,10 @@ const PIXEL_FORMAT: wl_shm::Format = wl_shm::Format::Xrgb8888;
 /// How long a present request waits for the compositor, and how long surface
 /// creation waits for the first configure before giving up.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+const FRAME_CALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
+const CANCEL_TIMEOUT: Duration = Duration::from_millis(250);
+const DEFAULT_MAX_BUFFERS: usize = 3;
+const MAX_BUFFERS: usize = 8;
 
 /// A rendered frame, ready to hand to the compositor.
 ///
@@ -198,7 +203,7 @@ pub enum PresentError {
     },
 
     /// Every buffer for the output was still held by the compositor.
-    #[error("both buffers for `{0}` are still in use by the compositor")]
+    #[error("all buffers for `{0}` are still in use by the compositor")]
     Busy(String),
 
     /// The frame does not match the surface's expected buffer size.
@@ -228,9 +233,14 @@ enum Command {
     Present {
         output: String,
         frame: Frame,
+        wait_for_frame: bool,
         reply: SyncSender<Result<PresentOutcome, PresentError>>,
     },
     Clear {
+        output: String,
+        reply: SyncSender<Result<(), PresentError>>,
+    },
+    CancelFrame {
         output: String,
         reply: SyncSender<Result<(), PresentError>>,
     },
@@ -264,6 +274,16 @@ impl Presenter {
     /// Fails fast with [`PresentError::NoSession`] when there is no session —
     /// that is a normal state for CI, not a crash.
     pub fn start(namespace: &str) -> Result<Self, PresentError> {
+        Self::start_with_buffers(namespace, DEFAULT_MAX_BUFFERS)
+    }
+
+    /// Start the presenter with a bounded per-output buffer count.
+    pub fn start_with_buffers(namespace: &str, max_buffers: usize) -> Result<Self, PresentError> {
+        if !(1..=MAX_BUFFERS).contains(&max_buffers) {
+            return Err(PresentError::Wayland(format!(
+                "max in-flight buffers must be between 1 and {MAX_BUFFERS}, got {max_buffers}"
+            )));
+        }
         // The command channel is calloop's, so the presenter thread can block on it
         // as an event source rather than polling it.
         let (command_tx, command_rx) = calloop_channel::<Command>();
@@ -273,7 +293,7 @@ impl Presenter {
         let namespace = namespace.to_string();
         let join = std::thread::Builder::new()
             .name("owe-presenter".to_string())
-            .spawn(move || run_presenter(&namespace, command_rx, &event_tx, &ready_tx))
+            .spawn(move || run_presenter(&namespace, max_buffers, command_rx, &event_tx, &ready_tx))
             .map_err(|error| {
                 PresentError::NoSession(format!("cannot spawn presenter thread: {error}"))
             })?;
@@ -302,22 +322,68 @@ impl Presenter {
 
     /// Present a frame on one output, waiting up to [`DEFAULT_TIMEOUT`].
     pub fn present(&self, output: &str, frame: Frame) -> Result<PresentOutcome, PresentError> {
+        self.present_inner(output, frame, false)
+    }
+
+    pub fn present_frame(
+        &self,
+        output: &str,
+        frame: Frame,
+    ) -> Result<PresentOutcome, PresentError> {
+        self.present_inner(output, frame, true)
+    }
+
+    fn present_inner(
+        &self,
+        output: &str,
+        frame: Frame,
+        wait_for_frame: bool,
+    ) -> Result<PresentOutcome, PresentError> {
         let tx = self.tx.as_ref().ok_or(PresentError::NotRunning)?;
         let (reply_tx, reply_rx) = sync_channel(1);
         tx.send(Command::Present {
             output: output.to_string(),
             frame,
+            wait_for_frame,
             reply: reply_tx,
         })
         .map_err(|error| PresentError::Wayland(format!("cannot reach the presenter: {error}")))?;
-        // A timeout is a timeout, not "the presenter died": the old mapping sent
-        // a confused compositor away as `NotRunning`, which reads like a crash.
-        reply_rx
-            .recv_timeout(DEFAULT_TIMEOUT * 4)
-            .map_err(|_| PresentError::ConfigureTimeout {
+        let timeout = if wait_for_frame {
+            FRAME_CALLBACK_TIMEOUT
+        } else {
+            DEFAULT_TIMEOUT * 4
+        };
+        match reply_rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                if wait_for_frame {
+                    let _ = self.cancel_frame(output);
+                }
+                Err(PresentError::ConfigureTimeout {
+                    output: output.to_string(),
+                    timeout,
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(PresentError::NotRunning),
+        }
+    }
+
+    pub fn cancel_frame(&self, output: &str) -> Result<(), PresentError> {
+        let tx = self.tx.as_ref().ok_or(PresentError::NotRunning)?;
+        let (reply_tx, reply_rx) = sync_channel(1);
+        tx.send(Command::CancelFrame {
+            output: output.to_string(),
+            reply: reply_tx,
+        })
+        .map_err(|error| PresentError::Wayland(format!("cannot reach the presenter: {error}")))?;
+        match reply_rx.recv_timeout(CANCEL_TIMEOUT) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(PresentError::ConfigureTimeout {
                 output: output.to_string(),
-                timeout: DEFAULT_TIMEOUT * 4,
-            })?
+                timeout: CANCEL_TIMEOUT,
+            }),
+            Err(RecvTimeoutError::Disconnected) => Err(PresentError::NotRunning),
+        }
     }
 
     /// Remove OWE's surface from an output.
@@ -329,12 +395,14 @@ impl Presenter {
             reply: reply_tx,
         })
         .map_err(|error| PresentError::Wayland(format!("cannot reach the presenter: {error}")))?;
-        reply_rx
-            .recv_timeout(DEFAULT_TIMEOUT * 2)
-            .map_err(|_| PresentError::ConfigureTimeout {
+        match reply_rx.recv_timeout(DEFAULT_TIMEOUT * 2) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(PresentError::ConfigureTimeout {
                 output: output.to_string(),
                 timeout: DEFAULT_TIMEOUT * 2,
-            })?
+            }),
+            Err(RecvTimeoutError::Disconnected) => Err(PresentError::NotRunning),
+        }
     }
 
     /// Take everything the presenter has reported since the last call.
@@ -384,7 +452,7 @@ struct OutputSurface {
     surface_id: u32,
     layer: LayerSurface,
     pool: SlotPool,
-    buffers: [Option<Buffer>; 2],
+    buffers: Vec<Option<Buffer>>,
     next_slot: usize,
     size: Option<(u32, u32)>,
 }
@@ -396,6 +464,12 @@ struct OutputSurface {
 /// Blocking for it would need the event queue inside a callback.
 struct PendingPresent {
     frame: Frame,
+    wait_for_frame: bool,
+    reply: SyncSender<Result<PresentOutcome, PresentError>>,
+}
+
+struct FrameWaiter {
+    size: (u32, u32),
     reply: SyncSender<Result<PresentOutcome, PresentError>>,
 }
 
@@ -406,12 +480,14 @@ struct PresenterState {
     shm: Shm,
     layer_shell: LayerShell,
     namespace: String,
+    max_buffers: usize,
     surfaces: HashMap<String, OutputSurface>,
     /// Output name by `wl_output` protocol id, for hotplug callbacks.
     output_names: HashMap<u32, String>,
     events: Sender<PresenterEvent>,
     /// Presents waiting for their surface's first configure, by output.
     pending: HashMap<String, PendingPresent>,
+    frame_waiters: HashMap<String, FrameWaiter>,
     /// Set by the shutdown command; the loop checks it after each dispatch.
     stop: bool,
     /// A clone of the connection, for flushing after commits. Cheap: the
@@ -455,11 +531,26 @@ impl CompositorHandler for PresenterState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        // Deliberately empty: a static wallpaper requests no frames. P4's video
-        // path is where `frame` callbacks become meaningful.
+        let id = surface.id().protocol_id();
+        let Some(output) = self
+            .surfaces
+            .iter()
+            .find(|(_, candidate)| candidate.surface_id == id)
+            .map(|(output, _)| output.clone())
+        else {
+            return;
+        };
+        if let Some(waiter) = self.frame_waiters.remove(&output) {
+            let size = self
+                .surfaces
+                .get(&output)
+                .and_then(|surface| surface.size)
+                .unwrap_or(waiter.size);
+            let _ = waiter.reply.send(Ok(PresentOutcome::Presented { size }));
+        }
     }
 
     fn surface_enter(
@@ -532,7 +623,16 @@ impl OutputHandler for PresenterState {
         if let Some(surface) = self.surfaces.remove(&name) {
             surface.layer.wl_surface().destroy();
         }
-        self.pending.remove(&name);
+        if let Some(pending) = self.pending.remove(&name) {
+            let _ = pending
+                .reply
+                .send(Err(PresentError::UnknownOutput(name.clone())));
+        }
+        if let Some(waiter) = self.frame_waiters.remove(&name) {
+            let _ = waiter
+                .reply
+                .send(Err(PresentError::UnknownOutput(name.clone())));
+        }
         let _ = self
             .events
             .send(PresenterEvent::OutputRemoved { output: name });
@@ -549,10 +649,13 @@ impl LayerShellHandler for PresenterState {
             .map(|(name, _)| name.clone())
         {
             self.surfaces.remove(&name);
-            // A pending present can never complete now: answer it instead of
-            // letting the caller sit until its timeout.
             if let Some(pending) = self.pending.remove(&name) {
                 let _ = pending
+                    .reply
+                    .send(Err(PresentError::UnknownOutput(name.clone())));
+            }
+            if let Some(waiter) = self.frame_waiters.remove(&name) {
+                let _ = waiter
                     .reply
                     .send(Err(PresentError::UnknownOutput(name.clone())));
             }
@@ -598,7 +701,8 @@ impl LayerShellHandler for PresenterState {
         {
             // A different size invalidates the parked buffers (and their pool).
             surface.size = Some(size);
-            surface.buffers = [None, None];
+            let buffer_count = surface.buffers.len();
+            surface.buffers = (0..buffer_count).map(|_| None).collect();
             surface.pool = match SlotPool::new(pool_bytes(size), &self.shm) {
                 Ok(pool) => pool,
                 Err(error) => {
@@ -612,8 +716,18 @@ impl LayerShellHandler for PresenterState {
         // A parked present finishes here: this is the whole reason the first
         // present of an output does not block waiting for a configure.
         if let Some(pending) = self.pending.remove(&output) {
-            let outcome = finish_present(self, &output, &pending.frame, size);
-            let _ = pending.reply.send(outcome);
+            let outcome = finish_present(
+                self,
+                &output,
+                &pending.frame,
+                size,
+                pending.wait_for_frame,
+                &pending.reply,
+            );
+            if !pending.wait_for_frame || !matches!(&outcome, Ok(PresentOutcome::Presented { .. }))
+            {
+                let _ = pending.reply.send(outcome);
+            }
         }
 
         if changed {
@@ -632,15 +746,47 @@ fn finish_present(
     output: &str,
     frame: &Frame,
     configured: (u32, u32),
+    wait_for_frame: bool,
+    reply: &SyncSender<Result<PresentOutcome, PresentError>>,
 ) -> Result<PresentOutcome, PresentError> {
     if configured != frame.size() {
-        // Hand the truth back instead of uploading a wrongly sized buffer, which
-        // the compositor would stretch.
         return Ok(PresentOutcome::ResizeRequired { size: configured });
     }
+    if wait_for_frame {
+        arm_frame_callback(state, output, configured, reply.clone())?;
+    }
     let connection = state.connection.clone();
-    upload(&connection, state, output, frame)?;
+    if let Err(error) = upload(&connection, state, output, frame) {
+        if wait_for_frame {
+            state.frame_waiters.remove(output);
+        }
+        return Err(error);
+    }
     Ok(PresentOutcome::Presented { size: configured })
+}
+
+fn arm_frame_callback(
+    state: &mut PresenterState,
+    output: &str,
+    size: (u32, u32),
+    reply: SyncSender<Result<PresentOutcome, PresentError>>,
+) -> Result<(), PresentError> {
+    let Some(surface) = state.surfaces.get(output) else {
+        return Err(PresentError::UnknownOutput(output.to_string()));
+    };
+    surface
+        .layer
+        .wl_surface()
+        .frame(&state.queue_handle, surface.layer.wl_surface().clone());
+    if let Some(previous) = state
+        .frame_waiters
+        .insert(output.to_string(), FrameWaiter { size, reply })
+    {
+        let _ = previous
+            .reply
+            .send(Err(PresentError::Busy(output.to_string())));
+    }
+    Ok(())
 }
 
 impl ShmHandler for PresenterState {
@@ -677,6 +823,7 @@ fn tracing_note(message: String) {
 
 fn run_presenter(
     namespace: &str,
+    max_buffers: usize,
     commands: CalloopChannel<Command>,
     events: &Sender<PresenterEvent>,
     ready: &SyncSender<Result<Vec<String>, PresentError>>,
@@ -727,10 +874,12 @@ fn run_presenter(
         shm,
         layer_shell,
         namespace: namespace.to_string(),
+        max_buffers,
         surfaces: HashMap::new(),
         output_names: HashMap::new(),
         events: events.clone(),
         pending: HashMap::new(),
+        frame_waiters: HashMap::new(),
         stop: false,
         connection: connection.clone(),
         // Cloned before the queue is moved into the event source.
@@ -815,7 +964,12 @@ fn run_presenter(
 
     tracing_note("presenter stopped".to_string());
     state.surfaces.clear();
-    state.pending.clear();
+    for (_, pending) in state.pending.drain() {
+        let _ = pending.reply.send(Err(PresentError::NotRunning));
+    }
+    for (_, waiter) in state.frame_waiters.drain() {
+        let _ = waiter.reply.send(Err(PresentError::NotRunning));
+    }
     let _ = connection.flush();
 }
 
@@ -825,31 +979,54 @@ fn handle_command(state: &mut PresenterState, command: Command) {
         Command::Present {
             output,
             frame,
+            wait_for_frame,
             reply,
-        } => {
-            match begin_present(state, &output, &frame) {
-                PresentStart::Done(result) => {
+        } => match begin_present(state, &output, &frame, wait_for_frame, &reply) {
+            PresentStart::Done(result) => {
+                if !wait_for_frame || !matches!(&result, Ok(PresentOutcome::Presented { .. })) {
                     let _ = reply.send(result);
                 }
-                // The surface has no configure yet: the reply is sent from the
-                // configure handler, so the caller still gets its answer.
-                PresentStart::Parked => {
-                    state
-                        .pending
-                        .insert(output, PendingPresent { frame, reply });
+            }
+            PresentStart::Parked => {
+                if let Some(previous) = state.pending.insert(
+                    output.clone(),
+                    PendingPresent {
+                        frame,
+                        wait_for_frame,
+                        reply,
+                    },
+                ) {
+                    let _ = previous.reply.send(Err(PresentError::Busy(output)));
                 }
             }
-        }
+        },
         Command::Clear { output, reply } => {
             let removed = state.surfaces.remove(&output).is_some();
             if let Some(pending) = state.pending.remove(&output) {
-                let _ = pending.reply.send(Ok(PresentOutcome::Presented {
-                    size: pending.frame.size(),
-                }));
+                let result = if pending.wait_for_frame {
+                    Err(PresentError::UnknownOutput(output.clone()))
+                } else {
+                    Ok(PresentOutcome::Presented {
+                        size: pending.frame.size(),
+                    })
+                };
+                let _ = pending.reply.send(result);
+            }
+            if let Some(waiter) = state.frame_waiters.remove(&output) {
+                let _ = waiter
+                    .reply
+                    .send(Err(PresentError::UnknownOutput(output.clone())));
             }
             let _ = state.connection.flush();
             if removed {
                 tracing_note(format!("cleared {output}"));
+            }
+            let _ = reply.send(Ok(()));
+        }
+        Command::CancelFrame { output, reply } => {
+            state.frame_waiters.remove(&output);
+            if let Some(pending) = state.pending.remove(&output) {
+                let _ = pending.reply.send(Err(PresentError::NotRunning));
             }
             let _ = reply.send(Ok(()));
         }
@@ -867,7 +1044,13 @@ enum PresentStart {
 }
 
 /// Start presenting `frame` on `output`.
-fn begin_present(state: &mut PresenterState, output: &str, frame: &Frame) -> PresentStart {
+fn begin_present(
+    state: &mut PresenterState,
+    output: &str,
+    frame: &Frame,
+    wait_for_frame: bool,
+    reply: &SyncSender<Result<PresentOutcome, PresentError>>,
+) -> PresentStart {
     // Create the surface on first use. Its configure arrives on the Wayland
     // socket right after, which is what wakes the loop to finish the present.
     if !state.surfaces.contains_key(output) {
@@ -878,7 +1061,14 @@ fn begin_present(state: &mut PresenterState, output: &str, frame: &Frame) -> Pre
     }
 
     match state.surfaces.get(output).and_then(|surface| surface.size) {
-        Some(size) => PresentStart::Done(finish_present(state, output, frame, size)),
+        Some(size) => PresentStart::Done(finish_present(
+            state,
+            output,
+            frame,
+            size,
+            wait_for_frame,
+            reply,
+        )),
         None => PresentStart::Parked,
     }
 }
@@ -942,7 +1132,7 @@ fn create_surface(state: &mut PresenterState, output: &str) -> Result<(), Presen
             surface_id,
             layer,
             pool,
-            buffers: [None, None],
+            buffers: (0..state.max_buffers).map(|_| None).collect(),
             next_slot: 0,
             size: None,
         },
@@ -1014,14 +1204,15 @@ fn upload(
 }
 
 /// Find a slot whose buffer the compositor has released, creating one if the slot
-/// is empty. Bounded at two slots — never grows the pool.
+/// is empty. The slot count is fixed when the output is created.
 fn acquire_slot(
     surface: &mut OutputSurface,
     size: (u32, u32),
     stride: u32,
 ) -> Result<usize, PresentError> {
-    for _ in 0..2 {
-        let slot = surface.next_slot % 2;
+    let count = surface.buffers.len();
+    for _ in 0..count {
+        let slot = surface.next_slot % count;
         surface.next_slot = surface.next_slot.wrapping_add(1);
 
         match surface.buffers[slot].take() {
@@ -1048,11 +1239,11 @@ fn acquire_slot(
         }
     }
 
-    // Both slots are still compositor-held. Give the protocol a moment to release
+    // All slots are still compositor-held. Give the protocol a moment to release
     // one before declaring failure.
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(5));
-        for slot in 0..2 {
+        for slot in 0..count {
             let Some(buffer) = surface.buffers[slot].as_mut() else {
                 continue;
             };
@@ -1062,7 +1253,9 @@ fn acquire_slot(
         }
     }
 
-    Err(PresentError::Busy("an OWE output".to_string()))
+    Err(PresentError::Busy(format!(
+        "all {count} buffers for an OWE output are still in use"
+    )))
 }
 
 #[cfg(test)]

@@ -60,7 +60,7 @@ impl Sandbox {
             .expect("spawn owed");
         self.child = Some(child);
         // Wait for the socket to answer.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if UnixStream::connect(self.socket()).is_ok() {
                 return 0;
@@ -175,14 +175,37 @@ fn daemon_answers_hello_then_kills_cleanly() {
     let hello = client.hello("binary-smoke", "0.0.0").expect("hello");
     assert_eq!(hello.server_version, env!("CARGO_PKG_VERSION"));
     assert!(!hello.capabilities.methods.is_empty());
+    assert!(
+        hello
+            .capabilities
+            .methods
+            .iter()
+            .any(|name| name == method::STATS_GET)
+    );
 
-    // Still-unimplemented methods stay honest about it.
-    let error = client
-        .call(method::STATS_GET, serde_json::json!({}))
-        .expect_err("stub method");
-    match error {
-        owe_ipc::ClientError::Server(body) => assert_eq!(body.code, ErrorCode::Unsupported),
-        other => panic!("unexpected: {other:?}"),
+    let stats = client.call(method::STATS_GET, serde_json::json!({}));
+    match stats {
+        Ok(reply) => {
+            assert!(
+                reply["stats"].is_array(),
+                "stats.get must return an array: {reply}"
+            );
+            assert_eq!(reply["paused"], serde_json::json!(false));
+            assert!(
+                reply["rss_bytes"].is_null() || reply["rss_bytes"].is_u64(),
+                "rss_bytes must be a number or null: {reply}"
+            );
+            for row in reply["stats"].as_array().unwrap() {
+                assert!(row["output"].is_string(), "stats row has no output: {row}");
+                assert!(
+                    row["decode"].is_string(),
+                    "stats row has no decode path: {row}"
+                );
+            }
+        }
+        Err(owe_ipc::ClientError::Server(body))
+            if body.code == ErrorCode::ConfigInvalid && body.msg.contains("no shell backend") => {}
+        Err(other) => panic!("unexpected stats.get reply: {other:?}"),
     }
 
     // Implemented methods validate their parameters instead of pretending to

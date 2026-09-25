@@ -32,6 +32,7 @@ impl Handler for TestHandler {
                     schema,
                     capabilities: Capabilities {
                         methods: vec![method::HELLO.to_string(), method::DAEMON_KILL.to_string()],
+                        events: Vec::new(),
                         shell_backends: vec!["hyprland".to_string()],
                         content_kinds: vec!["static-image".to_string()],
                         media_backends: vec!["auto".to_string()],
@@ -114,6 +115,54 @@ fn hello_reports_version_schema_and_capabilities() {
         reply.capabilities.shell_backends,
         vec!["hyprland".to_string()]
     );
+}
+
+#[test]
+fn non_hello_requests_are_refused_until_the_handshake_succeeds() {
+    let server = TestServer::start();
+    let mut client = server.client();
+
+    let payload = serde_json::to_vec(&json!({
+        "v": 1,
+        "id": "before-hello",
+        "method": method::DAEMON_KILL,
+        "params": {}
+    }))
+    .unwrap();
+    let reply = client.raw_call(&payload).expect("error reply");
+    assert_eq!(reply["err"]["code"], json!("BAD_REQUEST"));
+    assert!(reply["err"]["msg"].as_str().unwrap().contains("hello"));
+
+    let hello = client
+        .hello("test-client", "0.1.0")
+        .expect("hello after refusal");
+    assert_eq!(hello.server_version, "test-0.1.0");
+    client
+        .call(method::DAEMON_KILL, json!({}))
+        .expect("request after handshake");
+}
+
+#[test]
+fn a_failed_hello_does_not_unlock_the_connection() {
+    let server = TestServer::start();
+    let mut client = server.client();
+
+    let hello = client
+        .raw_call(
+            br#"{"v":1,"id":"bad-hello","method":"hello","params":{"client":"x","client_version":"1","schema":[{"major":2,"minor":0}]}}"#,
+        )
+        .expect("hello error");
+    assert_eq!(hello["err"]["code"], json!("UNSUPPORTED"));
+
+    let request = serde_json::to_vec(&json!({
+        "v": 1,
+        "id": "after-bad-hello",
+        "method": method::DAEMON_KILL,
+        "params": {}
+    }))
+    .unwrap();
+    let reply = client.raw_call(&request).expect("still locked");
+    assert_eq!(reply["err"]["code"], json!("BAD_REQUEST"));
 }
 
 #[test]

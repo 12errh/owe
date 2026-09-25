@@ -3,29 +3,46 @@
 A low-resource live-wallpaper engine and manager for Wayland Linux, targeting **Hyprland** and
 **Caelestia Shell** first. GPL-3.0-or-later.
 
-- **`owed`** — the daemon that renders wallpapers (images, animated images, hardware-decoded
-  video, WGSL shaders) on layer-shell background surfaces.
+- **`owed`** — the daemon that renders still images, animated images, and video on
+  layer-shell background surfaces, with GPU transitions and per-output frame clocks.
+  WGSL shader wallpapers are planned for Phase 5, not implemented yet.
 - **`owe`** — Tauri v2 + React desktop app (library, per-monitor assignment, settings).
 - **`owectl`** — thin CLI for scripts and keybinds.
 
-> **Status: alpha — Phases 0–3 complete (v0.3).** Static images render on Hyprland
-> layer-shell background surfaces, with GPU transitions on change, an indexed wallpaper
-> library with cached thumbnails, hotplug handling, and session restore; the GUI is a
-> library-grid-and-assignment window. **Caelestia Shell is a first-class target**: the
-> daemon auto-detects it, routes wallpaper changes through the shell in `shell-routed`
-> mode (the shell keeps its theming pipeline; OWE runs none — no double-theme), streams
-> Hyprland socket2 events into a typed event bus, and warns about `hyprpaper`/`swww`
-> coexistence. **Animated images and video decode but do not play yet:** Phase 4's decode
-> layer landed (GIF/APNG/WebP frames with container timing, a bounded compressed frame
-> cache, video through GStreamer with an FFmpeg fallback, and `render.fit`), while the
-> frame-pacing and playback half of that phase is still open, so the daemon reports both
-> as `not in this build` rather than advertising a wallpaper that would never move.
-> **Shader wallpapers and the resource governor are not implemented** (Phases 5–6).
-> Performance targets stay `UNVERIFIED` until the Phase 6 benchmark publishes measurements.
+> **Status: alpha — Phases 0–4 implemented in the development worktree (package version
+> remains 0.3.0 until the P4 gate closes).** Static images render on
+> Hyprland layer-shell background surfaces, with GPU transitions, an indexed wallpaper
+> library with cached thumbnails, hotplug handling, session restore, Caelestia routing,
+> and typed Hyprland events. **Animated images and video now decode and play:** the daemon
+> has a per-output frame clock, Wayland frame-callback pacing, bounded frame memory,
+> play/pause/seek/loop IPC, CLI controls, GUI playback controls, decode statistics, and
+> live Hyprland GIF/video probes. Video uses GStreamer with an FFmpeg fallback; hardware
+> decode is reported only when the local VA-API driver actually negotiates it. **Zero-copy
+> dma-buf import, the long-duration P4 performance gate, and fuzz targets remain explicit
+> follow-ups.** Shader wallpapers and the automatic resource governor are still Phases 5–6.
+> Performance targets remain `UNVERIFIED` until the Phase 6 benchmark publishes measurements.
 >
-> Evidence tables (commands + observed results) are in
+> Evidence tables and the remaining P4 gate items are in
 > [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) §0.1, §1.1, §2.1, §3.1,
 > and §4.1.
+
+## Implemented and remaining
+
+**Implemented and exercised:** static/animated/video decoding, bounded frame caching,
+per-output playback clocks, compositor frame-callback presentation, GPU transitions,
+library indexing and thumbnails, hotplug reconciliation, session restore, Hyprland events,
+Caelestia shell-routed and daemon-drawn modes, IPC/CLI/Tauri/React playback controls,
+decode statistics, and live compositor smoke probes.
+
+**Not complete yet:**
+
+- **P4 release gate:** dma-buf zero-copy import, ten-minute/4K RSS and multi-cap stability
+  measurements, and fuzz targets remain open.
+- **P5:** WGSL shader packs, shader previews, and shader GUI controls are not implemented.
+- **P6:** the automatic resource governor, published benchmark report, systemd packaging,
+  and tray/rotation features are not implemented; the current pause/resume path is a
+  manual override.
+- **P7:** release packaging, plugin ABI, and ecosystem features are not implemented.
 
 ## Documentation
 
@@ -38,11 +55,12 @@ reference-code map.
 ```
 crates/owe-core    config model + validation, content model   (pure logic, heavily tested)
 crates/owe-ipc     IPC protocol v1: framing, server, client
-crates/owe-render  wgpu rendering helpers (headless golden-image tooling)
+crates/owe-media   still/animated/video decoding, frame cache, runtime probes
+crates/owe-render  wgpu rendering, transitions, and layer-shell presentation
 crates/owed        the daemon binary
 crates/owectl      control CLI
 crates/owe-shell-* shell backends: hyprland, caelestia, generic-layer-shell
-app/               Tauri v2 + React GUI
+app/               Tauri v2 + React GUI (app/src-tauri is built by its own CI job)
 docs/              the doc set (start at docs/README.md)
 reference/         pinned clones of studied repos (gitignored, never built — see docs/REFERENCE-CODE-MAP.md)
 ```
@@ -53,6 +71,10 @@ reference/         pinned clones of studied repos (gitignored, never built — s
 # Rust workspace
 cargo build --workspace
 cargo test --workspace
+
+# Tauri/React GUI (kept outside the Rust workspace because of GTK/WebKit)
+cd app && pnpm install --frozen-lockfile && pnpm build
+(cd src-tauri && cargo test)
 
 # Validate a config file without starting the daemon
 cargo run -p owed -- --check-config --config ./docs/examples/config.toml
@@ -85,6 +107,11 @@ owectl set library:12 --transition wave --duration-ms 450
 owectl get --monitor eDP-1                    # prints the path, or nothing if OWE applied none
 owectl library thumb 12                       # materialise (or find) one cached thumbnail
 owectl pause  # / resume: governor override
+owectl playback pause -m eDP-1
+owectl playback seek 1.5 -m eDP-1
+owectl playback loop 0 5 -m eDP-1
+owectl playback play -m eDP-1
+owectl stats
 owectl clear -m eDP-1
 owectl kill
 ```
@@ -95,8 +122,9 @@ reached.
 
 The GUI (`cd app && pnpm tauri dev`) shows the same state as a library grid: thumbnail per
 wallpaper, a transition picker fed from the daemon's own config, per-output assignment
-(“Apply selected” on each output), apply-all, rescan, and search — and says when the daemon
-is not running instead of failing silently.
+(“Apply selected” on each output), apply-all, rescan, search, playback play/pause/seek/loop
+controls, and per-output decode/FPS/cache statistics — and says when the daemon is not
+running instead of failing silently.
 
 After `owectl clear` the output has no OWE wallpaper, so a previous wallpaper tool
 (`swaybg`, `swww`, Caelestia) needs to be re-run if you were using one.
@@ -114,6 +142,8 @@ cd app && pnpm install && pnpm tauri dev
 ```bash
 # Wayland + layer-shell + IPC smoke test. `--session` runs the same checks
 # against the compositor you are already in (no root, no sway needed).
+# `wayland-info` is optional; without it the layer-shell probe is reported as
+# skipped rather than silently counted as a pass.
 ./scripts/headless-smoke.sh            # headless (needs sway + wayland-utils)
 ./scripts/headless-smoke.sh --session  # against the running session
 
@@ -124,6 +154,11 @@ cargo run -p owe-render --example gen-app-icons
 # prove it reached the screen by sampling a screenshot, assert the layer surface,
 # check session state, clear, and shut down. Needs grim + python3+PIL.
 ./scripts/e2e-hyprland.sh
+
+# Live P4 probe: GIF and video frame clocks, play/pause/seek/loop, stats, clear,
+# and clean shutdown. Requires a Wayland session, grim, python3+PIL, and at
+# least one installed video runtime (GStreamer or FFmpeg).
+./scripts/e2e-playback.sh
 
 # NFR-PERF-1: 60 s of idle with a wallpaper on screen must stay under 1% of a core.
 ./scripts/idle-cpu.sh 60

@@ -22,6 +22,7 @@ export interface DaemonStatus {
   shell_backends: string[];
   content_kinds: string[];
   media_backends: string[];
+  events: string[];
   /** Transitions the picker may offer (what the daemon renders *and* allows). */
   transitions: string[];
   /** Planned-but-missing features, as `"<id>: <why>"`. */
@@ -160,6 +161,51 @@ export interface OutputsView {
   paused: boolean;
 }
 
+export type PlaybackCommand =
+  | "play"
+  | "pause"
+  | { seek: number }
+  | { loop: { a: number; b: number } };
+
+export interface PlaybackState {
+  output: string;
+  kind: string;
+  playing: boolean;
+  held: boolean;
+  position_ms: number;
+  fps: number;
+  fps_cap: number | null;
+  decode: string;
+  decoder: string;
+  mode: string;
+  buffers: number;
+  buffer_bytes: number;
+  buffer_cap_bytes: number;
+  total_frames: number | null;
+  failed: string | null;
+}
+
+export interface PlaybackResult {
+  ok: boolean;
+  states: PlaybackState[];
+}
+
+export interface StatsRow extends PlaybackState {
+  wallpaper: string | null;
+  width: number;
+  height: number;
+  position: number | null;
+  frames_presented: number;
+  loop_start_ms: number | null;
+  loop_end_ms: number | null;
+}
+
+export interface StatsView {
+  stats: StatsRow[];
+  rss_bytes: number | null;
+  paused: boolean;
+}
+
 export interface ApplyOutcome {
   reference: string;
   kind: string;
@@ -183,6 +229,7 @@ function disconnected(error: string, socketPath = ""): DaemonStatus {
     shell_backends: [],
     content_kinds: [],
     media_backends: [],
+    events: [],
     transitions: [],
     unavailable: [],
     error,
@@ -263,6 +310,17 @@ export function libraryThumbnail(id: number): Promise<Thumbnail> {
 /** Ask the daemon about its outputs. */
 export function listOutputs(): Promise<OutputsView> {
   return invoke<OutputsView>("list_outputs");
+}
+
+export function getStats(output: string | null = null): Promise<StatsView> {
+  return invoke<StatsView>("stats", { output });
+}
+
+export function playbackCommand(
+  output: string | null,
+  command: PlaybackCommand,
+): Promise<PlaybackResult> {
+  return invoke<PlaybackResult>("playback_command", { output, command });
 }
 
 /**

@@ -38,6 +38,16 @@ pub enum HotplugEvent {
         /// Connector name.
         name: String,
     },
+    #[allow(missing_docs)]
+    Activated {
+        #[allow(missing_docs)]
+        name: String,
+    },
+    #[allow(missing_docs)]
+    Deactivated {
+        #[allow(missing_docs)]
+        name: String,
+    },
     /// An output disappeared.
     Removed {
         /// Connector name.
@@ -57,6 +67,8 @@ impl HotplugEvent {
     pub fn output(&self) -> &str {
         match self {
             HotplugEvent::Added { name }
+            | HotplugEvent::Activated { name }
+            | HotplugEvent::Deactivated { name }
             | HotplugEvent::Removed { name }
             | HotplugEvent::Resized { name, .. } => name,
         }
@@ -69,25 +81,36 @@ impl HotplugEvent {
 /// look like "everything was just plugged in" — the right shape, because that is
 /// what the daemon has to handle: every output needs a worker and a wallpaper.
 pub fn diff(previous: &[OutputInfo], current: &[OutputInfo]) -> Vec<HotplugEvent> {
-    let before: BTreeMap<&str, (u32, u32)> = previous
+    let before: BTreeMap<&str, ((u32, u32), bool)> = previous
         .iter()
-        .map(|output| (output.name.as_str(), output.pixel_size()))
+        .map(|output| (output.name.as_str(), (output.pixel_size(), output.active)))
         .collect();
-    let after: BTreeMap<&str, (u32, u32)> = current
+    let after: BTreeMap<&str, ((u32, u32), bool)> = current
         .iter()
-        .map(|output| (output.name.as_str(), output.pixel_size()))
+        .map(|output| (output.name.as_str(), (output.pixel_size(), output.active)))
         .collect();
 
     let mut events = Vec::new();
-    for (name, size) in &after {
+    for (name, (size, active)) in &after {
         match before.get(name) {
-            None => events.push(HotplugEvent::Added {
+            None if *active => events.push(HotplugEvent::Added {
                 name: (*name).to_string(),
             }),
-            Some(previous_size) if previous_size != size => events.push(HotplugEvent::Resized {
+            None => events.push(HotplugEvent::Deactivated {
                 name: (*name).to_string(),
-                size: *size,
             }),
+            Some((_, false)) if *active => events.push(HotplugEvent::Activated {
+                name: (*name).to_string(),
+            }),
+            Some((_, true)) if !*active => events.push(HotplugEvent::Deactivated {
+                name: (*name).to_string(),
+            }),
+            Some((previous_size, true)) if *active && previous_size != size => {
+                events.push(HotplugEvent::Resized {
+                    name: (*name).to_string(),
+                    size: *size,
+                });
+            }
             Some(_) => {}
         }
     }
@@ -112,8 +135,10 @@ pub fn diff(previous: &[OutputInfo], current: &[OutputInfo]) -> Vec<HotplugEvent
 fn rank(event: &HotplugEvent) -> u8 {
     match event {
         HotplugEvent::Added { .. } => 0,
-        HotplugEvent::Resized { .. } => 1,
-        HotplugEvent::Removed { .. } => 2,
+        HotplugEvent::Activated { .. } => 1,
+        HotplugEvent::Resized { .. } => 2,
+        HotplugEvent::Deactivated { .. } => 3,
+        HotplugEvent::Removed { .. } => 4,
     }
 }
 
@@ -155,6 +180,8 @@ impl TrackedState {
 pub struct Tracked {
     /// Whether the compositor currently lists it.
     pub present: bool,
+    #[allow(missing_docs)]
+    pub active: bool,
     /// Last known pixel size.
     pub size: Option<(u32, u32)>,
     /// Health.
@@ -275,45 +302,87 @@ impl Supervisor {
                 HotplugEvent::Added { name } => {
                     let record = self.outputs.entry(name.clone()).or_insert_with(|| Tracked {
                         present: false,
+                        active: false,
                         size: None,
                         state: TrackedState::Active,
                         restarts: VecDeque::new(),
                     });
-                    let reason = if record.present {
+                    let reason = if record.present && record.active {
                         "reconfigured"
+                    } else if record.present {
+                        "reactivated"
                     } else {
                         "appeared"
                     };
                     record.present = true;
+                    record.active = true;
                     actions.push(SupervisorAction::Spawn {
                         output: name.clone(),
                         reason: reason.to_string(),
                     });
                 }
-                HotplugEvent::Removed { name } => {
-                    // Keep the record: the session entry must survive, or a
-                    // replug would restore nothing.
-                    let Some(record) = self.outputs.get_mut(name) else {
-                        continue;
-                    };
-                    if !record.present {
-                        continue;
-                    }
-                    record.present = false;
-                    record.size = None;
-                    actions.push(SupervisorAction::Teardown {
-                        output: name.clone(),
-                        reason: "output disappeared".to_string(),
-                    });
-                }
-                HotplugEvent::Resized { name, size } => {
+                HotplugEvent::Activated { name } => {
                     let record = self.outputs.entry(name.clone()).or_insert_with(|| Tracked {
-                        present: true,
+                        present: false,
+                        active: false,
                         size: None,
                         state: TrackedState::Active,
                         restarts: VecDeque::new(),
                     });
-                    let changed = record.size != Some(*size);
+                    let reason = if record.present {
+                        "reactivated"
+                    } else {
+                        "appeared"
+                    };
+                    record.present = true;
+                    record.active = true;
+                    actions.push(SupervisorAction::Spawn {
+                        output: name.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+                HotplugEvent::Deactivated { name } => {
+                    let record = self.outputs.entry(name.clone()).or_insert_with(|| Tracked {
+                        present: true,
+                        active: false,
+                        size: None,
+                        state: TrackedState::Active,
+                        restarts: VecDeque::new(),
+                    });
+                    let was_active = record.active;
+                    record.present = true;
+                    record.active = false;
+                    if was_active {
+                        actions.push(SupervisorAction::Teardown {
+                            output: name.clone(),
+                            reason: "output became inactive".to_string(),
+                        });
+                    }
+                }
+                HotplugEvent::Removed { name } => {
+                    let Some(record) = self.outputs.get_mut(name) else {
+                        continue;
+                    };
+                    let was_active = record.active;
+                    record.present = false;
+                    record.active = false;
+                    record.size = None;
+                    if was_active {
+                        actions.push(SupervisorAction::Teardown {
+                            output: name.clone(),
+                            reason: "output disappeared".to_string(),
+                        });
+                    }
+                }
+                HotplugEvent::Resized { name, size } => {
+                    let record = self.outputs.entry(name.clone()).or_insert_with(|| Tracked {
+                        present: true,
+                        active: true,
+                        size: None,
+                        state: TrackedState::Active,
+                        restarts: VecDeque::new(),
+                    });
+                    let changed = record.active && record.size != Some(*size);
                     record.size = Some(*size);
                     record.present = true;
                     if changed {
@@ -340,7 +409,15 @@ impl Supervisor {
         now: Instant,
     ) -> Vec<SupervisorAction> {
         let events = diff(previous, current);
-        self.observe(&events, now)
+        let actions = self.observe(&events, now);
+        for output in current {
+            if let Some(record) = self.outputs.get_mut(&output.name) {
+                record.present = true;
+                record.active = output.active;
+                record.size = Some(output.pixel_size());
+            }
+        }
+        actions
     }
 
     /// Record that a worker failed, and decide what to do about it.
@@ -350,9 +427,11 @@ impl Supervisor {
         reason: &str,
         now: Instant,
     ) -> Option<SupervisorAction> {
-        if let Some(record) = self.outputs.get_mut(output) {
-            record.restarts.push_back(now);
+        let record = self.outputs.get_mut(output)?;
+        if !record.present || !record.active {
+            return None;
         }
+        record.restarts.push_back(now);
         // Age out first: a failure that lands more than a window after the
         // previous ones is not a crash loop, and must not count towards the
         // budget it would otherwise exhaust.
@@ -448,7 +527,7 @@ impl Supervisor {
     pub fn is_usable(&self, output: &str) -> bool {
         self.outputs
             .get(output)
-            .is_some_and(|record| record.present && record.state.is_usable())
+            .is_some_and(|record| record.present && record.active && record.state.is_usable())
     }
 
     /// Forget an output completely (used by `clear` on a removed output).
@@ -612,6 +691,62 @@ mod tests {
             "a resize must not destroy and recreate the surface"
         );
         assert_eq!(supervisor.get("eDP-1").unwrap().size, Some((2560, 1440)));
+    }
+
+    #[test]
+    fn an_inactive_output_is_torn_down_and_reactivated_without_becoming_a_ghost() {
+        let mut supervisor = Supervisor::default();
+        let now = Instant::now();
+        let active = output("eDP-1", (1920, 1080));
+        let mut inactive = active.clone();
+        inactive.active = false;
+        supervisor.observe_snapshot(&[], std::slice::from_ref(&active), now);
+
+        assert_eq!(
+            diff(
+                std::slice::from_ref(&active),
+                std::slice::from_ref(&inactive)
+            ),
+            vec![HotplugEvent::Deactivated {
+                name: "eDP-1".to_string()
+            }]
+        );
+        let actions = supervisor.observe_snapshot(
+            std::slice::from_ref(&active),
+            std::slice::from_ref(&inactive),
+            now,
+        );
+        assert_eq!(
+            actions,
+            vec![SupervisorAction::Teardown {
+                output: "eDP-1".to_string(),
+                reason: "output became inactive".to_string()
+            }]
+        );
+        assert!(supervisor.present().contains(&"eDP-1".to_string()));
+        assert!(!supervisor.is_usable("eDP-1"));
+
+        let actions =
+            supervisor.observe_snapshot(&[inactive], &[output("eDP-1", (1920, 1080))], now);
+        assert_eq!(
+            actions,
+            vec![SupervisorAction::Spawn {
+                output: "eDP-1".to_string(),
+                reason: "reactivated".to_string()
+            }]
+        );
+        assert!(supervisor.is_usable("eDP-1"));
+    }
+
+    #[test]
+    fn an_initially_inactive_output_is_tracked_without_spawning() {
+        let mut supervisor = Supervisor::default();
+        let mut inactive = output("DP-1", (1920, 1080));
+        inactive.active = false;
+        let actions = supervisor.observe_snapshot(&[], &[inactive], Instant::now());
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(supervisor.present().contains(&"DP-1".to_string()));
+        assert!(!supervisor.is_usable("DP-1"));
     }
 
     #[test]

@@ -21,16 +21,15 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use image::AnimationDecoder;
 use image::codecs::gif::GifDecoder;
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
-use image::{ImageError, ImageFormat};
+use image::{AnimationDecoder, ImageDecoder as _, ImageError, ImageFormat};
 
 use crate::cache::FrameCache;
 use crate::{
-    Compression, DecodeMode, DecodePath, DecodedFrame, DecodedImage, DecoderStats, MediaConfig,
-    MediaDecoder, MediaError, MediaInfo,
+    Compression, DEFAULT_MAX_PIXELS, DecodeMode, DecodePath, DecodedFrame, DecodedImage,
+    DecoderStats, MediaConfig, MediaDecoder, MediaError, MediaInfo, bounded_frame_len,
 };
 use owe_core::ContentKind;
 
@@ -57,8 +56,8 @@ type ImageFrame = Result<image::Frame, ImageError>;
 type FrameStream = Box<dyn Iterator<Item = ImageFrame>>;
 
 /// The `image` crate's format id for `path`, sniffed from content, not the name.
-fn sniff(path: &Path) -> Result<ImageFormat, MediaError> {
-    image::ImageReader::open(path)
+pub(crate) fn image_format(path: &Path) -> Result<Option<ImageFormat>, MediaError> {
+    Ok(image::ImageReader::open(path)
         .map_err(|source| MediaError::Io {
             path: path.display().to_string(),
             source,
@@ -68,11 +67,54 @@ fn sniff(path: &Path) -> Result<ImageFormat, MediaError> {
             path: path.display().to_string(),
             source,
         })?
-        .format()
+        .format())
+}
+
+fn sniff(path: &Path) -> Result<ImageFormat, MediaError> {
+    image_format(path)?.ok_or_else(|| MediaError::Decode {
+        path: path.display().to_string(),
+        detail: "the file's format could not be identified".to_string(),
+    })
+}
+
+pub(crate) fn has_animation(path: &Path, format: ImageFormat) -> Result<bool, MediaError> {
+    let file = File::open(path).map_err(|source| MediaError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let reader = BufReader::new(file);
+    match format {
+        ImageFormat::Gif => Ok(GifDecoder::new(reader).is_ok()),
+        ImageFormat::Png => Ok(PngDecoder::new(reader)
+            .and_then(|decoder| decoder.is_apng())
+            .unwrap_or(false)),
+        ImageFormat::WebP => Ok(WebPDecoder::new(reader)
+            .map(|decoder| decoder.has_animation())
+            .unwrap_or(false)),
+        _ => Ok(false),
+    }
+}
+
+fn frame_limits(
+    path: &Path,
+    width: u32,
+    height: u32,
+    max_pixels: u64,
+) -> Result<image::Limits, MediaError> {
+    let frame_len = bounded_frame_len(path, width, height, max_pixels)?;
+    let max_alloc = u64::try_from(frame_len)
+        .ok()
+        .and_then(|bytes| bytes.checked_mul(4))
         .ok_or_else(|| MediaError::Decode {
             path: path.display().to_string(),
-            detail: "the file's format could not be identified".to_string(),
-        })
+            detail: "the animation frame allocation limit overflowed".to_string(),
+        })?;
+    let max_dimension = max_pixels.min(u64::from(u32::MAX)) as u32;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_dimension);
+    limits.max_image_height = Some(max_dimension);
+    limits.max_alloc = Some(max_alloc);
+    Ok(limits)
 }
 
 fn decode_error(path: &Path, error: ImageError) -> MediaError {
@@ -115,16 +157,28 @@ fn frames_for(path: &Path, format: ImageFormat) -> Result<FrameStream, MediaErro
 
     match format {
         ImageFormat::Gif => {
-            let decoder = GifDecoder::new(reader).map_err(|error| decode_error(path, error))?;
+            let mut decoder = GifDecoder::new(reader).map_err(|error| decode_error(path, error))?;
+            let (width, height) = decoder.dimensions();
+            let limits = frame_limits(path, width, height, DEFAULT_MAX_PIXELS)?;
+            decoder
+                .set_limits(limits)
+                .map_err(|error| decode_error(path, error))?;
             Ok(Box::new(decoder.into_frames()))
         }
         ImageFormat::Png => {
-            let decoder = PngDecoder::new(reader).map_err(|error| decode_error(path, error))?;
+            let mut decoder = PngDecoder::new(reader).map_err(|error| decode_error(path, error))?;
+            let (width, height) = decoder.dimensions();
+            let limits = frame_limits(path, width, height, DEFAULT_MAX_PIXELS)?;
+            decoder
+                .set_limits(limits)
+                .map_err(|error| decode_error(path, error))?;
             let apng = decoder.apng().map_err(|error| decode_error(path, error))?;
             Ok(Box::new(apng.into_frames()))
         }
         ImageFormat::WebP => {
             let decoder = WebPDecoder::new(reader).map_err(|error| decode_error(path, error))?;
+            let (width, height) = decoder.dimensions();
+            frame_limits(path, width, height, DEFAULT_MAX_PIXELS)?;
             Ok(Box::new(decoder.into_frames()))
         }
         other => Err(MediaError::UnsupportedKind {
@@ -227,7 +281,10 @@ impl AnimatedImageDecoder {
             });
         }
         let source = frames_for(path, format)?;
-        let cap_bytes = (config.cache.animated_frame_cap_mb as usize) * 1024 * 1024;
+        let cap_bytes = usize::try_from(config.cache.animated_frame_cap_mb)
+            .ok()
+            .and_then(|mib| mib.checked_mul(1024 * 1024))
+            .unwrap_or(usize::MAX);
         let compression = Compression::parse(&config.cache.compression).unwrap_or_default();
 
         let mut decoder = Self {
@@ -251,7 +308,7 @@ impl AnimatedImageDecoder {
             exhausted: false,
             streaming: false,
         };
-        decoder.pre_cache();
+        decoder.pre_cache()?;
 
         // A container that produced nothing is not an animation. For a PNG that is
         // the ordinary case of a still image reaching the animated path, and the
@@ -274,21 +331,22 @@ impl AnimatedImageDecoder {
     ///
     /// Stops at the first frame that does not fit, which is the streaming trigger:
     /// the cache stays full of the frames the animation *starts* with.
-    fn pre_cache(&mut self) {
+    fn pre_cache(&mut self) -> Result<(), MediaError> {
         let mut total_delay = Duration::ZERO;
-        while let Some(frame) = self.pull() {
-            total_delay += frame.delay();
+        while let Some(frame) = self.pull()? {
+            total_delay = total_delay.saturating_add(frame.delay());
             match self.cache.insert(&frame) {
                 Ok(true) => {}
                 // The cap is reached (or the frame could not be stored): everything
                 // from here on is decoded on demand. The head stays cached so the
                 // first pass is exact, and the frame that did not fit is kept for
                 // the next call — refusing is not the same as dropping it.
-                Ok(false) | Err(_) => {
+                Ok(false) => {
                     self.streaming = true;
                     self.pending = Some(frame);
                     break;
                 }
+                Err(error) => return Err(error),
             }
         }
 
@@ -300,32 +358,44 @@ impl AnimatedImageDecoder {
             self.info.frame_count = Some(self.produced);
             self.info.duration = Some(total_delay);
         }
+        Ok(())
     }
 
     /// Pull the next frame from the container.
-    fn pull(&mut self) -> Option<DecodedFrame> {
+    fn pull(&mut self) -> Result<Option<DecodedFrame>, MediaError> {
         if self.exhausted {
-            return None;
+            return Ok(None);
         }
         match self.source.next() {
             Some(Ok(frame)) => {
                 let delay = frame_delay(frame.delay());
                 let buffer = frame.into_buffer();
                 let index = self.produced;
-                self.produced += 1;
-                self.frames_decoded += 1;
-                DecodedFrame::new(
+                match DecodedFrame::new(
                     index,
                     buffer.width(),
                     buffer.height(),
                     delay,
                     buffer.into_raw(),
-                )
-                .ok()
+                ) {
+                    Ok(frame) => {
+                        self.produced = self.produced.saturating_add(1);
+                        self.frames_decoded = self.frames_decoded.saturating_add(1);
+                        Ok(Some(frame))
+                    }
+                    Err(error) => {
+                        self.exhausted = true;
+                        Err(error)
+                    }
+                }
             }
-            Some(Err(_)) | None => {
+            Some(Err(error)) => {
                 self.exhausted = true;
-                None
+                Err(decode_error(&self.path, error))
+            }
+            None => {
+                self.exhausted = true;
+                Ok(None)
             }
         }
     }
@@ -360,31 +430,32 @@ impl MediaDecoder for AnimatedImageDecoder {
         // Cached first: in cached mode this is the whole animation, and in
         // streaming mode it is the head that already fitted.
         if let Some(frame) = self.cache.get(self.cursor)? {
-            self.cursor += 1;
+            self.cursor = self.cursor.saturating_add(1);
             return Ok(Some(frame));
         }
         // Then the frame the pre-cache pulled but could not store. It is only
         // handed over at its own index, so the sequence stays in order.
         if let Some(frame) = self.pending.take_if(|frame| frame.index() == self.cursor) {
-            self.cursor += 1;
+            self.cursor = self.cursor.saturating_add(1);
             return Ok(Some(frame));
         }
         // Past the cached head the container is the source, and the consumer is
         // exactly where the pre-cache left off, so frames stay in order.
-        let Some(frame) = self.pull() else {
+        let Some(frame) = self.pull()? else {
             return Ok(None);
         };
-        self.cursor = frame.index() + 1;
+        self.cursor = frame.index().saturating_add(1);
         Ok(Some(frame))
     }
 
     fn rewind(&mut self) -> Result<(), MediaError> {
-        self.source = frames_for(&self.path, self.format)?;
-        // Indices are the playback sequence, so they restart with it: a caller
-        // that rewinds sees frame 0 again, not frame *n* of a second pass.
-        self.produced = 0;
+        let source = frames_for(&self.path, self.format)?;
+        let cached_frames = u64::try_from(self.cache.len()).unwrap_or(u64::MAX);
+        self.source = source;
+        self.pending = None;
+        self.produced = cached_frames;
         self.cursor = 0;
-        self.exhausted = false;
+        self.exhausted = !self.streaming;
         Ok(())
     }
 
@@ -513,6 +584,54 @@ mod tests {
         decoder.rewind().expect("rewind");
         let again = decoder.next_frame().expect("frame").expect("some");
         assert_eq!(again, first, "rewind must return to frame 0");
+    }
+
+    #[test]
+    fn streaming_rewind_replays_every_pass_from_index_zero() {
+        let path = Path::new(ANIMATED_GIF);
+        let mut decoder = AnimatedImageDecoder::open(path, &config(0, "zstd")).expect("open");
+        assert_eq!(decoder.next_frame().unwrap().unwrap().index(), 0);
+        assert_eq!(decoder.next_frame().unwrap().unwrap().index(), 1);
+
+        decoder.rewind().unwrap();
+        let first_pass = (0..3)
+            .map(|_| decoder.next_frame().unwrap().unwrap().index())
+            .collect::<Vec<_>>();
+        assert_eq!(first_pass, vec![0, 1, 2]);
+        assert!(decoder.next_frame().unwrap().is_none());
+
+        decoder.rewind().unwrap();
+        let second_pass = (0..3)
+            .map(|_| decoder.next_frame().unwrap().unwrap().index())
+            .collect::<Vec<_>>();
+        assert_eq!(second_pass, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_decoder_error_is_not_reported_as_clean_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.gif");
+        let file = File::create(&path).unwrap();
+        let mut encoder = image::codecs::gif::GifEncoder::new(file);
+        let frame = image::Frame::new(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([1, 2, 3, 255]),
+        ));
+        encoder.encode_frames([frame]).unwrap();
+        drop(encoder);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.pop();
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut decoder = AnimatedImageDecoder::open(&path, &config(0, "zstd")).expect("open");
+        assert_eq!(decoder.next_frame().unwrap().unwrap().index(), 0);
+        let error = decoder
+            .next_frame()
+            .expect_err("a decoder error must not look like EOF");
+        assert!(matches!(error, MediaError::Decode { .. }), "{error}");
+        assert!(decoder.next_frame().unwrap().is_none());
     }
 
     #[test]

@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use owe_core::shell::{EnvLookup, ShellEvent};
 
@@ -136,12 +137,41 @@ pub fn parse_line(line: &str) -> ParsedLine {
             ShellEvent::MonitorAdded {
                 id: Some(id),
                 monitor: monitor.to_string(),
-                description: fields.next().map(str::to_string),
+                description: fields
+                    .next()
+                    .filter(|description| !description.is_empty())
+                    .map(str::to_string),
             }
         }
-        "monitorremoved" => ShellEvent::MonitorRemoved {
-            monitor: payload.to_string(),
-        },
+        "monitorremoved" => {
+            let monitor = payload.trim();
+            if monitor.is_empty() {
+                return malformed(line, "monitor name must not be empty");
+            }
+            ShellEvent::MonitorRemoved {
+                monitor: monitor.to_string(),
+            }
+        }
+        "monitorremovedv2" => {
+            let mut fields = payload.splitn(3, ',');
+            let id = fields.next().unwrap_or_default();
+            let monitor = fields.next().unwrap_or_default().trim();
+            if monitor.is_empty() {
+                return malformed(line, "monitor name must not be empty");
+            }
+            let id = match id.trim().parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => return malformed(line, &format!("monitor id `{id}` is not a number")),
+            };
+            ShellEvent::MonitorRemovedV2 {
+                id,
+                monitor: monitor.to_string(),
+                description: fields
+                    .next()
+                    .filter(|description| !description.is_empty())
+                    .map(str::to_string),
+            }
+        }
         // `address,workspace,class,title` — again, the title is the rest.
         "openwindow" => {
             let fields: Vec<&str> = payload.splitn(4, ',').collect();
@@ -256,6 +286,14 @@ pub fn to_wire(event: &ShellEvent) -> String {
             (None, _) => format!("monitoradded>>{monitor}"),
         },
         ShellEvent::MonitorRemoved { monitor } => format!("monitorremoved>>{monitor}"),
+        ShellEvent::MonitorRemovedV2 {
+            id,
+            monitor,
+            description,
+        } => match description {
+            Some(description) => format!("monitorremovedv2>>{id},{monitor},{description}"),
+            None => format!("monitorremovedv2>>{id},{monitor}"),
+        },
         ShellEvent::OpenWindow {
             address,
             workspace,
@@ -333,6 +371,7 @@ impl Socket2Stream {
     /// Connect to a socket path.
     pub fn connect(path: &Path) -> std::io::Result<Self> {
         let stream = UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         Ok(Self {
             reader: BufReader::new(stream),
             path: path.to_path_buf(),
@@ -658,6 +697,42 @@ mod tests {
     }
 
     #[test]
+    fn a_v2_monitor_removal_keeps_its_name_and_description() {
+        assert_eq!(
+            event("monitorremovedv2>>1,HDMI-A-1,Dell Inc. DELL U2720Q, rev A00"),
+            ShellEvent::MonitorRemovedV2 {
+                id: 1,
+                monitor: "HDMI-A-1".to_string(),
+                description: Some("Dell Inc. DELL U2720Q, rev A00".to_string()),
+            }
+        );
+        assert_eq!(
+            event("monitorremovedv2>>2,DP-1"),
+            ShellEvent::MonitorRemovedV2 {
+                id: 2,
+                monitor: "DP-1".to_string(),
+                description: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_monitor_removal_without_a_name_is_malformed() {
+        assert!(matches!(
+            parse_line("monitorremoved>>"),
+            ParsedLine::Malformed { .. }
+        ));
+        assert!(matches!(
+            parse_line("monitorremovedv2>>1,"),
+            ParsedLine::Malformed { .. }
+        ));
+        assert!(matches!(
+            parse_line("monitorremovedv2>>bad,DP-1"),
+            ParsedLine::Malformed { .. }
+        ));
+    }
+
+    #[test]
     fn an_opened_window_keeps_its_title_whole() {
         assert_eq!(
             event("openwindow>>55b1c0e0e2a0,2,kitty,make, then commit"),
@@ -756,6 +831,8 @@ mod tests {
             "monitoraddedv2>>1,HDMI-A-1,Dell Inc. DELL U2720Q",
             "monitoraddedv2>>1,HDMI-A-1",
             "monitorremoved>>HDMI-A-1",
+            "monitorremovedv2>>1,HDMI-A-1",
+            "monitorremovedv2>>1,HDMI-A-1,Dell Inc. DELL U2720Q",
             "openwindow>>addr,2,kitty,title",
             "closewindow>>addr",
             "windowtitle>>addr,title, with comma",

@@ -26,15 +26,14 @@ use owe_render::surface::PresenterEvent;
 
 use crate::engine::Engine;
 
-/// Whether an event can change the output list.
-///
-/// `Configured` and `Closed` cannot: they are about *our surface* on an output
-/// that is still there. Filtering them keeps a surface rebuild from looking like a
-/// hotplug.
+#[allow(missing_docs)]
 pub fn is_output_change(event: &PresenterEvent) -> bool {
     matches!(
         event,
-        PresenterEvent::OutputAdded { .. } | PresenterEvent::OutputRemoved { .. }
+        PresenterEvent::Configured { .. }
+            | PresenterEvent::Closed { .. }
+            | PresenterEvent::OutputAdded { .. }
+            | PresenterEvent::OutputRemoved { .. }
     )
 }
 
@@ -73,10 +72,33 @@ impl HotplugDriver {
                         }
                     }
 
+                    if !batch.iter().any(is_output_change) {
+                        continue;
+                    }
                     for event in &batch {
                         tracing::debug!(event = ?event, "presenter event");
+                        if matches!(
+                            event,
+                            PresenterEvent::Configured { .. } | PresenterEvent::Closed { .. }
+                        ) {
+                            match worker.handle_presenter_event(event) {
+                                Ok(report) => {
+                                    for (output, reason) in &report.failures {
+                                        tracing::warn!(%output, %reason, "presenter event recovery failed");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "presenter event recovery failed");
+                                }
+                            }
+                        }
                     }
-                    if !batch.iter().any(is_output_change) {
+                    if !batch.iter().any(|event| {
+                        matches!(
+                            event,
+                            PresenterEvent::OutputAdded { .. } | PresenterEvent::OutputRemoved { .. }
+                        )
+                    }) {
                         continue;
                     }
 
@@ -154,23 +176,24 @@ mod tests {
     use std::sync::mpsc::channel;
 
     #[test]
-    fn only_output_events_count_as_hotplug() {
-        assert!(is_output_change(&PresenterEvent::OutputAdded {
-            output: "HDMI-A-1".to_string()
-        }));
-        assert!(is_output_change(&PresenterEvent::OutputRemoved {
-            output: "HDMI-A-1".to_string()
-        }));
-        assert!(
-            !is_output_change(&PresenterEvent::Configured {
+    fn every_presenter_event_reaches_reconciliation() {
+        for event in [
+            PresenterEvent::Configured {
                 output: "eDP-1".to_string(),
                 size: (1920, 1080),
-            }),
-            "a surface configure is not a hotplug: the output is still there"
-        );
-        assert!(!is_output_change(&PresenterEvent::Closed {
-            output: "eDP-1".to_string()
-        }));
+            },
+            PresenterEvent::Closed {
+                output: "eDP-1".to_string(),
+            },
+            PresenterEvent::OutputAdded {
+                output: "HDMI-A-1".to_string(),
+            },
+            PresenterEvent::OutputRemoved {
+                output: "HDMI-A-1".to_string(),
+            },
+        ] {
+            assert!(is_output_change(&event), "{event:?}");
+        }
     }
 
     #[test]

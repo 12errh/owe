@@ -99,7 +99,7 @@ pub trait MediaDecoder: Send {
 
 ## 3. IPC protocol v1 (authoritative spec)
 
-- Transport: Unix stream socket `$XDG_RUNTIME_DIR/owe/<pid>/socket`, mode 0600 (TRD NFR-SEC-1).
+- Transport: Unix stream socket `$XDG_RUNTIME_DIR/owe/socket`, mode 0600 (TRD NFR-SEC-1).
 - Framing: UTF-8 JSON, one object per line, `\n`-terminated. Max frame 1 MiB (larger → error frame).
 - Every message: `{"v": 1, "id": "<client-uuid>", ...}`. Replies reference `id`.
 
@@ -194,7 +194,7 @@ wallpaper = "~/Pictures/Wallpapers/default.png"
 
 Resolution order per output: exact name → description match → `any`. Precedence conflicts are resolved `exact > description > any` and logged. `config.patch` IPC applies the same validation, then hot-reload semantics.
 
-**State files:** session (`$XDG_STATE_HOME/owe/session.toml`) written on every successful apply; library DB per ARCHITECTURE §7.
+**State files:** session (`$XDG_STATE_HOME/owe/session.json`) written on every successful apply; library DB per ARCHITECTURE §7.
 
 ---
 
@@ -217,18 +217,18 @@ Fault isolation: worker panic → supervisor catches (catch_unwind at thread bou
 ### 6.1 Video (GStreamer primary — ADR-006)
 
 ```
-uridecodebin → (hw decode: vaapidecodebin / vapostproc)
-            → GLUpload / dmabuf caps negotiation
-            → appsink(last-sample, max-bytes bounded)
-            → owe-media DecodedFrame{dmabuf|memory}
-            → owe-render: import EGLImage/dma-buf → wgpu texture → draw
+gst-launch/ffmpeg subprocess
+  → bounded raw RGBA8 stdout pipe
+  → owe-media DecodedFrame{memory}
+  → playback clock
+  → wgpu render
+  → wl_shm presentation
 ```
 
-- Decoder name queried from pipeline (VA-API vs software) and surfaced via `stats.get` (TRD FR-LIVE-2/3).
-- The capability probe runs at pipeline-build time; legacy VA-API drivers (e.g. `i965` on Haswell-era iGPUs — the Reference Profile machine, ADR-014) are handled by the same probe: hw name when the driver negotiates, software decode + warning otherwise (TRD FR-LIVE-3). No hard assumption that any specific driver works.
-- GStreamer bus runs on its own thread, bridged into calloop via channel — no async runtime (ADR-004).
-- FFmpeg fallback implements the same `MediaDecoder` trait; `media.backend` selects; `auto` prefers GStreamer when plugins load.
-- Audio: **dropped at the pipeline** (`audioconvert ! fakesink`), wallpapers are silent by default; an explicit `enable_audio` escape hatch exists but defaults false.
+- GStreamer is the primary subprocess pipeline and FFmpeg is the fallback; both are bounded, report child failures separately from clean EOF, and expose hardware-vs-software decode through `stats.get`.
+- The current build uses the SHM presentation path after a CPU decode. The dma-buf/EGLImage zero-copy path remains an explicit P4 follow-up; no zero-copy claim is made.
+- Audio is not linked into either frame pipeline.
+- The playback clock is independent of the decoder and presents through Wayland frame callbacks with an output FPS ceiling.
 
 ### 6.2 Animated GIF/APNG
 

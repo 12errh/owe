@@ -217,6 +217,14 @@ impl ShellEventBus {
                                 tracing::info!("shell event socket closed; reconnecting");
                                 break;
                             }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue;
+                            }
                             Err(error) => {
                                 tracing::warn!(%error, "shell event socket read failed");
                                 break;

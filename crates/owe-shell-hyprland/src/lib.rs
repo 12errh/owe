@@ -50,6 +50,8 @@ struct RawMonitor {
     focused: Option<bool>,
     #[serde(default)]
     disabled: Option<bool>,
+    #[serde(rename = "dpmsStatus", default)]
+    dpms_status: Option<bool>,
 }
 
 /// Parse `hyprctl monitors -j` output.
@@ -89,10 +91,7 @@ pub fn parse_monitors(json: &str) -> Result<Vec<OutputInfo>, ShellError> {
             x: monitor.x.unwrap_or(0),
             y: monitor.y.unwrap_or(0),
             focused: monitor.focused.unwrap_or(false),
-            // `hyprctl monitors` already omits disabled outputs; when a build
-            // does report one, treat it as inactive rather than pretending it can
-            // be drawn to.
-            active: !monitor.disabled.unwrap_or(false),
+            active: !monitor.disabled.unwrap_or(false) && monitor.dpms_status.unwrap_or(true),
             name,
         });
     }
@@ -214,6 +213,20 @@ mod tests {
             !outputs[0].active,
             "a disabled output must not be treated as drawable"
         );
+    }
+
+    #[test]
+    fn dpms_off_monitors_are_reported_but_inactive() {
+        let json = r#"[{"name":"HDMI-A-1","width":1920,"height":1080,"dpmsStatus":false}]"#;
+        let outputs = parse_monitors(json).unwrap();
+        assert!(!outputs[0].active);
+    }
+
+    #[test]
+    fn a_missing_dpms_status_keeps_an_enabled_monitor_active() {
+        let json = r#"[{"name":"eDP-1","width":1920,"height":1080}]"#;
+        let outputs = parse_monitors(json).unwrap();
+        assert!(outputs[0].active);
     }
 
     #[test]
